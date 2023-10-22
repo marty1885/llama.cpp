@@ -176,21 +176,26 @@ int ggml_rknpu2_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_t
     return 1;
 }
 
-static void ggml_rknpu2_transposed_to_native_int8(int8_t* restrict dst, int8_t* restrict src, int64_t k, int64_t n)
+static void ggml_rknpu2_transposed_to_native_int8(int8_t* restrict dst, int8_t* restrict src, size_t k, size_t n)
 {
-    GGML_ASSERT(k % 32 == 0 && n % 16 == 0);
+    GGML_ASSERT(k % 32 == 0 && n % 16 == 0 && k > 0 && n > 0);
 
-    const size_t rknpu_strides[4] = {k / 32 * 16 * 32, 16 * 32, 32, 1};
     // RKNN native layout is (N/16, K/32, 16, 32)
-    for(int64_t j = 0; j < k; j++) {
-        for(int64_t i = 0; i < n; i++) {
-            // src is pre-transposed
-            int64_t src_idx = j * n + i;
-            
-            int64_t dst_idxs[4] = {i / 16, j / 32, i % 16, j % 32};
-            int64_t dst_idx = dst_idxs[0] * rknpu_strides[0] + dst_idxs[1] * rknpu_strides[1] + dst_idxs[2] * rknpu_strides[2] + dst_idxs[3] * rknpu_strides[3];
+    const size_t rknpu_strides[4] = {k / 32 * 16 * 32, 16 * 32, 32, 1};
 
-            dst[dst_idx] = src[src_idx];
+    // Unroll the innermost loops to improve cache locality
+    for(size_t j = 0; j < k/32; j++) {
+        for(size_t i = 0; i < n/16; i++) {
+            for(size_t jj = 0; jj < 32; jj++) {
+                size_t partial_src_idx = (j*32+jj) * n + i*16;
+                size_t partial_dst_idx = i * rknpu_strides[0] + j * rknpu_strides[1] + jj;
+
+                for(size_t ii=0; ii < 16; ii++) {
+                    size_t src_idx = partial_src_idx + ii;
+                    size_t dst_idx = partial_dst_idx + ii * rknpu_strides[2];
+                    dst[dst_idx] = src[src_idx];
+                }
+            }
         }
     }
 }
@@ -206,7 +211,7 @@ void ggml_rknpu2_transform_tensor(void * data, struct ggml_tensor * tensor)
 
     const enum ggml_type type = tensor->type;
 
-    GGML_ASSERT(ne2 == 1 && ne3 == 1);
+    GGML_ASSERT(ne2 == 1 && ne3 == 1 && ne1 > 0 && ne0 > 0);
     GGML_ASSERT(type == GGML_TYPE_Q8_0);
     GGML_ASSERT(ggml_is_quantized(type));
 

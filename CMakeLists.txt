@@ -93,6 +93,7 @@ option(LLAMA_CLBLAST                         "llama: use CLBlast"               
 option(LLAMA_METAL                           "llama: use Metal"                                 ${LLAMA_METAL_DEFAULT})
 option(LLAMA_METAL_NDEBUG                    "llama: disable Metal debugging"                   OFF)
 option(LLAMA_MPI                             "llama: use MPI"                                   OFF)
+option(LLAMA_RKNPU2                          "llama: use RKNN2"                                 OFF)
 option(LLAMA_K_QUANTS                        "llama: use k-quants"                              ON)
 option(LLAMA_QKK_64                          "llama: use super-block size of 64 for k-quants"   OFF)
 
@@ -417,6 +418,21 @@ if (LLAMA_HIPBLAS)
     else()
         message(WARNING "hipBLAS or HIP not found. Try setting CMAKE_PREFIX_PATH=/opt/rocm")
     endif()
+endif()
+
+if(LLAMA_RKNPU2)
+    # Rockchip does not have a pkg-config file for rknn-toolkit2. Gonna assume it's in the default location.
+    # TODO: Detect the location of rknn-toolkit2
+
+    message(STATUS "Using RKNPU2")
+    add_compile_definitions(GGML_USE_RKNPU2)
+    add_library(ggml-rknpu2 OBJECT ggml-rknpu2.c ggml-rknpu2.h)
+    if (BUILD_SHARED_LIBS)
+        set_target_properties(ggml-rknpu2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    endif()
+
+    target_link_libraries(ggml-rknpu2 PRIVATE rknnrt)
+    set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} ggml-rknpu2)
 endif()
 
 if (LLAMA_ALL_WARNINGS)

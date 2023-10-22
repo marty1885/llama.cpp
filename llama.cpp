@@ -11,6 +11,8 @@
 #  include "ggml-cuda.h"
 #elif defined(GGML_USE_CLBLAST)
 #  include "ggml-opencl.h"
+#elif defined(GGML_USE_RKNPU2)
+#  include "ggml-rknpu2.h"
 #endif
 
 #ifdef GGML_USE_METAL
@@ -1272,6 +1274,10 @@ struct llama_model {
         for (size_t i = 0; i < tensors_by_name.size(); ++i) {
             ggml_cl_free_data(tensors_by_name[i].second);
         }
+#elif defined(GGML_USE_RKNPU2)
+        for (size_t i = 0; i < tensors_by_name.size(); ++i) {
+            ggml_rknpu2_free_data(tensors_by_name[i].second);
+        }
 #endif
     }
 };
@@ -1910,6 +1916,16 @@ struct llama_model_loader {
                         free(cur->data);
                     }
                     break;
+#elif defined(GGML_USE_RKNPU2)
+                case GGML_BACKEND_GPU:
+                    if (ggml_rknpu2_can_mul_mat_b(cur) == false) {
+                        break;
+                    }
+                    ggml_rknpu2_transform_tensor(cur->data, cur);
+                    if (!use_mmap) {
+                        free(cur->data);
+                    }
+                    break;
 #endif
                 default:
                     continue;
@@ -2441,6 +2457,10 @@ static void llm_load_tensors(
 #elif defined(GGML_USE_CLBLAST)
     LLAMA_LOG_INFO("%s: using OpenCL for GPU acceleration\n", __func__);
 #define LLAMA_BACKEND_OFFLOAD       GGML_BACKEND_GPU
+#define LLAMA_BACKEND_OFFLOAD_SPLIT GGML_BACKEND_GPU
+#elif defined(GGML_USE_RKNPU2)
+    LLAMA_LOG_INFO("%s: using RKNPU2 for NPU acceleration\n", __func__);
+#define LLAMA_BACKEND_OFFLOAD       GGML_BACKEND_CPU
 #define LLAMA_BACKEND_OFFLOAD_SPLIT GGML_BACKEND_GPU
 #else
 #define LLAMA_BACKEND_OFFLOAD       GGML_BACKEND_CPU

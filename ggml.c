@@ -249,6 +249,8 @@ inline static void * ggml_aligned_malloc(size_t size) {
 #include "ggml-cuda.h"
 #elif defined(GGML_USE_CLBLAST)
 #include "ggml-opencl.h"
+#elif defined(GGML_USE_RKNPU2)
+#include "ggml-rknpu2.h"
 #endif
 
 #undef MIN
@@ -4664,6 +4666,8 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
         ggml_init_cublas();
 #elif defined(GGML_USE_CLBLAST)
         ggml_cl_init();
+#elif defined(GGML_USE_RKNPU2)
+        ggml_rknpu2_init();
 #endif
 
         ggml_setup_op_has_task_pass();
@@ -11888,6 +11892,14 @@ static void ggml_compute_forward_mul_mat(
 
         return;
     }
+#elif defined(GGML_USE_RKNPU2)
+    if (ggml_rknpu2_can_mul_mat(src0, src1, dst)) {
+        // fprintf(stderr, "rknpu2\n");
+        if (params->ith == 0 && params->type == GGML_TASK_COMPUTE) {
+            ggml_rknpu2_mul_mat(src0, src1, dst, params->wdata, params->wsize);
+        }
+        return;
+    }
 #endif
 
     if (params->type == GGML_TASK_INIT) {
@@ -18508,6 +18520,11 @@ struct ggml_cplan ggml_graph_plan(struct ggml_cgraph * cgraph, int n_threads) {
                         n_tasks = 1; // TODO: this actually is doing nothing
                                      //       the threads are still spinning
                         cur = ggml_cl_mul_mat_get_wsize(node->src[0], node->src[1], node);
+                    } else
+#elif defined(GGML_USE_RKNPU2)
+                    if(ggml_rknpu2_can_mul_mat(node->src[0], node->src[1], node)) {
+                        n_tasks = 1; // TODO: this actually is doing nothing
+                                     //       the threads are still spinning
                     } else
 #endif
 #if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS)

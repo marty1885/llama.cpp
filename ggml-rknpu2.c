@@ -53,11 +53,11 @@ static struct ggml_rknpu2_matmul_kernel* ggml_rknpu2_matmul_kernel_find(int m, i
 
 static struct ggml_rknpu2_matmul_kernel* ggml_rknpu2_matmul_kernel_create(int m, int k, int n, rknn_tensor_type type)
 {
-    GGML_ASSERT(matmul_kernels_count < GGML_RKNPU2_MAX_MATMUL_KERNELS);
     struct ggml_rknpu2_matmul_kernel* kernel = ggml_rknpu2_matmul_kernel_find(m, k, n, type);
     if(kernel != NULL)
         return kernel;
 
+    GGML_ASSERT(matmul_kernels_count < GGML_RKNPU2_MAX_MATMUL_KERNELS);
     kernel = &matmul_kernels[matmul_kernels_count++];
     memset(kernel, 0, sizeof(struct ggml_rknpu2_matmul_kernel));
 
@@ -183,7 +183,7 @@ static void ggml_rknpu2_transposed_to_native_int8(int8_t* restrict dst, int8_t* 
     // RKNN native layout is (N/16, K/32, 16, 32)
     const size_t rknpu_strides[4] = {k / 32 * 16 * 32, 16 * 32, 32, 1};
 
-    // Unroll the innermost loops to improve cache locality
+    // Block copy 32x16 at a time to improve cache locality
     for(size_t j = 0; j < k/32; j++) {
         for(size_t i = 0; i < n/16; i++) {
             for(size_t jj = 0; jj < 32; jj++) {
@@ -255,6 +255,8 @@ void ggml_rknpu2_free_data(struct ggml_tensor * tensor)
         struct ggml_rknpu2_matmul_kernel* kernel = &matmul_kernels[0];
         rknn_destroy_mem(kernel->matmul_ctx, pack->B);
     }
+    free(pack);
+    tensor->extra = NULL;
 }
 
 void ggml_rknpu2_destroy(void)

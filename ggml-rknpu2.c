@@ -11,7 +11,7 @@
 // 1 means multiply by 1, therefore 0 bits are used for the integer part and is purely fractional
 // 2 means multiply by 2, therefore 1 bit is used for the integer part and 7 bits for the fractional part
 // 4 means multiply by 4, 2 bits integer, 6 bits fractional, etc..
-#define GGML_RKNPU2_FP2INT_RANGE_MULTIPLIER 2
+#define GGML_RKNPU2_FP2INT_RANGE_MULTIPLIER 1
 #define GGML_RKNPU2_FP2INT_WEIGHT_RANGE_MULTIPLIER 2
 
 // Helper macros

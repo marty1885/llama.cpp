@@ -129,10 +129,9 @@ void ggml_rknpu2_mul_mat(const struct ggml_tensor * src0, const struct ggml_tens
 
     int32_t* C = kernel->C->virt_addr;
     float* dst_data = dst->data;
-    const float div_factor = 1.f / (128.f * 128.f / GGML_RKNPU2_FP2INT_RANGE_MULTIPLIER / GGML_RKNPU2_FP2INT_WEIGHT_RANGE_MULTIPLIER);
+    const float factor = 1.f / (128.f * 128.f / GGML_RKNPU2_FP2INT_RANGE_MULTIPLIER / GGML_RKNPU2_FP2INT_WEIGHT_RANGE_MULTIPLIER);
     for(size_t i = 0; i < m*n; i++) {
-        // Round about way to convert int32_t to float to workaround floating point precision issues
-        dst_data[i] = (float)C[i] / div_factor;
+        dst_data[i] = (float)C[i] * factor;
     }
 }
 

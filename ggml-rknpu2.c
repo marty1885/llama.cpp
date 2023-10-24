@@ -7,12 +7,12 @@
 #include <rknn_api.h>
 #include <rknn_matmul_api.h>
 
-// Must be a power of 2, between 1 and 8. Controls the scale convertion from float to fixed point(8 bit)
-// 1 means multiply by 1, therefore 0 bits are used for the integer part and is purely fractional
-// 2 means multiply by 2, therefore 1 bit is used for the integer part and 7 bits for the fractional part
-// 4 means multiply by 4, 2 bits integer, 6 bits fractional, etc..
+// Scales the range accepted when converting from float to int8. A larger vaaue will result in less accuracy, but wider range
+// The range is [-range_multiplier, range_multiplier]
+// For example a range multiplier of 1 will result in a range of [-1, 1]
+// A range multiplier of 2 will result in a range of [-2, 2], etc..
 #define GGML_RKNPU2_FP2INT_RANGE_MULTIPLIER 1
-#define GGML_RKNPU2_FP2INT_WEIGHT_RANGE_MULTIPLIER 2
+#define GGML_RKNPU2_FP2INT_WEIGHT_RANGE_MULTIPLIER 1.2f
 
 // Helper macros
 #define ggrk_clamp(x, low, high) (x < low ? low : (x > high ? high : x))
@@ -114,6 +114,8 @@ void ggml_rknpu2_mul_mat(const struct ggml_tensor * src0, const struct ggml_tens
     if(kernel == NULL)
         kernel = ggml_rknpu2_matmul_kernel_create(m, k, n, RKNN_TENSOR_INT8);
 
+    GGML_ASSERT(kernel->matmul_io_attr.A.type == RKNN_TENSOR_INT8);
+    GGML_ASSERT(kernel->matmul_io_attr.C.type == RKNN_TENSOR_INT32);
     float const* src1_data = src1->data;
     int8_t* A = kernel->A->virt_addr;
     for(size_t i = 0; i < m*k; i++) {

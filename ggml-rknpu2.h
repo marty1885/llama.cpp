@@ -5,13 +5,11 @@
 The experimental RKNPU2 backend for GGML.
 
 LIMITATIONS:
-- Only supports running in INT8 mode (uses Q8_0 GGML tensors)
+- Only supports running in FLOAT16 mode (uses Q8_0 GGML tensors)
 - Only MatMul is supported
-- Very high quantization error
+- Still high quantization error using fp16, but why?
 - RK3588 only
-- Not faster then jsut running on RK3588 CPU
-- Only square matrices are supported (seems to be a bug in the relayout code)
-
+- Not faster then just running on RK3588 CPU
 */
 
 #include "ggml.h"

@@ -16481,7 +16481,7 @@ struct ggml_cplan ggml_graph_plan(struct ggml_cgraph * cgraph, int n_threads) {
                     } else
 #elif defined(GGML_USE_RKNPU2)
                     if(ggml_rknpu2_can_mul_mat(node->src[0], node->src[1], node)) {
-                        n_tasks = 1; // TODO: this actually is doing nothing
+                        cur = 1; // TODO: this actually is doing nothing
                                      //       the threads are still spinning
                     } else
 #endif

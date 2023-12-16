@@ -75,7 +75,7 @@ int main(int argc, char ** argv) {
     // make sure the KV cache is big enough to hold all the prompt and generated tokens
     if (n_kv_req > n_ctx) {
         LOG_TEE("%s: error: n_kv_req > n_ctx, the required KV cache size is not big enough\n", __func__);
-        LOG_TEE("%s:        either reduce n_parallel or increase n_ctx\n", __func__);
+        LOG_TEE("%s:        either reduce n_len or increase n_ctx\n", __func__);
         return 1;
     }
 
@@ -95,13 +95,8 @@ int main(int argc, char ** argv) {
     llama_batch batch = llama_batch_init(512, 0, 1);
 
     // evaluate the initial prompt
-    batch.n_tokens = tokens_list.size();
-
-    for (int32_t i = 0; i < batch.n_tokens; i++) {
-        batch.token[i]  = tokens_list[i];
-        batch.pos[i]    = i;
-        batch.seq_id[i] = 0;
-        batch.logits[i] = false;
+    for (size_t i = 0; i < tokens_list.size(); i++) {
+        llama_batch_add(batch, tokens_list[i], i, { 0 }, false);
     }
 
     // llama_decode will output logits only for the last token of the prompt
@@ -148,15 +143,10 @@ int main(int argc, char ** argv) {
             fflush(stdout);
 
             // prepare the next batch
-            batch.n_tokens = 0;
+            llama_batch_clear(batch);
 
             // push this new token for next evaluation
-            batch.token [batch.n_tokens] = new_token_id;
-            batch.pos   [batch.n_tokens] = n_cur;
-            batch.seq_id[batch.n_tokens] = 0;
-            batch.logits[batch.n_tokens] = true;
-
-            batch.n_tokens += 1;
+            llama_batch_add(batch, new_token_id, n_cur, { 0 }, true);
 
             n_decode += 1;
         }

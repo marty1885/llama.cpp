@@ -178,9 +178,8 @@ void ggml_rknpu2_mul_mat(const struct ggml_tensor * src0, const struct ggml_tens
     ret = rknn_matmul_run(kernel->matmul_ctx);
     GGML_ASSERT(ret == 0);
 
-    float* C = kernel->C->virt_addr;
-    float* dst_data = kernel->C->virt_addr;
-    memcpy(dst_data, C, m*n*sizeof(float));
+    // dst->data = kernel->C->virt_addr;
+    memcpy(dst->data, kernel->C->virt_addr, m * n * sizeof(float));
 }
 
 int ggml_rknpu2_can_mul_mat_b(const struct ggml_tensor * tensor)
@@ -219,29 +218,30 @@ int ggml_rknpu2_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_t
     return 1;
 }
 
-static void ggml_rknpu2_transposed_to_native_fp16(uint16_t* restrict dst, const uint16_t* restrict src, size_t k, size_t n)
-{
-    GGML_ASSERT(k % 16 == 0 && n % 8 == 0 && k > 0 && n > 0);
+static void ggml_rknpu2_transposed_to_native_fp16(uint16_t *restrict dst,
+                                                  const uint16_t *restrict src,
+                                                  size_t k, size_t n) {
+  GGML_ASSERT(k % 32 == 0 && n % 16 == 0 && k > 0 && n > 0);
 
-    // RKNN native layout is [N/8, K/16, 8, 16]
-    const size_t rknpu_strides[4] = {k / 16 * 8 * 16, 8 * 16, 16, 1};
+  // RKNN native layout is (N/16, K/32, 16, 32)
+  const size_t rknpu_strides[4] = {k / 32 * 16 * 32, 16 * 32, 32, 1};
 
-    // Block copy 16x8 at a time to improve cache locality
-    for (size_t j = 0; j < k / 16; j++) {
-      for (size_t i = 0; i < n / 8; i++) {
-        for (size_t jj = 0; jj < 16; jj++) {
-          size_t partial_src_idx = (j * 16 + jj) * n + i * 8;
-          size_t partial_dst_idx =
-              i * rknpu_strides[0] + j * rknpu_strides[1] + jj;
+  // Block copy 32x16 at a time to improve cache locality
+  for (size_t j = 0; j < k / 32; j++) {
+    for (size_t i = 0; i < n / 16; i++) {
+      for (size_t jj = 0; jj < 32; jj++) {
+        size_t partial_src_idx = (j * 32 + jj) * n + i * 16;
+        size_t partial_dst_idx =
+            i * rknpu_strides[0] + j * rknpu_strides[1] + jj;
 
-          for (size_t ii = 0; ii < 8; ii++) {
-            size_t src_idx = partial_src_idx + ii;
-            size_t dst_idx = partial_dst_idx + ii * rknpu_strides[2];
-            dst[dst_idx] = src[src_idx];
-          }
+        for (size_t ii = 0; ii < 16; ii++) {
+          size_t src_idx = partial_src_idx + ii;
+          size_t dst_idx = partial_dst_idx + ii * rknpu_strides[2];
+          dst[dst_idx] = src[src_idx];
         }
       }
     }
+  }
 }
 
 void ggml_rknpu2_transform_tensor(void * data, struct ggml_tensor * tensor)

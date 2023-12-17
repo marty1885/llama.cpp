@@ -11,10 +11,8 @@
 #include <arm_neon.h>
 
 
-static uint16_t arm_fp32_to_fp16(float x) {
-  float32x4_t tmp = vld1q_dup_f32(&x);
-  float16_t res = vget_lane_f16(vcvt_f16_f32(tmp), 0);
-  return *(uint16_t *)(&res);
+static __fp16 arm_fp32_to_fp16(float x) {
+    return (__fp16)x;
 }
 
 rknn_tensor_type rknpu2_matmul_type_to_rknn_type_input(rknn_matmul_type type)
@@ -59,8 +57,23 @@ rknn_matmul_type rknpu2_matmul_type_from_rknn_type(rknn_tensor_type type)
     }
 }
 
+rknn_tensor_type rknpu2_matmul_input_type_to_output_type(rknn_tensor_type type)
+{
+    switch(type) {
+        case RKNN_TENSOR_FLOAT16:
+            return RKNN_TENSOR_FLOAT32;
+        case RKNN_TENSOR_INT8:
+            return RKNN_TENSOR_INT32;
+        case RKNN_TENSOR_INT4:
+            return RKNN_TENSOR_INT16;
+        default:
+            GGML_ASSERT(0);
+    }
+}
+
 struct ggml_rknpu2_data_pack
 {
+    rknn_tensor_type type;
     void* ordered_data;
     int initialized;
 
@@ -147,7 +160,7 @@ void ggml_rknpu2_mul_mat(const struct ggml_tensor * src0, const struct ggml_tens
 
     // First time called. Initialize RKNPU2 API structs
     if(pack->initialized == 0) {
-        struct ggml_rknpu2_matmul_kernel* kernel = ggml_rknpu2_matmul_kernel_create(m, k, n, RKNN_TENSOR_FLOAT16);
+        struct ggml_rknpu2_matmul_kernel* kernel = ggml_rknpu2_matmul_kernel_create(m, k, n, pack->type);
 
         pack->B = rknn_create_mem(kernel->matmul_ctx, kernel->matmul_io_attr.B.size);
         memcpy(pack->B->virt_addr, pack->ordered_data, kernel->matmul_io_attr.B.size);
@@ -159,13 +172,13 @@ void ggml_rknpu2_mul_mat(const struct ggml_tensor * src0, const struct ggml_tens
     struct ggml_rknpu2_matmul_kernel* kernel = ggml_rknpu2_matmul_kernel_find(m, k, n, RKNN_TENSOR_FLOAT16);
     // GGML will switch batch size on the fly. So we need to create a new kernel if the batch size is different
     if(kernel == NULL)
-        kernel = ggml_rknpu2_matmul_kernel_create(m, k, n, RKNN_TENSOR_FLOAT16);
+        kernel = ggml_rknpu2_matmul_kernel_create(m, k, n, pack->type);
 
-    GGML_ASSERT(kernel->matmul_io_attr.A.type == RKNN_TENSOR_FLOAT16);
-    GGML_ASSERT(kernel->matmul_io_attr.C.type == RKNN_TENSOR_FLOAT32);
+    GGML_ASSERT(kernel->matmul_io_attr.A.type == pack->type);
+    GGML_ASSERT(kernel->matmul_io_attr.C.type == rknpu2_matmul_input_type_to_output_type(pack->type));
     //A: fp32 -> fp16
     float const* src1_data = src1->data;
-    uint16_t* A = kernel->A->virt_addr;
+    __fp16* A = kernel->A->virt_addr;
     #pragma clang loop unroll_count(32)
     for(size_t i = 0; i < m*k; i++) {
         A[i] = arm_fp32_to_fp16(src1_data[i]);
@@ -218,8 +231,8 @@ int ggml_rknpu2_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_t
     return 1;
 }
 
-static void ggml_rknpu2_transposed_to_native_fp16(uint16_t *restrict dst,
-                                                  const uint16_t *restrict src,
+static void ggml_rknpu2_transposed_to_native_fp16(__fp16 *restrict dst,
+                                                  const __fp16 *restrict src,
                                                   size_t k, size_t n) {
   GGML_ASSERT(k % 32 == 0 && n % 16 == 0 && k > 0 && n > 0);
 
@@ -267,22 +280,30 @@ void ggml_rknpu2_transform_tensor(void * data, struct ggml_tensor * tensor)
 
     traits.to_float(data, fdata, nelements);
 
-    uint16_t *fp16data = malloc(nelements * sizeof(uint16_t));
+    __fp16 *fp16data = malloc(nelements * sizeof(__fp16));
     for (int64_t i = 0; i < nelements; i++) {
       fp16data[i] = arm_fp32_to_fp16(fdata[i]);
     }
 
     free(fdata);
 
-    uint16_t* reordered_data = malloc(ne0 * ne1 * sizeof(uint16_t));
-    ggml_rknpu2_transposed_to_native_fp16(reordered_data, fp16data, ne1, ne0);
-    free(fp16data);
+    __fp16* reordered_data = malloc(ne0 * ne1 * sizeof(__fp16));
+    const rknn_tensor_type inference_type = RKNN_TENSOR_FLOAT16;
+    if(inference_type == RKNN_TENSOR_FLOAT16) {
+        ggml_rknpu2_transposed_to_native_fp16(reordered_data, fp16data, ne1, ne0);
+    }
+    else {
+        free(fp16data);
+        GGML_ASSERT(0);
+    }
 
+    free(fp16data);
     struct ggml_rknpu2_data_pack* pack = malloc(sizeof(struct ggml_rknpu2_data_pack));
     memset(pack, 0, sizeof(struct ggml_rknpu2_data_pack));
 
     pack->ordered_data = reordered_data;
     pack->initialized = 0;
+    pack->type = inference_type;
 
     tensor->extra = pack;
 }

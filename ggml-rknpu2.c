@@ -215,8 +215,8 @@ void ggml_rknpu2_mul_mat(const struct ggml_tensor * src0, const struct ggml_tens
         int8_t* A = kernel->A->virt_addr;
         #pragma clang loop unroll_count(32)
         for(size_t i = 0; i < m*k; i++) {
-            float val = fmin(fmax(src1_data[i], -128.0f), 127.0f);
-            A[i] = val / 128.0f;
+            float val = fmin(fmax(src1_data[i], -1.0f), 1.0f) * 127.0f;
+            A[i] = val;
         }
     }
     else {
@@ -240,9 +240,8 @@ void ggml_rknpu2_mul_mat(const struct ggml_tensor * src0, const struct ggml_tens
         float* dst_data = dst->data;
         int32_t* C = kernel->C->virt_addr;
         #pragma clang loop unroll_count(32)
-        for(size_t i = 0; i < m*n; i++) {
-            dst_data[i] = C[i] / 128.0f;
-        }
+        for(size_t i = 0; i < m*n; i++)
+            dst_data[i] = C[i] / 127.0f;
     }
     else {
         GGML_ASSERT(0 && "Unsupported inference type");
@@ -361,7 +360,7 @@ void ggml_rknpu2_transform_tensor(void * data, struct ggml_tensor * tensor)
     traits.to_float(data, fdata, nelements);
 
     void* reordered_data = NULL;
-    const rknn_tensor_type inference_type = RKNN_TENSOR_INT8;
+    const rknn_tensor_type inference_type = RKNN_TENSOR_FLOAT16;
     if(inference_type == RKNN_TENSOR_FLOAT16) {
         reordered_data = malloc(nelements * sizeof(__fp16));
         ggml_rknpu2_transposed_to_native_fp16((__fp16*)reordered_data, fdata, ne1, ne0);

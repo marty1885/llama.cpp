@@ -229,14 +229,14 @@ static void ggml_rknpu2_transposed_to_native_fp16(uint16_t *restrict dst,
   // Block copy 32x16 at a time to improve cache locality
   for (size_t j = 0; j < k / 32; j++) {
     for (size_t i = 0; i < n / 16; i++) {
-      for (size_t jj = 0; jj < 32; jj++) {
-        size_t partial_src_idx = (j * 32 + jj) + i * 16 * k;
+      for (size_t ii = 0; ii < 16; ii++) {
+        size_t partial_src_idx = j * 32 + (i * 16 + ii) * k;
         size_t partial_dst_idx =
-            i * rknpu_strides[0] + j * rknpu_strides[1] + jj;
+            i * rknpu_strides[0] + j * rknpu_strides[1] + ii * rknpu_strides[2];
 
-        for (size_t ii = 0; ii < 16; ii++) {
-          size_t src_idx = partial_src_idx + ii * k;
-          size_t dst_idx = partial_dst_idx + ii * rknpu_strides[2];
+        for (size_t jj = 0; jj < 32; jj++) {
+          size_t src_idx = partial_src_idx + jj;
+          size_t dst_idx = partial_dst_idx + jj;
           dst[dst_idx] = src[src_idx];
         }
       }

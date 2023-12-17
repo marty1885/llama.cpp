@@ -11,7 +11,7 @@
 #include <arm_neon.h>
 
 
-inline uint16_t arm_fp32_to_fp16(float x) {
+static uint16_t arm_fp32_to_fp16(float x) {
   float32x4_t tmp = vld1q_dup_f32(&x);
   float16_t res = vget_lane_f16(vcvt_f16_f32(tmp), 0);
   return *(uint16_t *)(&res);
@@ -129,7 +129,7 @@ static struct ggml_rknpu2_matmul_kernel* ggml_rknpu2_matmul_kernel_create(int m,
 
 void ggml_rknpu2_init(void)
 {
-    
+
     // no-op
 }
 
@@ -188,7 +188,7 @@ int ggml_rknpu2_can_mul_mat_b(const struct ggml_tensor * tensor)
     const int64_t n = tensor->ne[1];
     if(k > 10240 || n > 4096) // RKNPU2 limit
         return 0;
-    
+
     // k and n size must align to 32 bytes
     if(k % 32 != 0 || n % 32 != 0)
         return 0;
@@ -196,7 +196,7 @@ int ggml_rknpu2_can_mul_mat_b(const struct ggml_tensor * tensor)
     // make sure the tensor has assosiated data
     if(tensor->backend != GGML_BACKEND_GPU)
         return 0;
-    
+
     if(tensor->type != GGML_TYPE_Q8_0)
         return 0;
 
@@ -208,13 +208,13 @@ int ggml_rknpu2_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_t
     // TODO: Support RK3566/RK3568 NPU. This is only for RK3588
     if(ggml_rknpu2_can_mul_mat_b(src0) == 0)
         return 0;
-    
+
     if(src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32)
         return 0;
 
     if(src0->extra == NULL)
         return 0;
-    
+
     return 1;
 }
 
@@ -230,12 +230,12 @@ static void ggml_rknpu2_transposed_to_native_fp16(uint16_t *restrict dst,
   for (size_t j = 0; j < k / 32; j++) {
     for (size_t i = 0; i < n / 16; i++) {
       for (size_t jj = 0; jj < 32; jj++) {
-        size_t partial_src_idx = (j * 32 + jj) * n + i * 16;
+        size_t partial_src_idx = (j * 32 + jj) + i * 16 * k;
         size_t partial_dst_idx =
             i * rknpu_strides[0] + j * rknpu_strides[1] + jj;
 
         for (size_t ii = 0; ii < 16; ii++) {
-          size_t src_idx = partial_src_idx + ii;
+          size_t src_idx = partial_src_idx + ii * k;
           size_t dst_idx = partial_dst_idx + ii * rknpu_strides[2];
           dst[dst_idx] = src[src_idx];
         }
@@ -264,7 +264,7 @@ void ggml_rknpu2_transform_tensor(void * data, struct ggml_tensor * tensor)
 
     const size_t nelements = ne0 * ne1;
     float* fdata = malloc(nelements * sizeof(float));
-    
+
     traits.to_float(data, fdata, nelements);
 
     uint16_t *fp16data = malloc(nelements * sizeof(uint16_t));

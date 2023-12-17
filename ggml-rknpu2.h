@@ -5,10 +5,11 @@
 The experimental RKNPU2 backend for GGML.
 
 LIMITATIONS:
-- Only supports running in FLOAT16 mode (uses Q8_0 GGML tensors)
+- Only supports Q8_0 GGML quantization
 - Only MatMul is supported
 - RK3588 only
-- Not faster then just running on RK3588 CPU (4x A76)
+- Please only use 1 CPU thread for best efficiency. More threads will not run faster.
+- Not faster than running on 1x A76 Cores, but saves some CPU time...
 */
 
 #include "ggml.h"

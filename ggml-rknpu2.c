@@ -241,7 +241,7 @@ void ggml_rknpu2_mul_mat(const struct ggml_tensor * src0, const struct ggml_tens
         int32_t* C = kernel->C->virt_addr;
         #pragma clang loop unroll_count(32)
         for(size_t i = 0; i < m*n; i++)
-            dst_data[i] = C[i] / 127.0f;
+            dst_data[i] = C[i] / 127.0f / 127.0f;
     }
     else {
         GGML_ASSERT(0 && "Unsupported inference type");
@@ -318,18 +318,18 @@ static void ggml_rknpu2_transposed_to_native_int8(int8_t *restrict dst,
   // RKNN native layout is (N/32, K/32, 32, 32)
   const size_t rknpu_strides[4] = {k / 32 * 32 * 32, 32 * 32, 32, 1};
 
-  // Block copy 32x16 at a time to improve cache locality
-  for(size_t j = 0; j < k / 32; j++) {
-    for(size_t i = 0; i < n / 32; i++) {
-      for(size_t ii = 0; ii < 32; ii++) {
+  // Block copy 32x32 at a time to improve cache locality
+  for (size_t j = 0; j < k / 32; j++) {
+    for (size_t i = 0; i < n / 32; i++) {
+      for (size_t ii = 0; ii < 32; ii++) {
         size_t partial_src_idx = j * 32 + (i * 32 + ii) * k;
-        size_t partial_dst_idx = i * rknpu_strides[0] + j * rknpu_strides[1] + ii * rknpu_strides[2];
+        size_t partial_dst_idx =
+            i * rknpu_strides[0] + j * rknpu_strides[1] + ii * rknpu_strides[2];
 
-        for(size_t jj = 0; jj < 32; jj++) {
+        for (size_t jj = 0; jj < 32; jj++) {
           size_t src_idx = partial_src_idx + jj;
           size_t dst_idx = partial_dst_idx + jj;
-          float val = fmin(fmax(src[src_idx], -1.0f), 1.0f) * 127.0f;
-          dst[dst_idx] = val;
+          dst[dst_idx] = fmin(fmax(src[src_idx], -1.0f), 1.0f) * 127.0f;
         }
       }
     }
@@ -360,7 +360,7 @@ void ggml_rknpu2_transform_tensor(void * data, struct ggml_tensor * tensor)
     traits.to_float(data, fdata, nelements);
 
     void* reordered_data = NULL;
-    const rknn_tensor_type inference_type = RKNN_TENSOR_FLOAT16;
+    const rknn_tensor_type inference_type = RKNN_TENSOR_INT8;
     if(inference_type == RKNN_TENSOR_FLOAT16) {
         reordered_data = malloc(nelements * sizeof(__fp16));
         ggml_rknpu2_transposed_to_native_fp16((__fp16*)reordered_data, fdata, ne1, ne0);

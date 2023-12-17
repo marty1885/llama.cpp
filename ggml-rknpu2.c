@@ -192,7 +192,7 @@ void ggml_rknpu2_mul_mat(const struct ggml_tensor * src0, const struct ggml_tens
         pack->initialized = 1;
     }
 
-    struct ggml_rknpu2_matmul_kernel* kernel = ggml_rknpu2_matmul_kernel_find(m, k, n, RKNN_TENSOR_FLOAT16);
+    struct ggml_rknpu2_matmul_kernel* kernel = ggml_rknpu2_matmul_kernel_find(m, k, n, pack->type);
     // GGML will switch batch size on the fly. So we need to create a new kernel if the batch size is different
     if(kernel == NULL)
         kernel = ggml_rknpu2_matmul_kernel_create(m, k, n, pack->type);
@@ -216,7 +216,7 @@ void ggml_rknpu2_mul_mat(const struct ggml_tensor * src0, const struct ggml_tens
         #pragma clang loop unroll_count(32)
         for(size_t i = 0; i < m*k; i++) {
             float val = fmin(fmax(src1_data[i], -128.0f), 127.0f);
-            A[i] = val;
+            A[i] = val / 128.0f;
         }
     }
     else {
@@ -232,16 +232,16 @@ void ggml_rknpu2_mul_mat(const struct ggml_tensor * src0, const struct ggml_tens
 
     // dst->data = kernel->C->virt_addr;
     if(inference_type == RKNN_TENSOR_FLOAT16) {
-        //C: fp16 -> fp32
+        //C: fp32 -> fp32
         memcpy(dst->data, kernel->C->virt_addr, m * n * sizeof(float));
     }
     else if(inference_type == RKNN_TENSOR_INT8) {
-        //C: int8 -> fp32
+        //C: int32 -> fp32
         float* dst_data = dst->data;
         int32_t* C = kernel->C->virt_addr;
         #pragma clang loop unroll_count(32)
         for(size_t i = 0; i < m*n; i++) {
-            dst_data[i] = C[i] * 128.0f;
+            dst_data[i] = C[i] / 128.0f;
         }
     }
     else {
@@ -314,25 +314,23 @@ static void ggml_rknpu2_transposed_to_native_fp16(__fp16 *restrict dst,
 static void ggml_rknpu2_transposed_to_native_int8(int8_t *restrict dst,
                                                   const float *restrict src,
                                                   size_t k, size_t n) {
-  GGML_ASSERT(k % 32 == 0 && n % 16 == 0 && k > 0 && n > 0);
+  GGML_ASSERT(k % 32 == 0 && n % 32 == 0 && k > 0 && n > 0);
 
-  // RKNN native layout is (N/16, K/32, 16, 32)
-  const size_t rknpu_strides[4] = {k / 32 * 16 * 32, 16 * 32, 32, 1};
+  // RKNN native layout is (N/32, K/32, 32, 32)
+  const size_t rknpu_strides[4] = {k / 32 * 32 * 32, 32 * 32, 32, 1};
 
   // Block copy 32x16 at a time to improve cache locality
-  for (size_t j = 0; j < k / 32; j++) {
-    for (size_t i = 0; i < n / 16; i++) {
-      for (size_t ii = 0; ii < 16; ii++) {
-        size_t partial_src_idx = j * 32 + (i * 16 + ii) * k;
-        size_t partial_dst_idx =
-            i * rknpu_strides[0] + j * rknpu_strides[1] + ii * rknpu_strides[2];
+  for(size_t j = 0; j < k / 32; j++) {
+    for(size_t i = 0; i < n / 32; i++) {
+      for(size_t ii = 0; ii < 32; ii++) {
+        size_t partial_src_idx = j * 32 + (i * 32 + ii) * k;
+        size_t partial_dst_idx = i * rknpu_strides[0] + j * rknpu_strides[1] + ii * rknpu_strides[2];
 
-        for (size_t jj = 0; jj < 32; jj++) {
+        for(size_t jj = 0; jj < 32; jj++) {
           size_t src_idx = partial_src_idx + jj;
           size_t dst_idx = partial_dst_idx + jj;
-          __fp16 val = src[src_idx] / 128.0f;
-          val = fmin(fmax(val, -128.0f), 127.0f);
-          dst[dst_idx] = val * 128.0f;
+          float val = fmin(fmax(src[src_idx], -1.0f), 1.0f) * 127.0f;
+          dst[dst_idx] = val;
         }
       }
     }
@@ -363,7 +361,7 @@ void ggml_rknpu2_transform_tensor(void * data, struct ggml_tensor * tensor)
     traits.to_float(data, fdata, nelements);
 
     void* reordered_data = NULL;
-    const rknn_tensor_type inference_type = RKNN_TENSOR_FLOAT16;
+    const rknn_tensor_type inference_type = RKNN_TENSOR_INT8;
     if(inference_type == RKNN_TENSOR_FLOAT16) {
         reordered_data = malloc(nelements * sizeof(__fp16));
         ggml_rknpu2_transposed_to_native_fp16((__fp16*)reordered_data, fdata, ne1, ne0);

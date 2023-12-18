@@ -11,6 +11,7 @@
 
 #include <arm_neon.h>
 
+#define GGML_RKNPU2_INPUT_SCALE 1.7f
 
 static __fp16 arm_fp32_to_fp16(float x) {
     return (__fp16)x;
@@ -215,7 +216,7 @@ void ggml_rknpu2_mul_mat(const struct ggml_tensor * src0, const struct ggml_tens
         int8_t* A = kernel->A->virt_addr;
         #pragma clang loop unroll_count(32)
         for(size_t i = 0; i < m*k; i++) {
-            float val = round(fmin(fmax(src1_data[i], -1.0f), 1.0f) * 127.0f);
+            float val = round(fmin(fmax(src1_data[i]*127.0f/GGML_RKNPU2_INPUT_SCALE, -127.0f), 127.0f));
             A[i] = val;
         }
     }
@@ -241,7 +242,7 @@ void ggml_rknpu2_mul_mat(const struct ggml_tensor * src0, const struct ggml_tens
         int32_t* C = kernel->C->virt_addr;
         #pragma clang loop unroll_count(32)
         for(size_t i = 0; i < m*n; i++)
-            dst_data[i] = C[i] / 127.0f / 127.0f;
+            dst_data[i] = C[i] / 127.0f / 127.f * GGML_RKNPU2_INPUT_SCALE;
     }
     else {
         GGML_ASSERT(0 && "Unsupported inference type");

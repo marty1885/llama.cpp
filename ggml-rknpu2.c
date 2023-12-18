@@ -215,7 +215,7 @@ void ggml_rknpu2_mul_mat(const struct ggml_tensor * src0, const struct ggml_tens
         int8_t* A = kernel->A->virt_addr;
         #pragma clang loop unroll_count(32)
         for(size_t i = 0; i < m*k; i++) {
-            float val = fmin(fmax(src1_data[i], -1.0f), 1.0f) * 127.0f;
+            float val = round(fmin(fmax(src1_data[i], -1.0f), 1.0f) * 127.0f);
             A[i] = val;
         }
     }
@@ -329,7 +329,7 @@ static void ggml_rknpu2_transposed_to_native_int8(int8_t *restrict dst,
         for (size_t jj = 0; jj < 32; jj++) {
           size_t src_idx = partial_src_idx + jj;
           size_t dst_idx = partial_dst_idx + jj;
-          dst[dst_idx] = fmin(fmax(src[src_idx], -1.0f), 1.0f) * 127.0f;
+          dst[dst_idx] = round(fmin(fmax(src[src_idx], -1.0f), 1.0f) * 127.0f);
         }
       }
     }

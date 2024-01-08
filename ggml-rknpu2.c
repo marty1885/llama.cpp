@@ -9,6 +9,12 @@
 #include "rknn_api.h"
 #include "rknn_matmul_api.h"
 
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <unistd.h>
+
 #include <arm_neon.h>
 
 #define GGML_RKNPU2_INPUT_SCALE 1.7f
@@ -115,10 +121,106 @@ struct ggml_rknpu2_matmul_kernel
     rknn_tensor_mem* C;
 };
 
+#define GGML_RKNPU2_USE_OUTSIDE_ALLOC 1
+
+#if GGML_RKNPU2_USE_OUTSIDE_ALLOC
+struct dma_heap_allocation_data {
+	uint64_t len;
+	uint32_t fd;
+	uint32_t fd_flags;
+	uint64_t heap_flags;
+};
+
+#define DMA_HEAP_IOC_MAGIC		'H'
+#define DMA_HEAP_IOCTL_ALLOC	_IOWR(DMA_HEAP_IOC_MAGIC, 0x0,\
+				      struct dma_heap_allocation_data)
+
+#define DMA_BUF_SYNC_READ      (1 << 0)
+#define DMA_BUF_SYNC_WRITE     (2 << 0)
+#define DMA_BUF_SYNC_RW        (DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE)
+#define DMA_BUF_SYNC_START     (0 << 2)
+#define DMA_BUF_SYNC_END       (1 << 2)
+#define DMA_BUF_BASE		'b'
+#define DMA_BUF_IOCTL_SYNC	_IOW(DMA_BUF_BASE, 0, uint64_t)
+#define CMA_HEAP_SIZE	(1024 * 1024)
+
+//Helper function to manually allocate buffer from dma_heap for RKNPU2
+//The internal RKNPU2 API will allocate buffer from DMA32 heap, which is only 4GiB, not enough for large models.
+//WARNING: Memory leak will not be released on exit!! But it will be released on next run...?
+int dma_alloc(size_t size, int *fd, void **va) {
+    int ret;
+    int prot;
+    void *mmap_va;
+    int dma_heap_fd = -1;
+    struct dma_heap_allocation_data buf_data;
+    const char* path = "/dev/dma_heap/system";
+
+    /* open dma_heap fd */
+    dma_heap_fd = open(path, O_RDWR);
+    if (dma_heap_fd < 0) {
+        printf("open %s fail!\n", path);
+        return dma_heap_fd;
+    }
+
+    /* alloc buffer */
+    memset(&buf_data, 0x0, sizeof(struct dma_heap_allocation_data));
+
+    buf_data.len = size;
+    buf_data.fd_flags = O_CLOEXEC | O_RDWR;
+    ret = ioctl(dma_heap_fd, DMA_HEAP_IOCTL_ALLOC, &buf_data);
+    if (ret < 0) {
+        printf("RK_DMA_HEAP_ALLOC_BUFFER failed\n");
+        return ret;
+    }
+
+    /* mmap va */
+    if (fcntl(buf_data.fd, F_GETFL) & O_RDWR)
+        prot = PROT_READ | PROT_WRITE;
+    else
+        prot = PROT_READ;
+
+    /* mmap contiguors buffer to user */
+    mmap_va = (void *)mmap(NULL, buf_data.len, prot, MAP_SHARED, buf_data.fd, 0);
+    if (mmap_va == MAP_FAILED) {
+        printf("mmap failed: %s\n", strerror(errno));
+        return -errno;
+    }
+
+    *va = mmap_va;
+    *fd = buf_data.fd;
+
+    close(dma_heap_fd);
+
+    return 0;
+}
+
+int dma_sync_device_to_cpu(int fd) {
+    uint64_t flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW;
+    return ioctl(fd, DMA_BUF_IOCTL_SYNC, &flags);
+}
+
+int dma_sync_cpu_to_device(int fd) {
+    uint64_t flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW;
+    return ioctl(fd, DMA_BUF_IOCTL_SYNC, &flags);
+}
+void dma_buf_free(size_t size, int *fd, void *va) {
+    int len;
+
+    len =  size;
+    munmap(va, len);
+
+    close(*fd);
+    *fd = -1;
+}
+
+#endif
+
 // Pool of RKNPU2 matmul kernels so we can reuse them
 #define GGML_RKNPU2_MAX_MATMUL_KERNELS 16
 static struct ggml_rknpu2_matmul_kernel matmul_kernels[GGML_RKNPU2_MAX_MATMUL_KERNELS];
 static int matmul_kernels_count = 0;
+
+static uint64_t rknpu2_allocated_bytes = 0;
 
 static struct ggml_rknpu2_matmul_kernel *
 ggml_rknpu2_matmul_kernel_find(int m, int k, int n, rknn_tensor_type type) {
@@ -185,10 +287,27 @@ void ggml_rknpu2_mul_mat(const struct ggml_tensor * src0, const struct ggml_tens
     // First time called. Initialize RKNPU2 API structs
     if(pack->initialized == 0) {
         struct ggml_rknpu2_matmul_kernel* kernel = ggml_rknpu2_matmul_kernel_create(m, k, n, pack->type);
-
-        pack->B = rknn_create_mem(kernel->matmul_ctx, kernel->matmul_io_attr.B.size);
-        memcpy(pack->B->virt_addr, pack->ordered_data, kernel->matmul_io_attr.B.size);
+        // allocate B
+#if GGML_RKNPU2_USE_OUTSIDE_ALLOC
+        int fd = -1;
+        uint8_t *va = NULL;
+        dma_alloc(kernel->matmul_io_attr.B.size, &fd, (void *)&va);
+        dma_sync_device_to_cpu(fd);
+        pack->B = rknn_create_mem_from_fd(kernel->matmul_ctx, fd, va,
+                                          kernel->matmul_io_attr.B.size, 0);
+        memcpy(pack->B->virt_addr, pack->ordered_data,
+               kernel->matmul_io_attr.B.size);
+        dma_sync_cpu_to_device(fd);
+#else
+        pack->B =
+            rknn_create_mem(kernel->matmul_ctx, kernel->matmul_io_attr.B.size);
+        memcpy(pack->B->virt_addr, pack->ordered_data,
+               kernel->matmul_io_attr.B.size);
+#endif
         free(pack->ordered_data);
+        rknpu2_allocated_bytes += kernel->matmul_io_attr.B.size;
+        printf("RKNPU2 allocated %f MiB\n",
+               rknpu2_allocated_bytes / 1024.0F / 1024.0F);
         pack->ordered_data = NULL;
         pack->initialized = 1;
     }

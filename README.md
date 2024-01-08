@@ -8,6 +8,12 @@
 
 Inference of [LLaMA](https://arxiv.org/abs/2302.13971) model in pure C/C++
 
+### About this branch
+
+This branch my development branch working on implementing RK3588 NPU support. Currently it is functional but is not faster then CPU due to various reasons. For how to use the branch. Please refer to my comment introducing my fork.
+
+https://github.com/ggerganov/llama.cpp/issues/722#issuecomment-1780333765
+
 ### Hot topics
 
 - Added Mixtral support: https://github.com/ggerganov/llama.cpp/pull/4406

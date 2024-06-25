@@ -88,6 +88,7 @@ static size_t ggml_backend_metalium_buffer_type_get_max_size(ggml_backend_buffer
 }
 
 GGML_CALL static size_t ggml_backend_metalium_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    // TODO: Make sure this is correct
     if(ggml_is_quantized(tensor->type)) {
         return ggml_nbytes(tensor);
     }
@@ -95,13 +96,72 @@ GGML_CALL static size_t ggml_backend_metalium_buffer_type_get_alloc_size(ggml_ba
     for(int i = 0; i < 4; i++) {
         nelements *= i < 2 ? tensor->ne[i] / 32 + (tensor->ne[i] % 32 != 0) : tensor->ne[i];
     }
-    return nelements  * ggml_type_size(tensor->type);
+    return nelements * ggml_type_size(tensor->type);
+    GGML_UNUSED(buft);
+}
 
+struct ggml_backend_metalium_buffer_context {
+
+    size_t ggml_buffer_size_bytes = 0;
+    std::string name;
+    
+    // These initializations are deferred due to GGML API limitations
+    tt::tt_metal::Tensor tensor;
+};
+
+GGML_CALL static const char * ggml_backend_metalium_buffer_get_name(ggml_backend_buffer_t buffer) {
+    ggml_backend_metalium_buffer_context * ctx = (ggml_backend_metalium_buffer_context *)buffer->context;
+    return ctx->name.c_str();
+}
+
+static void
+ggml_backend_metalium_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_backend_metalium_buffer_context * ctx = ( ggml_backend_metalium_buffer_context *)buffer->context;
+    delete ctx;
+}
+
+static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer,
+                                                ggml_tensor *tensor,
+                                                const void *data, size_t offset,
+                                                size_t size)
+{
+    ggml_backend_metalium_buffer_context * ctx = (ggml_backend_metalium_buffer_context *)buffer->context;
+    ggml_type ggtype = tensor->type;
+    GGML_ASSERT(ggtype == GGML_TYPE_F16);
+    abort(); // not implemented yet
+
+    GGML_ASSERT(offset == 0);
+}
+
+static struct ggml_backend_buffer_i ggml_backend_metalium_buffer_interface = {
+    /* .get_name        = */ ggml_backend_metalium_buffer_get_name,
+    /* .free_buffer     = */ ggml_backend_metalium_buffer_free_buffer,
+    /* .get_base        = */ nullptr, //ggml_backend_metalium_buffer_get_base,
+    /* .init_tensor     = */ nullptr, //ggml_backend_metalium_buffer_init_tensor,
+    /* .set_tensor      = */ ggml_backend_metalium_buffer_set_tensor,
+    /* .get_tensor      = */ nullptr, //ggml_backend_metalium_buffer_get_tensor,
+    /* .cpy_tensor      = */ nullptr, //ggml_backend_metalium_buffer_cpy_tensor,
+    /* .clear           = */ nullptr, //ggml_backend_metalium_buffer_clear,
+    /* .reset           = */ nullptr,
+};
+
+
+GGML_CALL static ggml_backend_buffer_t
+ggml_backend_metalium_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
+                                           size_t size) {
+    // ggml_backend_metalium_buffer_type_context * buft_ctx = (ggml_backend_metalium_buffer_type_context *)buft->context;
+    ggml_backend_metalium_buffer_context* ctx = new ggml_backend_metalium_buffer_context;
+
+    // real allocation is deferred until the first tensor is set because we don't know the underlying tensor type yet
+    // TODO: Use a constructor
+    ctx->ggml_buffer_size_bytes = size;
+    ctx->name = ctx->name;
+    return ggml_backend_buffer_init(buft, ggml_backend_metalium_buffer_interface, ctx, size);
 }
 
 static ggml_backend_buffer_type_i ggml_backend_metalium_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_metalium_buffer_type_name,
-    /* .alloc_buffer     = */ nullptr,//ggml_backend_sycl_buffer_type_alloc_buffer,
+    /* .alloc_buffer     = */ ggml_backend_metalium_buffer_type_alloc_buffer,
     /* .get_alignment    = */ ggml_backend_metalium_buffer_type_get_alignment,
     /* .get_max_size     = */ ggml_backend_metalium_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_metalium_buffer_type_get_alloc_size,
@@ -109,7 +169,7 @@ static ggml_backend_buffer_type_i ggml_backend_metalium_buffer_type_interface = 
 };
 
 ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(int device) {
-    GGML_ASSERT(device < tt::tt_metal::GetNumAvailableDevices());
+    GGML_ASSERT((size_t)device < tt::tt_metal::GetNumAvailableDevices());
     static std::map<int, ggml_backend_buffer_type> buffer_type_map;
 
     GGML_ASSERT(g_device_map.contains(device));
@@ -228,6 +288,7 @@ ggml_backend_t ggml_backend_metalium_init(void) {
         /* device_id         = */ device_id,
         /* name              = */ "Metalium " + std::to_string(device_id),
     };
+    AutoFormat::SetDefaultDevice(ctx->device);
     
 
     // store the device in the global map because tensor creation uses device ID but Metalium disallows opening the same device twice

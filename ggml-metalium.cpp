@@ -7,6 +7,7 @@
 #include "tensor/types.hpp"
 #include "tt_dnn/op_library/auto_format.hpp"
 #include <cstddef>
+#include <cstdint>
 #include <tt_eager/tensor/tensor.hpp>
 #include <ttnn/core.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
@@ -21,6 +22,7 @@
 struct ggml_backend_metalium_context {
     ttnn::device::Device* device = nullptr;
     int device_id = 0;
+    std::string name;
 };
 
 
@@ -62,20 +64,68 @@ GGML_CALL static void ggml_backend_metalium_free(ggml_backend_t backend) {
     delete backend;
 }
 
+struct ggml_backend_metalium_buffer_type_context {
+    ttnn::Device* device = nullptr;
+    std::string name;
+};
+
+GGML_CALL static const char * ggml_backend_metalium_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    ggml_backend_metalium_buffer_type_context * ctx = (ggml_backend_metalium_buffer_type_context *)buft->context;
+
+    return ctx->name.c_str();
+}
+
+GGML_CALL static size_t ggml_backend_metalium_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+    return 4096; // assume the wosre, BFP16 on tile boundary
+    GGML_UNUSED(buft);
+}
+
+// NOTE: I might need to add a metalium tensor wrapper to work around TT tensors have hardware-tagged data types
+//       and GGML tensors does not specify the data type during tensor creation.
+static size_t ggml_backend_metalium_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+    ggml_backend_metalium_buffer_type_context * ctx = (ggml_backend_metalium_buffer_type_context *)buft->context;
+    return ctx->device->num_dram_channels() * ctx->device->dram_size_per_channel();
+}
+
+GGML_CALL static size_t ggml_backend_metalium_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    if(ggml_is_quantized(tensor->type)) {
+        return ggml_nbytes(tensor);
+    }
+    intmax_t nelements = 1;
+    for(int i = 0; i < 4; i++) {
+        nelements *= i < 2 ? tensor->ne[i] / 32 + (tensor->ne[i] % 32 != 0) : tensor->ne[i];
+    }
+    return nelements  * ggml_type_size(tensor->type);
+
+}
+
+static ggml_backend_buffer_type_i ggml_backend_metalium_buffer_type_interface = {
+    /* .get_name         = */ ggml_backend_metalium_buffer_type_name,
+    /* .alloc_buffer     = */ nullptr,//ggml_backend_sycl_buffer_type_alloc_buffer,
+    /* .get_alignment    = */ ggml_backend_metalium_buffer_type_get_alignment,
+    /* .get_max_size     = */ ggml_backend_metalium_buffer_type_get_max_size,
+    /* .get_alloc_size   = */ ggml_backend_metalium_buffer_type_get_alloc_size,
+    /* .is_host          = */ nullptr,
+};
+
 ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(int device) {
-    // GGML_ASSERT(device < tt::tt_metal::GetNumAvailableDevices());
-    // static std::map<int, ggml_backend_buffer_type_t> buffer_type_map;
+    GGML_ASSERT(device < tt::tt_metal::GetNumAvailableDevices());
+    static std::map<int, ggml_backend_buffer_type> buffer_type_map;
 
-    // if(buffer_type_map.contains(device)) {
-    //     return buffer_type_map[device];
-    // }
+    GGML_ASSERT(g_device_map.contains(device));
 
+    if(buffer_type_map.contains(device)) {
+        return &buffer_type_map[device];
+    }
 
-
-
-    abort();
-    GGML_UNUSED(device);
-    return NULL;
+    buffer_type_map[device] = {
+        /* .iface    = */ ggml_backend_metalium_buffer_type_interface,
+        /* .context  = */ new ggml_backend_metalium_buffer_type_context{
+            /* .device = */ g_device_map[device],
+            /* .name   = */ "Metalium " + std::to_string(device),
+        },
+    };
+    return &buffer_type_map[device];
 }
 
 GGML_CALL static ggml_backend_buffer_type_t ggml_backend_metalium_get_default_buffer_type(ggml_backend_t backend) {
@@ -171,10 +221,14 @@ static ggml_guid_t ggml_backend_metalium_guid(void) {
 }
 
 ggml_backend_t ggml_backend_metalium_init(void) {
-    ggml_backend_metalium_context * ctx = new ggml_backend_metalium_context;
     // TODO: Support multiple devices (do we even need to? TT supports merging diverse devices into a single device, at least the API suggests that)
-    ctx->device = &ttnn::device::open_device(0);
-    ctx->device_id = 0;
+    const int device_id = 0;
+    ggml_backend_metalium_context * ctx = new ggml_backend_metalium_context {
+        /* device            = */ &ttnn::device::open_device(device_id),
+        /* device_id         = */ device_id,
+        /* name              = */ "Metalium " + std::to_string(device_id),
+    };
+    
 
     // store the device in the global map because tensor creation uses device ID but Metalium disallows opening the same device twice
     g_device_map[0] = ctx->device;

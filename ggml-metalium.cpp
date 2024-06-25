@@ -1,39 +1,25 @@
-#include "ggml-blas.h"
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 #include "ggml-metalium.h"
 
+#include "tensor/host_buffer/functions.hpp"
+#include "tensor/types.hpp"
+#include "tt_dnn/op_library/auto_format.hpp"
+#include <cstddef>
+#include <tt_eager/tensor/tensor.hpp>
+#include <ttnn/core.hpp>
+#include <ttnn/operations/eltwise/binary/binary.hpp>
+#include <ttnn/device.hpp>
+#include <tt_dnn/op_library/fully_connected/fully_connected_op.hpp>
+#include <tt_dnn/op_library/eltwise_unary/eltwise_unary_op.hpp>
+#include <tt_eager/tensor/tensor.hpp>
+
+
 #include <memory>
 
 struct ggml_backend_metalium_context {
-    int n_threads = GGML_DEFAULT_N_THREADS;
-    std::unique_ptr<char[]> work_data;
-    size_t work_size = 0;
+    ttnn::device::Device* device = nullptr;
 };
-
-// helper function to determine if it is better to use BLAS or not
-// for large matrices, BLAS is faster
-static bool ggml_backend_blas_use_blas(const struct ggml_tensor * dst) {
-    const struct ggml_tensor * src0 = dst->src[0];
-    const struct ggml_tensor * src1 = dst->src[1];
-
-    const int64_t ne10 = src1->ne[0];
-
-    const int64_t ne0 = dst->ne[0];
-    const int64_t ne1 = dst->ne[1];
-
-    // TODO: find the optimal values for these
-    if (ggml_is_contiguous(src0) &&
-        ggml_is_contiguous(src1) &&
-        src1->type == GGML_TYPE_F32 &&
-        (ne0 >= 32 && ne1 >= 32 && ne10 >= 32)) {
-
-        /*printf("BLAS: %d %d %d %d %d\n", ne0, ne1, ne10, ne00, ne01);*/
-        return true;
-    }
-
-    return false;
-}
 
 static void ggml_backend_blas_mul_mat(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
     GGML_UNUSED(ctx);
@@ -234,6 +220,7 @@ GGML_CALL static const char * ggml_backend_metalium_name(ggml_backend_t backend)
 
 GGML_CALL static void ggml_backend_metalium_free(ggml_backend_t backend) {
     ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
+    ctx->device->close();
     delete ctx;
     delete backend;
 }
@@ -302,7 +289,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_buft(ggml_backend_t backend
     GGML_UNUSED(backend);
 }
 
-static struct ggml_backend_i blas_backend_i = {
+static struct ggml_backend_i metalium_backend_i = {
     /* .get_name                = */ ggml_backend_metalium_name,
     /* .free                    = */ ggml_backend_metalium_free,
     /* .get_default_buffer_type = */ ggml_backend_metalium_get_default_buffer_type,
@@ -332,10 +319,11 @@ static ggml_guid_t ggml_backend_metalium_guid(void) {
 
 ggml_backend_t ggml_backend_metalium_init(void) {
     ggml_backend_metalium_context * ctx = new ggml_backend_metalium_context;
+    ctx->device = &ttnn::device::open_device(0);
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_metalium_guid(),
-        /* .interface = */ blas_backend_i,
+        /* .interface = */ metalium_backend_i,
         /* .context   = */ ctx,
     };
     return backend;

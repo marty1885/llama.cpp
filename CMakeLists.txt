@@ -917,6 +917,11 @@ if(LLAMA_METALIUM)
         -stdlib=libc++
     )
 
+    # HACK: Metalium requires C++20. Find a way to get this info into GGML
+    set(CMAKE_CXX_STANDARD 20)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
+
     set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} ${METALIUM_LIBRARIES})
     set(LLAMA_EXTRA_INCLUDES ${LLAMA_EXTRA_INCLUDES} ${METALIUM_INCLUDE_DIRS})
     link_directories(ggml ${METALIUM_LIB_DIRS})
@@ -1353,6 +1358,11 @@ if (BUILD_SHARED_LIBS)
     target_link_libraries(ggml_shared PUBLIC Threads::Threads ${LLAMA_EXTRA_LIBS})
     install(TARGETS ggml_shared LIBRARY)
 endif()
+
+# HACK: Metalium needs PCH else takes forever to compile
+if (LLAMA_METALIUM)
+    target_precompile_headers(ggml PRIVATE metalium-pch.hpp)
+endif ()
 
 # llama
 

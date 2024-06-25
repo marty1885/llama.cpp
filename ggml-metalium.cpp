@@ -1,9 +1,11 @@
+#include "common/bfloat16.hpp"
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 #include "ggml-metalium.h"
 
 #include "host_api.hpp"
 #include "tensor/host_buffer/functions.hpp"
+#include "tensor/host_buffer/types.hpp"
 #include "tensor/types.hpp"
 #include "tt_dnn/op_library/auto_format.hpp"
 #include <cstddef>
@@ -127,8 +129,23 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
 {
     ggml_backend_metalium_buffer_context * ctx = (ggml_backend_metalium_buffer_context *)buffer->context;
     ggml_type ggtype = tensor->type;
-    GGML_ASSERT(ggtype == GGML_TYPE_F16);
-    abort(); // not implemented yet
+
+    // TODO: Support other types
+    GGML_ASSERT(ggtype == GGML_TYPE_BF16);
+    std::vector<bfloat16> bfloat16_data(size / sizeof(bfloat16));
+    std::memcpy(bfloat16_data.data(), data, size);
+    auto owned = tt::tt_metal::owned_buffer::create(std::move(bfloat16_data));
+    
+    std::vector<uint32_t> shape(GGML_MAX_DIMS);
+    for(int i = 0; i < GGML_MAX_DIMS; i++) {
+        // GGML stores the shape in reverse order
+        shape[i] = tensor->ne[GGML_MAX_DIMS - i - 1];
+    }
+
+    ctx->tensor = tt::tt_metal::Tensor(OwnedStorage{owned}, tt::tt_metal::Shape(shape), tt::tt_metal::DataType::BFLOAT16, tt::tt_metal::Layout::ROW_MAJOR);
+    // HACK: Need to save device pointer
+    ctx->tensor = ctx->tensor.to(g_device_map[0]);
+    ctx->tensor = tilize_with_zero_padding(ctx->tensor);
 
     GGML_ASSERT(offset == 0);
 }

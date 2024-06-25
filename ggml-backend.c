@@ -445,6 +445,12 @@ GGML_CALL static void ggml_backend_registry_init(void) {
     extern GGML_CALL void ggml_backend_kompute_reg_devices(void);
     ggml_backend_kompute_reg_devices();
 #endif
+
+#ifdef GGML_USE_METALIUM
+    extern GGML_CALL ggml_backend_t ggml_backend_reg_metalium_init(const char * params, void * user_data);
+    extern GGML_CALL ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(void);
+    ggml_backend_register("Metalium", ggml_backend_reg_metalium_init, ggml_backend_cpu_buffer_type(), NULL);
+#endif
 }
 
 GGML_CALL void ggml_backend_register(const char * name, ggml_backend_init_fn init_fn, ggml_backend_buffer_type_t default_buffer_type, void * user_data) {

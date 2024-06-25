@@ -29,6 +29,10 @@
 #  include "ggml-metal.h"
 #endif
 
+#ifdef GGML_USE_METALIUM
+#  include "ggml-metalium.h"
+#endif
+
 // TODO: replace with ggml API call
 #define QK_K 256
 
@@ -2584,6 +2588,11 @@ static ggml_backend_buffer_type_t llama_default_buffer_type_offload(const llama_
     if (buft == nullptr) {
         LLAMA_LOG_WARN("%s: cannot use GPU %d, check `vulkaninfo --summary`\n", __func__, gpu);
     }
+// #elif defined(GGML_USE_METALIUM)
+//     buft = ggml_backend_metalium_buffer_type(gpu);
+//     if (buft == nullptr) {
+//         LLAMA_LOG_WARN("%s: cannot use GPU %d, check `metalinfo`\n", __func__, gpu);
+//     }
 #endif
 
     if (buft == nullptr) {
@@ -16473,7 +16482,8 @@ bool llama_supports_mlock(void) {
 
 bool llama_supports_gpu_offload(void) {
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_METAL)   || defined(GGML_USE_VULKAN) || \
-    defined(GGML_USE_SYCL) || defined(GGML_USE_KOMPUTE) || defined(GGML_USE_RPC)
+    defined(GGML_USE_SYCL) || defined(GGML_USE_KOMPUTE) || defined(GGML_USE_RPC) || \
+    defined(GGML_USE_METALIUM)
     // Defined when llama.cpp is compiled with support for offloading model layers to GPU.
     return true;
 #else
@@ -16783,6 +16793,18 @@ struct llama_context * llama_new_context_with_model(
             auto * backend = ggml_backend_kompute_init(model->main_gpu);
             if (backend == nullptr) {
                 LLAMA_LOG_ERROR("%s: failed to initialize Kompute backend\n", __func__);
+                llama_free(ctx);
+                return nullptr;
+            }
+            ctx->backends.push_back(backend);
+        }
+#endif
+
+#ifdef GGML_USE_METALIUM
+        if (model->n_gpu_layers > 0) {
+            auto * backend = ggml_backend_metalium_init();
+            if (backend == nullptr) {
+                LLAMA_LOG_ERROR("%s: failed to initialize Metallium backend\n", __func__);
                 llama_free(ctx);
                 return nullptr;
             }

@@ -15,6 +15,8 @@ GGML_API GGML_CALL ggml_backend_t ggml_backend_metalium_init(void);
 
 GGML_API GGML_CALL bool ggml_backend_is_metalium(ggml_backend_t backend);
 
+GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(int device_id);
+
 GGML_CALL ggml_backend_t ggml_backend_reg_metalium_init(const char * params, void * user_data);
 
 #ifdef  __cplusplus

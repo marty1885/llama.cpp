@@ -2,6 +2,7 @@
 #include "ggml.h"
 #include "ggml-metalium.h"
 
+#include "host_api.hpp"
 #include "tensor/host_buffer/functions.hpp"
 #include "tensor/types.hpp"
 #include "tt_dnn/op_library/auto_format.hpp"
@@ -19,195 +20,31 @@
 
 struct ggml_backend_metalium_context {
     ttnn::device::Device* device = nullptr;
+    int device_id = 0;
 };
 
-static void ggml_backend_blas_mul_mat(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////
+// Backend internal state tracking because GGML API does not allow
+///////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// maps device id to device
+static std::map<int, ttnn::Device*> g_device_map;
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////
+// Actual backend code
+///////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
     GGML_UNUSED(ctx);
     GGML_UNUSED(dst);
     abort();
-#if 0
-    const struct ggml_tensor * src0 = dst->src[0];
-    const struct ggml_tensor * src1 = dst->src[1];
-
-    GGML_TENSOR_BINARY_OP_LOCALS
-
-    const enum ggml_type type = src0->type;
-
-    GGML_ASSERT(ne0 == ne01);
-    GGML_ASSERT(ne1 == ne11);
-    GGML_ASSERT(ne2 == ne12);
-    GGML_ASSERT(ne3 == ne13);
-
-    // we don't support permuted src0 or src1
-    GGML_ASSERT(nb00 == ggml_type_size(type));
-    GGML_ASSERT(nb10 == ggml_type_size(src1->type));
-
-    // dst cannot be transposed or permuted
-    GGML_ASSERT(nb0 == sizeof(float));
-    GGML_ASSERT(nb0 <= nb1);
-    GGML_ASSERT(nb1 <= nb2);
-    GGML_ASSERT(nb2 <= nb3);
-
-    // broadcast factors
-    const int64_t r2 = ne12/ne02;
-    const int64_t r3 = ne13/ne03;
-
-    const int64_t ne_plane      = ne01*ne00;
-    const size_t  desired_wsize = type == GGML_TYPE_F32 ? 0 : ne03*ne02*ne_plane*sizeof(float);
-
-    if (ctx->work_size < desired_wsize) {
-        ctx->work_data.reset(new char[desired_wsize]);
-        ctx->work_size = desired_wsize;
-    }
-    void * wdata = ctx->work_data.get();
-
-    // convert src0 to float
-    if (type != GGML_TYPE_F32) {
-        ggml_type_traits_t type_traits = ggml_internal_get_type_traits(type);
-        ggml_to_float_t const to_float = type_traits.to_float;
-
-        for (int64_t i03 = 0; i03 < ne03; i03++) {
-            for (int64_t i02 = 0; i02 < ne02; i02++) {
-                const void  *       x      = (char *)  src0->data + i02*nb02          + i03*nb03;
-                      float * const wplane = (float *) wdata      + i02*ne_plane      + i03*ne02*ne_plane;
-
-                const int min_cols_per_thread = 4096;
-                const int min_rows_per_thread = std::max((int)(min_cols_per_thread/ne00), 1);
-                const int n_threads = std::max(std::min(ctx->n_threads, (int)(ne01/min_rows_per_thread)), 1);
-
-#ifdef GGML_USE_OPENMP
-                #pragma omp parallel for num_threads(n_threads)
-                for (int64_t i01 = 0; i01 < ne01; i01++) {
-                    to_float((const char *) x + i01*nb01, wplane + i01*ne00, ne00);
-                }
-#else
-                for (int i = 1; i < n_threads; i++) {
-                    const int64_t start =       i*ne01/n_threads;
-                    const int64_t end   = (i + 1)*ne01/n_threads;
-                    if (start < end) {
-                        ctx->tasks.push_back(std::async(std::launch::async, [=]() {
-                            for (int64_t i01 = start; i01 < end; i01++) {
-                                to_float((const char *) x + i01*nb01, wplane + i01*ne00, ne00);
-                            }
-                        }));
-                    }
-                }
-                {
-                    // reuse the current thread for the first task
-                    const int64_t start = 0;
-                    const int64_t end   = ne01/n_threads;
-                    for (int64_t i01 = start; i01 < end; i01++) {
-                        to_float((const char *) x + i01*nb01, wplane + i01*ne00, ne00);
-                    }
-                }
-#endif
-            }
-        }
-
-#ifndef GGML_USE_OPENMP
-        // wait for all tasks to finish
-        for (auto & task : ctx->tasks) {
-            task.get();
-        }
-        ctx->tasks.clear();
-#endif
-    }
-
-#if defined(OPENBLAS_VERSION)
-    openblas_set_num_threads(ctx->n_threads);
-#endif
-
-#if defined(BLIS_ENABLE_CBLAS)
-    bli_thread_set_num_threads(ctx->n_threads);
-#endif
-
-    for (int64_t i13 = 0; i13 < ne13; i13++) {
-        for (int64_t i12 = 0; i12 < ne12; i12++) {
-            const int64_t i03 = i13/r3;
-            const int64_t i02 = i12/r2;
-
-            const float * x = (float *) ((char *) src0->data + i02*nb02 + i03*nb03);
-            const float * y = (float *) ((char *) src1->data + i12*nb12 + i13*nb13);
-                  float * d = (float *) ((char *)  dst->data + i12*nb2  + i13*nb3);
-
-            if (type != GGML_TYPE_F32) {
-                x = (float *) wdata + i02*ne_plane + i03*ne02*ne_plane;
-            }
-
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        ne1, ne01, ne10,
-                        1.0f,   y, ne10,
-                                x, ne00,
-                        0.0f,   d, ne01);
-        }
-    }
-#endif
 }
 
-static void ggml_backend_blas_out_prod(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
+static void ggml_backend_metalium_out_prod(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
     GGML_UNUSED(ctx);
     GGML_UNUSED(dst);
     abort();
-#if 0
-    const struct ggml_tensor * src0 = dst->src[0];
-    const struct ggml_tensor * src1 = dst->src[1];
-
-    GGML_TENSOR_BINARY_OP_LOCALS
-
-    GGML_ASSERT(ne0  == ne00);
-    GGML_ASSERT(ne1  == ne10);
-    GGML_ASSERT(ne2  == ne02);
-    GGML_ASSERT(ne02 == ne12);
-    GGML_ASSERT(ne3  == ne13);
-    GGML_ASSERT(ne03 == ne13);
-
-    // we don't support permuted src0 or src1
-    GGML_ASSERT(nb00 == sizeof(float));
-
-    // dst cannot be transposed or permuted
-    GGML_ASSERT(nb0 == sizeof(float));
-    // GGML_ASSERT(nb0 <= nb1);
-    // GGML_ASSERT(nb1 <= nb2);
-    // GGML_ASSERT(nb2 <= nb3);
-
-    // Arguments to ggml_compute_forward_out_prod (expressed as major,minor)
-    // src0: (k,n)
-    // src1: (k,m)
-    // dst:  (m,n)
-    //
-    // Arguments to sgemm (see https://github.com/Reference-LAPACK/lapack/blob/master/BLAS/SRC/sgemm.f)
-    // Also expressed as (major,minor)
-    // a: (m,k): so src1 transposed
-    // b: (k,n): so src0
-    // c: (m,n)
-    //
-    // However, if ggml_is_transposed(src1) is true, then
-    // src1->data already contains a transposed version, so sgemm mustn't
-    // transpose it further.
-
-    int n = src0->ne[0];
-    int k = src0->ne[1];
-    int m = src1->ne[0];
-
-    CBLAS_TRANSPOSE transposeA;
-    int lda;
-
-    if (!ggml_is_transposed(src1)) {
-        transposeA = CblasTrans;
-        lda = m;
-    } else {
-        transposeA = CblasNoTrans;
-        lda = k;
-    }
-
-    float * a = (float *) ((char *) src1->data);
-    float * b = (float *) ((char *) src0->data);
-    float * c = (float *) ((char *) dst->data);
-
-    cblas_sgemm(CblasRowMajor, transposeA, CblasNoTrans, m, n, k, 1.0, a, lda, b, n, 0.0, c, n);
-
-    GGML_UNUSED(ctx);
-#endif
 }
 
 // backend interface
@@ -225,9 +62,25 @@ GGML_CALL static void ggml_backend_metalium_free(ggml_backend_t backend) {
     delete backend;
 }
 
-GGML_CALL static ggml_backend_buffer_type_t ggml_backend_metalium_get_default_buffer_type(ggml_backend_t backend) {
-    return ggml_backend_cpu_buffer_type();
+ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(int device) {
+    // GGML_ASSERT(device < tt::tt_metal::GetNumAvailableDevices());
+    // static std::map<int, ggml_backend_buffer_type_t> buffer_type_map;
 
+    // if(buffer_type_map.contains(device)) {
+    //     return buffer_type_map[device];
+    // }
+
+
+
+
+    abort();
+    GGML_UNUSED(device);
+    return NULL;
+}
+
+GGML_CALL static ggml_backend_buffer_type_t ggml_backend_metalium_get_default_buffer_type(ggml_backend_t backend) {
+    auto* ctx = (ggml_backend_metalium_context *)backend->context;
+    return ggml_backend_metalium_buffer_type(ctx->device_id);
     GGML_UNUSED(backend);
 }
 
@@ -240,11 +93,11 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
 
         switch (node->op) {
             case GGML_OP_MUL_MAT:
-                ggml_backend_blas_mul_mat(ctx, node);
+                ggml_backend_metalium_mul_mat(ctx, node);
                 break;
 
             case GGML_OP_OUT_PROD:
-                ggml_backend_blas_out_prod(ctx, node);
+                ggml_backend_metalium_out_prod(ctx, node);
                 break;
 
             case GGML_OP_NONE:
@@ -319,7 +172,12 @@ static ggml_guid_t ggml_backend_metalium_guid(void) {
 
 ggml_backend_t ggml_backend_metalium_init(void) {
     ggml_backend_metalium_context * ctx = new ggml_backend_metalium_context;
+    // TODO: Support multiple devices (do we even need to? TT supports merging diverse devices into a single device, at least the API suggests that)
     ctx->device = &ttnn::device::open_device(0);
+    ctx->device_id = 0;
+
+    // store the device in the global map because tensor creation uses device ID but Metalium disallows opening the same device twice
+    g_device_map[0] = ctx->device;
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_metalium_guid(),

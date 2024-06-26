@@ -507,6 +507,12 @@ GGML_CALL static bool ggml_backend_metalium_supports_buft(ggml_backend_t backend
     GGML_UNUSED(backend);
 }
 
+static void ggml_backend_metalium_synchronize(ggml_backend_t backend)
+{
+    ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
+    tt::tt_metal::Finish(ctx->device->command_queue());
+}
+
 static struct ggml_backend_i metalium_backend_i = {
     /* .get_name                = */ ggml_backend_metalium_name,
     /* .free                    = */ ggml_backend_metalium_free,
@@ -514,7 +520,7 @@ static struct ggml_backend_i metalium_backend_i = {
     /* .set_tensor_async        = */ NULL,
     /* .get_tensor_async        = */ NULL,
     /* .cpy_tensor_async        = */ NULL,
-    /* .synchronize             = */ NULL,
+    /* .synchronize             = */ ggml_backend_metalium_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
     /* .graph_plan_update       = */ NULL,

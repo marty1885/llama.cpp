@@ -5,11 +5,13 @@
 #include "ggml-metalium.h"
 
 #include "host_api.hpp"
+#include "impl/dispatch/command_queue.hpp"
 #include "tensor/host_buffer/functions.hpp"
 #include "tensor/host_buffer/types.hpp"
 #include "tensor/types.hpp"
 #include "tt_dnn/op_library/auto_format.hpp"
 #include "tt_dnn/op_library/tilize/tilize_op.hpp"
+#include "tt_dnn/op_library/untilize/untilize_op.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -77,7 +79,8 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
 
     tt::tt_metal::Tensor& a = *reinterpret_cast<TensorWithMetadata*>(src0->extra)->tensor;
     tt::tt_metal::Tensor& b = *reinterpret_cast<TensorWithMetadata*>(src1->extra)->tensor;
-    tt::tt_metal::Tensor& c = *reinterpret_cast<TensorWithMetadata*>(dst->extra)->tensor;
+
+    // TODO: Check they are not null
 
     GGML_ASSERT(a.storage_type() == tt::tt_metal::StorageType::DEVICE || a.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
     GGML_ASSERT(b.storage_type() == tt::tt_metal::StorageType::DEVICE || b.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
@@ -85,8 +88,9 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     printf("A shape = %u %u %u %u\n", a.shape()[0], a.shape()[1], a.shape()[2], a.shape()[3]);
     printf("B shape = %u %u %u %u\n", b.shape()[0], b.shape()[1], b.shape()[2], b.shape()[3]);
 
-    // TODO: Support matmul of pre-transposed tensors. Calling transpose here is slow
-    c = tt::tt_metal::fully_connected(a, tt::tt_metal::transpose(b, 2, 3));
+    reinterpret_cast<TensorWithMetadata*>(dst->extra)->tensor = std::make_shared<tt::tt_metal::Tensor>(
+        tt::tt_metal::fully_connected(b, tt::tt_metal::transpose(a, 2, 3)));
+    printf("Done with matmul\n");
 }
 
 static void ggml_backend_metalium_out_prod(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
@@ -220,7 +224,53 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
         .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::tilize_with_zero_padding(t.to(bufctx->device))),
         .ggtype = ggtype,
     };
-    tt::tt_metal::Finish(bufctx->device->command_queue());
+}
+
+static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer,
+                                                const ggml_tensor *tensor,
+                                                void *data, size_t offset,
+                                                size_t size)
+{
+    GGML_ASSERT(size == ggml_nbytes(tensor));
+    GGML_ASSERT(tensor->extra != NULL);
+    GGML_UNUSED(offset);
+
+    TensorWithMetadata * meta = (TensorWithMetadata *)tensor->extra;
+    GGML_ASSERT(meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || meta->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
+
+    ggml_backend_metalium_buffer_context * ctx = (ggml_backend_metalium_buffer_context *)buffer->context;
+
+    ggml_type dst_ggtype = tensor->type;
+    tt::tt_metal::CommandQueue& queue = ctx->device->command_queue(0);
+
+    fprintf(stderr, "GGML thinks tensor shape is %ld %ld %ld %ld\n", tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+    fprintf(stderr, "TT thinks tensor shape is %u %u %u %u\n", meta->tensor->shape()[0], meta->tensor->shape()[1], meta->tensor->shape()[2], meta->tensor->shape()[3]);
+
+    // TODO: Proper handling of data types
+    if(dst_ggtype == GGML_TYPE_F32) {
+        if(meta->tensor->dtype() == tt::tt_metal::DataType::BFLOAT16) {
+
+            tt::tt_metal::Tensor row_major_tensor = tt::tt_metal::untilize(*meta->tensor);
+            ttnn::Shape shape = meta->tensor->shape();
+            size_t volume = 1;
+            for(size_t i = 0; i < shape.size(); i++) {
+                volume *= shape[i];
+            }
+            GGML_ASSERT((int64_t)volume == ggml_nelements(tensor) && "Mismatched tensor sizes");
+            std::vector<bfloat16> buf((volume / 1024 + (volume % 1024 != 0)) * 1024); // TT reads a tile at a time
+            tt::tt_metal::memcpy(queue, buf.data(), row_major_tensor);
+            tt::tt_metal::Finish(queue);
+            for(size_t i = 0; i < volume; i++) {
+                ((float*)data)[i] = buf[i].to_float();
+            }
+        }
+        else {
+            GGML_ASSERT(false && "Unsupported data type held in TT kernel");
+        }
+    }
+    else {
+        GGML_ASSERT(false && "Unsupported data type");
+    }
 }
 
 static void * ggml_backend_metalium_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -244,7 +294,7 @@ static struct ggml_backend_buffer_i ggml_backend_metalium_buffer_interface = {
     /* .get_base        = */ ggml_backend_metalium_buffer_get_base,
     /* .init_tensor     = */ ggml_backend_sycl_buffer_init_tensor,
     /* .set_tensor      = */ ggml_backend_metalium_buffer_set_tensor,
-    /* .get_tensor      = */ nullptr, //ggml_backend_metalium_buffer_get_tensor,
+    /* .get_tensor      = */ ggml_backend_metalium_buffer_get_tensor,
     /* .cpy_tensor      = */ nullptr, //ggml_backend_metalium_buffer_cpy_tensor,
     /* .clear           = */ nullptr, //ggml_backend_metalium_buffer_clear,
     /* .reset           = */ nullptr,

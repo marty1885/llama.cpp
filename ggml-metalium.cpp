@@ -88,6 +88,7 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     // TODO: Ask TT to support multiplication of pre-transposed tensors. Calling transpose here is inefficient
     reinterpret_cast<TensorWithMetadata*>(dst->extra)->tensor = std::make_shared<tt::tt_metal::Tensor>(
         tt::tt_metal::fully_connected(b, tt::tt_metal::transpose(a, 2, 3)));
+    GGML_UNUSED(ctx);
 }
 
 static void ggml_backend_metalium_out_prod(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
@@ -132,7 +133,7 @@ GGML_CALL static size_t ggml_backend_metalium_buffer_type_get_alignment(ggml_bac
 //       and GGML tensors does not specify the data type during tensor creation.
 static size_t ggml_backend_metalium_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
     ggml_backend_metalium_buffer_type_context * ctx = (ggml_backend_metalium_buffer_type_context *)buft->context;
-    return ctx->device->num_dram_channels() * ctx->device->dram_size_per_channel();
+    return ctx->device->num_dram_channels() * (size_t)ctx->device->dram_size_per_channel();
 }
 
 GGML_CALL static size_t ggml_backend_metalium_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
@@ -205,7 +206,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     }
     
     // TODO: Make sure this is correct
-    std::vector<uint32_t> shape(GGML_MAX_DIMS);
+    std::vector<uint32_t> shape(GGML_MAX_DIMS, 1);
     for(int i = 0; i < GGML_MAX_DIMS; i++) {
         // GGML stores the shape in reverse order
         shape[i] = tensor->ne[GGML_MAX_DIMS - i - 1];
@@ -272,7 +273,7 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
             size_t idx = 0;
             for(size_t w = 0; w < shape[0]; w++) {
                 for(size_t z = 0; z < shape[1]; z++) {
-                    for(size_t x = 0; x < shape[3]; x++) {
+                    for(size_t x = 0; x < shape[3]; x++) { // FIXME: Don't know why but the shape is reversed...????
                         for(size_t y = 0; y < shape[2]; y++) {
                             const size_t src_idx = x * stride[0] + y * stride[1] + z * stride[2] + w * stride[3];
                             ((float*)data)[idx++] = (float)buf[src_idx].to_float();
@@ -292,6 +293,7 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
 
 static void * ggml_backend_metalium_buffer_get_base(ggml_backend_buffer_t buffer) {
     // Not using this. Metalium's allication model is not compatible with GGML's allocator
+    GGML_UNUSED(buffer);
     return (void*)0x10000;
 }
 
@@ -405,7 +407,11 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
     const struct ggml_tensor * src1 = op->src[1];
     GGML_UNUSED(src0);
     GGML_UNUSED(src1);
-    return false;
+
+    if(op->op == GGML_OP_NONE) {
+        return true;
+    }
+    return op->op == GGML_OP_MUL_MAT && op->type == GGML_TYPE_F32;
 
     /*return (op->op == GGML_OP_MUL_MAT  && ggml_backend_blas_use_blas(op)) ||
            (op->op == GGML_OP_OUT_PROD && op->src[0]->type == GGML_TYPE_F32 &&
@@ -464,7 +470,8 @@ ggml_backend_t ggml_backend_metalium_init(void) {
     
 
     // store the device in the global map because tensor creation uses device ID but Metalium disallows opening the same device twice
-    g_device_map[0] = ctx->device;
+    g_device_map[device_id] = ctx->device;
+    ttnn::enable_program_cache(*ctx->device);
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_metalium_guid(),

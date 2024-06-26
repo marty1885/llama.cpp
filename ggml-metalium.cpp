@@ -85,12 +85,9 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     GGML_ASSERT(a.storage_type() == tt::tt_metal::StorageType::DEVICE || a.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
     GGML_ASSERT(b.storage_type() == tt::tt_metal::StorageType::DEVICE || b.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
 
-    printf("A shape = %u %u %u %u\n", a.shape()[0], a.shape()[1], a.shape()[2], a.shape()[3]);
-    printf("B shape = %u %u %u %u\n", b.shape()[0], b.shape()[1], b.shape()[2], b.shape()[3]);
-
+    // TODO: Ask TT to support multiplication of pre-transposed tensors. Calling transpose here is inefficient
     reinterpret_cast<TensorWithMetadata*>(dst->extra)->tensor = std::make_shared<tt::tt_metal::Tensor>(
         tt::tt_metal::fully_connected(b, tt::tt_metal::transpose(a, 2, 3)));
-    printf("Done with matmul\n");
 }
 
 static void ggml_backend_metalium_out_prod(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
@@ -243,25 +240,45 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
     ggml_type dst_ggtype = tensor->type;
     tt::tt_metal::CommandQueue& queue = ctx->device->command_queue(0);
 
-    fprintf(stderr, "GGML thinks tensor shape is %ld %ld %ld %ld\n", tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
-    fprintf(stderr, "TT thinks tensor shape is %u %u %u %u\n", meta->tensor->shape()[0], meta->tensor->shape()[1], meta->tensor->shape()[2], meta->tensor->shape()[3]);
-
     // TODO: Proper handling of data types
     if(dst_ggtype == GGML_TYPE_F32) {
         if(meta->tensor->dtype() == tt::tt_metal::DataType::BFLOAT16) {
-
-            tt::tt_metal::Tensor row_major_tensor = tt::tt_metal::untilize(*meta->tensor);
             ttnn::Shape shape = meta->tensor->shape();
-            size_t volume = 1;
+            size_t real_volume = 1;
             for(size_t i = 0; i < shape.size(); i++) {
-                volume *= shape[i];
+                real_volume *= shape[i];
             }
-            GGML_ASSERT((int64_t)volume == ggml_nelements(tensor) && "Mismatched tensor sizes");
-            std::vector<bfloat16> buf((volume / 1024 + (volume % 1024 != 0)) * 1024); // TT reads a tile at a time
+
+            GGML_ASSERT((int64_t)real_volume == ggml_nelements(tensor) && "Mismatched tensor sizes");
+            
+            tt::tt_metal::Tensor row_major_tensor = tt::tt_metal::untilize(*meta->tensor);
+            GGML_ASSERT(row_major_tensor.layout() == tt::tt_metal::Layout::ROW_MAJOR);
+
+            std::vector<bfloat16> buf(shape.volume()); // .volume() returns the underlying volume of the tensor not the logical one (TT enforces 32x32 tiles)
             tt::tt_metal::memcpy(queue, buf.data(), row_major_tensor);
             tt::tt_metal::Finish(queue);
-            for(size_t i = 0; i < volume; i++) {
-                ((float*)data)[i] = buf[i].to_float();
+
+            tt::tt_metal::Shape tt_underlying_shape = row_major_tensor.shape().value();
+            if(tt_underlying_shape[2] % 32 != 0) {
+                tt_underlying_shape[2] = (tt_underlying_shape[2] / 32 + 1) * 32;
+            }
+            if (tt_underlying_shape[3] % 32 != 0) {
+                tt_underlying_shape[3] = (tt_underlying_shape[3] / 32 + 1) * 32;
+            }
+            std::array<size_t, 4> stride = {1, tt_underlying_shape[3], tt_underlying_shape[3] * tt_underlying_shape[2], tt_underlying_shape[3] * tt_underlying_shape[2] * tt_underlying_shape[1]};
+
+            // Tilize to ROW_MAJOR doesn't mean the tensor is contiguous. It still has the underlying 32x32 tiles
+            // we need to view into the tensor to get the contiguous data
+            size_t idx = 0;
+            for(size_t w = 0; w < shape[0]; w++) {
+                for(size_t z = 0; z < shape[1]; z++) {
+                    for(size_t x = 0; x < shape[3]; x++) {
+                        for(size_t y = 0; y < shape[2]; y++) {
+                            const size_t src_idx = x * stride[0] + y * stride[1] + z * stride[2] + w * stride[3];
+                            ((float*)data)[idx++] = (float)buf[src_idx].to_float();
+                        }
+                    }
+                }
             }
         }
         else {

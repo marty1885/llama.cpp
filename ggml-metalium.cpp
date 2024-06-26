@@ -1,4 +1,5 @@
 #include "common/bfloat16.hpp"
+#include "device/tt_arch_types.h"
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 #include "ggml-metalium.h"
@@ -8,8 +9,10 @@
 #include "tensor/host_buffer/types.hpp"
 #include "tensor/types.hpp"
 #include "tt_dnn/op_library/auto_format.hpp"
+#include "tt_dnn/op_library/tilize/tilize_op.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <tt_eager/tensor/tensor.hpp>
 #include <ttnn/core.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
@@ -27,6 +30,11 @@ struct ggml_backend_metalium_context {
     std::string name;
 };
 
+struct TensorWithMetadata
+{
+    std::shared_ptr<tt::tt_metal::Tensor> tensor;
+    ggml_type ggtype = (ggml_type)-1;
+};
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 // Backend internal state tracking because GGML API does not allow
@@ -40,9 +48,43 @@ static std::map<int, ttnn::Device*> g_device_map;
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
-    abort();
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const enum ggml_type type = src0->type;
+
+    GGML_ASSERT(ne0 == ne01);
+    GGML_ASSERT(ne1 == ne11);
+    GGML_ASSERT(ne2 == ne12);
+    GGML_ASSERT(ne3 == ne13);
+
+    // we don't support permuted src0 or src1
+    GGML_ASSERT(nb00 == ggml_type_size(type));
+    GGML_ASSERT(nb10 == ggml_type_size(src1->type));
+
+    // dst cannot be transposed or permuted
+    GGML_ASSERT(nb0 == sizeof(float));
+    GGML_ASSERT(nb0 <= nb1);
+    GGML_ASSERT(nb1 <= nb2);
+    GGML_ASSERT(nb2 <= nb3);
+
+    GGML_ASSERT(src0->extra != NULL);
+    GGML_ASSERT(src1->extra != NULL);
+    GGML_ASSERT(dst->extra != NULL);
+
+    tt::tt_metal::Tensor& a = *reinterpret_cast<TensorWithMetadata*>(src0->extra)->tensor;
+    tt::tt_metal::Tensor& b = *reinterpret_cast<TensorWithMetadata*>(src1->extra)->tensor;
+    tt::tt_metal::Tensor& c = *reinterpret_cast<TensorWithMetadata*>(dst->extra)->tensor;
+
+    GGML_ASSERT(a.storage_type() == tt::tt_metal::StorageType::DEVICE || a.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
+    GGML_ASSERT(b.storage_type() == tt::tt_metal::StorageType::DEVICE || b.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
+
+    auto t = tt::tt_metal::fully_connected(a, b);
+    fprintf(stderr, "Metalium: %s starting\n", __func__);
+    tt::tt_metal::Finish(ctx->device->command_queue());
+    fprintf(stderr, "Metalium: %s done\n", __func__);
 }
 
 static void ggml_backend_metalium_out_prod(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
@@ -78,7 +120,8 @@ GGML_CALL static const char * ggml_backend_metalium_buffer_type_name(ggml_backen
 }
 
 GGML_CALL static size_t ggml_backend_metalium_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return 4096; // assume the wosre, BFP16 on tile boundary
+    // Not using this. Metalium's allication model is not compatible with GGML's allocator
+    return 128;
     GGML_UNUSED(buft);
 }
 
@@ -90,15 +133,8 @@ static size_t ggml_backend_metalium_buffer_type_get_max_size(ggml_backend_buffer
 }
 
 GGML_CALL static size_t ggml_backend_metalium_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
-    // TODO: Make sure this is correct
-    if(ggml_is_quantized(tensor->type)) {
-        return ggml_nbytes(tensor);
-    }
-    intmax_t nelements = 1;
-    for(int i = 0; i < 4; i++) {
-        nelements *= i < 2 ? tensor->ne[i] / 32 + (tensor->ne[i] % 32 != 0) : tensor->ne[i];
-    }
-    return nelements * ggml_type_size(tensor->type);
+    // Not using this. Metalium's allication model is not compatible with GGML's allocator
+    return ggml_nbytes(tensor);
     GGML_UNUSED(buft);
 }
 
@@ -106,9 +142,10 @@ struct ggml_backend_metalium_buffer_context {
 
     size_t ggml_buffer_size_bytes = 0;
     std::string name;
-    
-    // These initializations are deferred due to GGML API limitations
-    tt::tt_metal::Tensor tensor;
+    ttnn::device::Device* device = nullptr;
+
+    // Tracking our own allocations because Metalium limitations and GGML assuming them
+    std::vector<std::unique_ptr<TensorWithMetadata>> metadata_to_free;
 };
 
 GGML_CALL static const char * ggml_backend_metalium_buffer_get_name(ggml_backend_buffer_t buffer) {
@@ -127,34 +164,82 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
                                                 const void *data, size_t offset,
                                                 size_t size)
 {
-    ggml_backend_metalium_buffer_context * ctx = (ggml_backend_metalium_buffer_context *)buffer->context;
-    ggml_type ggtype = tensor->type;
+    // Must be setting the entire tensor at once
+    GGML_ASSERT(offset == 0);
+    GGML_ASSERT(size == ggml_nbytes(tensor));
+    GGML_ASSERT(tensor->extra != NULL);
 
-    // TODO: Support other types
-    GGML_ASSERT(ggtype == GGML_TYPE_BF16);
-    std::vector<bfloat16> bfloat16_data(size / sizeof(bfloat16));
-    std::memcpy(bfloat16_data.data(), data, size);
-    auto owned = tt::tt_metal::owned_buffer::create(std::move(bfloat16_data));
+    ggml_backend_metalium_buffer_context * bufctx = (ggml_backend_metalium_buffer_context *)buffer->context;
+    ggml_type ggtype = tensor->type;
+    TensorWithMetadata * meta = (TensorWithMetadata *)tensor->extra;
+
+    tt::ARCH processor_class = bufctx->device->arch();
+    // only grayskull is supported for now.
+    GGML_ASSERT(processor_class == tt::ARCH::GRAYSKULL);
+
+    // TODO: See if we can use BorrowedStorage to avoid copying the data
+    OwnedStorage storage;
+
+    if (ggtype == GGML_TYPE_BF16) {
+        std::vector<bfloat16> bfloat16_data(size / sizeof(bfloat16));
+        std::memcpy(bfloat16_data.data(), data, size);
+        auto owned = tt::tt_metal::owned_buffer::create(std::move(bfloat16_data));
+        storage = OwnedStorage{std::move(owned)};
+    }
+    else if (ggtype == GGML_TYPE_F32) {
+        // For now we cast F32 to BF16. Need a scalable way to handle this as WORMHOLD_B0 have native support for F32
+        std::vector<bfloat16> bfloat16_data(size / sizeof(float));
+        const float* f32_data = (const float*)data;
+        for(size_t i = 0; i < size / sizeof(float); i++) {
+            bfloat16_data[i] = bfloat16(f32_data[i]);
+        }
+        auto owned = tt::tt_metal::owned_buffer::create(std::move(bfloat16_data));
+        storage = OwnedStorage{std::move(owned)};
+    }
+    else {
+        // TODO: Support other types
+        GGML_ASSERT(false && "Unsupported data type");
+    }
     
+    // TODO: Make sure this is correct
     std::vector<uint32_t> shape(GGML_MAX_DIMS);
     for(int i = 0; i < GGML_MAX_DIMS; i++) {
         // GGML stores the shape in reverse order
         shape[i] = tensor->ne[GGML_MAX_DIMS - i - 1];
     }
 
-    ctx->tensor = tt::tt_metal::Tensor(OwnedStorage{owned}, tt::tt_metal::Shape(shape), tt::tt_metal::DataType::BFLOAT16, tt::tt_metal::Layout::ROW_MAJOR);
-    // HACK: Need to save device pointer
-    ctx->tensor = ctx->tensor.to(g_device_map[0]);
-    ctx->tensor = tilize_with_zero_padding(ctx->tensor);
+    tt::tt_metal::Tensor t(std::move(storage), tt::tt_metal::Shape(shape)
+        , tt::tt_metal::DataType::BFLOAT16, tt::tt_metal::Layout::ROW_MAJOR);
+    
+    // I think we can allow this.. right?
+    // GGML_ASSERT(!bufctx->tensors.contains(offset));
+    *meta = TensorWithMetadata {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::tilize_with_zero_padding(t.to(bufctx->device))),
+        .ggtype = ggtype,
+    };
+    tt::tt_metal::Finish(bufctx->device->command_queue());
+}
 
-    GGML_ASSERT(offset == 0);
+static void * ggml_backend_metalium_buffer_get_base(ggml_backend_buffer_t buffer) {
+    // Not using this. Metalium's allication model is not compatible with GGML's allocator
+    return (void*)0x10000;
+}
+
+GGML_CALL static void
+ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
+                                     ggml_tensor *tensor)
+{
+    ggml_backend_metalium_buffer_context * bufctx = (ggml_backend_metalium_buffer_context *)buffer->context;
+    bufctx->metadata_to_free.push_back(std::make_unique<TensorWithMetadata>());
+    tensor->extra = bufctx->metadata_to_free.back().get();
+    GGML_UNUSED(buffer);
 }
 
 static struct ggml_backend_buffer_i ggml_backend_metalium_buffer_interface = {
     /* .get_name        = */ ggml_backend_metalium_buffer_get_name,
     /* .free_buffer     = */ ggml_backend_metalium_buffer_free_buffer,
-    /* .get_base        = */ nullptr, //ggml_backend_metalium_buffer_get_base,
-    /* .init_tensor     = */ nullptr, //ggml_backend_metalium_buffer_init_tensor,
+    /* .get_base        = */ ggml_backend_metalium_buffer_get_base,
+    /* .init_tensor     = */ ggml_backend_sycl_buffer_init_tensor,
     /* .set_tensor      = */ ggml_backend_metalium_buffer_set_tensor,
     /* .get_tensor      = */ nullptr, //ggml_backend_metalium_buffer_get_tensor,
     /* .cpy_tensor      = */ nullptr, //ggml_backend_metalium_buffer_cpy_tensor,
@@ -166,13 +251,14 @@ static struct ggml_backend_buffer_i ggml_backend_metalium_buffer_interface = {
 GGML_CALL static ggml_backend_buffer_t
 ggml_backend_metalium_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
                                            size_t size) {
-    // ggml_backend_metalium_buffer_type_context * buft_ctx = (ggml_backend_metalium_buffer_type_context *)buft->context;
+    ggml_backend_metalium_buffer_type_context * buft_ctx = (ggml_backend_metalium_buffer_type_context *)buft->context;
     ggml_backend_metalium_buffer_context* ctx = new ggml_backend_metalium_buffer_context;
 
     // real allocation is deferred until the first tensor is set because we don't know the underlying tensor type yet
     // TODO: Use a constructor
     ctx->ggml_buffer_size_bytes = size;
     ctx->name = ctx->name;
+    ctx->device = buft_ctx->device;
     return ggml_backend_buffer_init(buft, ggml_backend_metalium_buffer_interface, ctx, size);
 }
 
@@ -212,7 +298,6 @@ GGML_CALL static ggml_backend_buffer_type_t ggml_backend_metalium_get_default_bu
 }
 
 GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
-    abort(); // nothing supported yet
     ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {

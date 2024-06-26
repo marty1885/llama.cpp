@@ -63,6 +63,8 @@ function(llama_target_and_test source)
         ${LLAMA_TEST_ARGS})
 
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
+    target_compile_options(${TEST_TARGET} PRIVATE -stdlib=libc++)
+    target_link_libraries(${TEST_TARGET} PRIVATE c++ c++abi)
 endfunction()
 
 # build test-tokenizer-0 target once and add many tests
@@ -139,3 +141,7 @@ endif()
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
+
+# HACK: Test files so I can debug metalium.
+# TODO: Remove these tests when done.
+llama_target_and_test(test-mul-mat.cpp)

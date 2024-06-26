@@ -1,15 +1,18 @@
 #include "common/bfloat16.hpp"
+#include "common/constants.hpp"
 #include "device/tt_arch_types.h"
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 #include "ggml-metalium.h"
 
 #include "host_api.hpp"
+#include "hostdevcommon/kernel_structs.h"
 #include "impl/dispatch/command_queue.hpp"
 #include "tensor/host_buffer/functions.hpp"
 #include "tensor/host_buffer/types.hpp"
 #include "tensor/types.hpp"
 #include "tt_dnn/op_library/auto_format.hpp"
+#include "tt_dnn/op_library/composite/composite_ops.hpp"
 #include "tt_dnn/op_library/tilize/tilize_op.hpp"
 #include "tt_dnn/op_library/untilize/untilize_op.hpp"
 #include <cstddef>
@@ -84,6 +87,8 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     GGML_ASSERT(am != NULL);
     GGML_ASSERT(bm != NULL);
     GGML_ASSERT(cm != NULL);
+    GGML_ASSERT(am->tensor != NULL);
+    GGML_ASSERT(bm->tensor != NULL);
 
     tt::tt_metal::Tensor& a = *am->tensor;
     tt::tt_metal::Tensor& b = *bm->tensor;
@@ -94,6 +99,7 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     auto aT = tt::tt_metal::transpose(a, -2, -1);
 #if !defined(NDEBUG) || 1
     // TODO: Remove this in the future. TTNN has buggy transpose implementation
+    std::cout << "a.shape: " << a.shape() << " aT.shape: " << aT.shape() << std::endl;
     GGML_ASSERT(aT.shape()[0] == a.shape()[0]);
     GGML_ASSERT(aT.shape()[1] == a.shape()[1]);
     GGML_ASSERT(aT.shape()[3] == a.shape()[2]);
@@ -101,9 +107,25 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
 #endif
 
     // TODO: Ask TT to support multiplication of pre-transposed tensors. Calling transpose here is inefficient
+    // https://github.com/tenstorrent/tt-metal/issues/9709
     cm->tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::fully_connected(b, aT));
-    auto at = tt::tt_metal::transpose(a, 2, 3);
     GGML_UNUSED(ctx);
+}
+
+static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
+    GGML_UNUSED(ctx);
+    const struct ggml_tensor * src0 = dst->src[0];
+    TensorWithMetadata* meta = (TensorWithMetadata*)src0->extra;
+    GGML_ASSERT(meta != NULL);
+    GGML_ASSERT(meta->tensor != NULL);
+
+    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+    GGML_ASSERT(dst_meta != NULL);
+
+    tt::tt_metal::Tensor ret = tt::tt_metal::zeros_like(*meta->tensor);
+    ret.deepcopy(*meta->tensor);
+    GGML_ASSERT(ret.storage_type() == tt::tt_metal::StorageType::DEVICE || ret.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
+    dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(ret));
 }
 
 static void ggml_backend_metalium_out_prod(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
@@ -207,6 +229,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     }
     else if (ggtype == GGML_TYPE_F32) {
         // For now we cast F32 to BF16. Need a scalable way to handle this as WORMHOLD_B0 have native support for F32
+        // TODO: Might want to consider disabling F32 support for Grayskull in the future
         std::vector<bfloat16> bfloat16_data(size / sizeof(float));
         const float* f32_data = (const float*)data;
         for(size_t i = 0; i < size / sizeof(float); i++) {
@@ -232,9 +255,11 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     
     // I think we can allow this.. right?
     // GGML_ASSERT(!bufctx->tensors.contains(offset));
+
     // TODO: Make sure this is the correct tilize we want to use
+    t = tt::tt_metal::tilize_with_zero_padding(t.to(bufctx->device));
     *meta = TensorWithMetadata {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::tilize_with_zero_padding(t.to(bufctx->device))),
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(t)),
         .ggtype = ggtype,
     };
 }
@@ -274,17 +299,12 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
             tt::tt_metal::memcpy(queue, buf.data(), row_major_tensor);
             tt::tt_metal::Finish(queue);
 
-            tt::tt_metal::Shape tt_underlying_shape = row_major_tensor.shape().value();
-            if(tt_underlying_shape[2] % 32 != 0) {
-                tt_underlying_shape[2] = (tt_underlying_shape[2] / 32 + 1) * 32;
-            }
-            if (tt_underlying_shape[3] % 32 != 0) {
-                tt_underlying_shape[3] = (tt_underlying_shape[3] / 32 + 1) * 32;
-            }
+            ttnn::Shape tt_underlying_shape = row_major_tensor.shape().with_tile_padding();
             std::array<size_t, 4> stride = {1, tt_underlying_shape[3], tt_underlying_shape[3] * tt_underlying_shape[2], tt_underlying_shape[3] * tt_underlying_shape[2] * tt_underlying_shape[1]};
 
             // Tilize to ROW_MAJOR doesn't mean the tensor is contiguous. It still has the underlying 32x32 tiles
             // we need to view into the tensor to get the contiguous data
+            // TODO: Make sure this is correct. As of now not tested for large (>32x32) tensors
             size_t idx = 0;
             for(size_t w = 0; w < shape[0]; w++) {
                 for(size_t z = 0; z < shape[1]; z++) {
@@ -309,7 +329,7 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
 static void * ggml_backend_metalium_buffer_get_base(ggml_backend_buffer_t buffer) {
     // Not using this. Metalium's allication model is not compatible with GGML's allocator
     GGML_UNUSED(buffer);
-    return (void*)0x10000;
+    return (void*)0xdeadbeef;
 }
 
 GGML_CALL static void
@@ -346,7 +366,7 @@ ggml_backend_metalium_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
     ctx->ggml_buffer_size_bytes = size;
     ctx->name = ctx->name;
     ctx->device = buft_ctx->device;
-    return ggml_backend_buffer_init(buft, ggml_backend_metalium_buffer_interface, ctx, size);
+    return ggml_backend_buffer_init(buft, ggml_backend_metalium_buffer_interface, ctx, size + 4096 * 1024);
 }
 
 static ggml_backend_buffer_type_i ggml_backend_metalium_buffer_type_interface = {
@@ -398,6 +418,10 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
             case GGML_OP_OUT_PROD:
                 ggml_backend_metalium_out_prod(ctx, node);
                 break;
+            
+            case GGML_OP_CPY:
+                ggml_backend_metalium_cpy(ctx, node);
+                break;
 
             case GGML_OP_NONE:
             case GGML_OP_RESHAPE:
@@ -420,21 +444,18 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
 GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
-    GGML_UNUSED(src0);
-    GGML_UNUSED(src1);
+    GGML_ASSERT(op != NULL);
 
-    if(op->op == GGML_OP_NONE) {
-        return true;
+    switch (op->op) {
+        case GGML_OP_NONE:
+            return  true;
+        case GGML_OP_MUL_MAT:
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
+        case GGML_OP_CPY:
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32;
+        default:
+            return false;
     }
-    return op->op == GGML_OP_MUL_MAT && op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
-
-    /*return (op->op == GGML_OP_MUL_MAT  && ggml_backend_blas_use_blas(op)) ||
-           (op->op == GGML_OP_OUT_PROD && op->src[0]->type == GGML_TYPE_F32 &&
-                                          op->src[1]->type == GGML_TYPE_F32 &&
-                                          ggml_is_matrix(src0) &&
-                                          ggml_is_matrix(src1) &&
-                                          ggml_is_contiguous(src0) &&
-                                          (ggml_is_contiguous(src1) || ggml_is_transposed(src1)));*/
 
     GGML_UNUSED(backend);
 }

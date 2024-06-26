@@ -77,17 +77,32 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     GGML_ASSERT(src1->extra != NULL);
     GGML_ASSERT(dst->extra != NULL);
 
-    tt::tt_metal::Tensor& a = *reinterpret_cast<TensorWithMetadata*>(src0->extra)->tensor;
-    tt::tt_metal::Tensor& b = *reinterpret_cast<TensorWithMetadata*>(src1->extra)->tensor;
+    TensorWithMetadata* am = (TensorWithMetadata*)src0->extra;
+    TensorWithMetadata* bm = (TensorWithMetadata*)src1->extra;
+    TensorWithMetadata* cm = (TensorWithMetadata*)dst->extra;
 
-    // TODO: Check they are not null
+    GGML_ASSERT(am != NULL);
+    GGML_ASSERT(bm != NULL);
+    GGML_ASSERT(cm != NULL);
+
+    tt::tt_metal::Tensor& a = *am->tensor;
+    tt::tt_metal::Tensor& b = *bm->tensor;
 
     GGML_ASSERT(a.storage_type() == tt::tt_metal::StorageType::DEVICE || a.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
     GGML_ASSERT(b.storage_type() == tt::tt_metal::StorageType::DEVICE || b.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
 
+    auto aT = tt::tt_metal::transpose(a, -2, -1);
+#if !defined(NDEBUG) || 1
+    // TODO: Remove this in the future. TTNN has buggy transpose implementation
+    GGML_ASSERT(aT.shape()[0] == a.shape()[0]);
+    GGML_ASSERT(aT.shape()[1] == a.shape()[1]);
+    GGML_ASSERT(aT.shape()[3] == a.shape()[2]);
+    GGML_ASSERT(aT.shape()[2] == a.shape()[3]);
+#endif
+
     // TODO: Ask TT to support multiplication of pre-transposed tensors. Calling transpose here is inefficient
-    reinterpret_cast<TensorWithMetadata*>(dst->extra)->tensor = std::make_shared<tt::tt_metal::Tensor>(
-        tt::tt_metal::fully_connected(b, tt::tt_metal::transpose(a, 2, 3)));
+    cm->tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::fully_connected(b, aT));
+    auto at = tt::tt_metal::transpose(a, 2, 3);
     GGML_UNUSED(ctx);
 }
 
@@ -411,7 +426,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
     if(op->op == GGML_OP_NONE) {
         return true;
     }
-    return op->op == GGML_OP_MUL_MAT && op->type == GGML_TYPE_F32;
+    return op->op == GGML_OP_MUL_MAT && op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
 
     /*return (op->op == GGML_OP_MUL_MAT  && ggml_backend_blas_use_blas(op)) ||
            (op->op == GGML_OP_OUT_PROD && op->src[0]->type == GGML_TYPE_F32 &&

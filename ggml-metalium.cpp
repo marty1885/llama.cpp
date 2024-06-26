@@ -321,6 +321,45 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
             GGML_ASSERT(false && "Unsupported data type held in TT kernel");
         }
     }
+    else if(dst_ggtype == GGML_TYPE_BF16) {
+        if(meta->tensor->dtype() == tt::tt_metal::DataType::BFLOAT16) {
+            ttnn::Shape shape = meta->tensor->shape();
+            size_t real_volume = 1;
+            for(size_t i = 0; i < shape.size(); i++) {
+                real_volume *= shape[i];
+            }
+
+            GGML_ASSERT((int64_t)real_volume == ggml_nelements(tensor) && "Mismatched tensor sizes");
+            
+            tt::tt_metal::Tensor row_major_tensor = tt::tt_metal::untilize(*meta->tensor);
+            GGML_ASSERT(row_major_tensor.layout() == tt::tt_metal::Layout::ROW_MAJOR);
+
+            std::vector<bfloat16> buf(shape.volume()); // .volume() returns the underlying volume of the tensor not the logical one (TT enforces 32x32 tiles)
+            tt::tt_metal::memcpy(queue, buf.data(), row_major_tensor);
+            tt::tt_metal::Finish(queue);
+
+            ttnn::Shape tt_underlying_shape = row_major_tensor.shape().with_tile_padding();
+            std::array<size_t, 4> stride = {1, tt_underlying_shape[3], tt_underlying_shape[3] * tt_underlying_shape[2], tt_underlying_shape[3] * tt_underlying_shape[2] * tt_underlying_shape[1]};
+
+            // Tilize to ROW_MAJOR doesn't mean the tensor is contiguous. It still has the underlying 32x32 tiles
+            // we need to view into the tensor to get the contiguous data
+            // TODO: Make sure this is correct. As of now not tested for large (>32x32) tensors
+            size_t idx = 0;
+            for(size_t w = 0; w < shape[0]; w++) {
+                for(size_t z = 0; z < shape[1]; z++) {
+                    for(size_t x = 0; x < shape[3]; x++) { // FIXME: Don't know why but the shape is reversed...????
+                        for(size_t y = 0; y < shape[2]; y++) {
+                            const size_t src_idx = x * stride[0] + y * stride[1] + z * stride[2] + w * stride[3];
+                            ((bfloat16*)data)[idx++] = buf[src_idx];
+                        }
+                    }
+                }
+            }
+        }
+        else {
+            GGML_ASSERT(false && "Unsupported data type held in TT kernel");
+        }
+    }
     else {
         GGML_ASSERT(false && "Unsupported data type");
     }
@@ -449,10 +488,12 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
     switch (op->op) {
         case GGML_OP_NONE:
             return  true;
-        case GGML_OP_MUL_MAT:
-            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
+        // FIXME: This crash for most shapes due to a bug in TTNN transpose implementation. Unmask this
+        // when the bug is fixed
+        // case GGML_OP_MUL_MAT:
+        //     return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
         case GGML_OP_CPY:
-            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32;
+            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_BF16) && src0->type == GGML_TYPE_F32;
         default:
             return false;
     }

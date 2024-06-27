@@ -189,7 +189,27 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, DstType* dst, tt::tt_metal:
     }
 }
 
+// Sanity check macros to ensure that the tensors are in the correct format and we won't crash
+#define GGML_METALIUM_OP_SANITY_CHECK(_node) \
+    GGML_ASSERT((_node)->extra != NULL);
+// Check if the tensor is on the device (so we wont'e be using the CPU) as well as letting us crash early
+#define GGML_METALIUM_OP_SRC_SANITY_CHECK(_node, _idx) \
+    do { \
+        GGML_ASSERT((_node)->src[_idx] != NULL); \
+        GGML_ASSERT((_node)->src[_idx]->extra != NULL); \
+        auto _meta = (TensorWithMetadata*)((_node)->src[_idx]->extra); \
+        GGML_ASSERT(_meta->tensor != NULL); \
+        GGML_ASSERT(_meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || _meta->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE); \
+        GGML_ASSERT(_meta->tensor->layout() == tt::tt_metal::Layout::TILE); \
+    } while(0)
+#define GGML_METALIUM_OP_SRC0_SANITY_CHECK(_node) GGML_METALIUM_OP_SRC_SANITY_CHECK(_node, 0)
+#define GGML_METALIUM_OP_SRC1_SANITY_CHECK(_node) GGML_METALIUM_OP_SRC_SANITY_CHECK(_node, 1)
+
 static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC1_SANITY_CHECK(dst);
+
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
@@ -216,21 +236,11 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     GGML_ASSERT(src1->extra != NULL);
     GGML_ASSERT(dst->extra != NULL);
 
-    TensorWithMetadata* am = (TensorWithMetadata*)src0->extra;
-    TensorWithMetadata* bm = (TensorWithMetadata*)src1->extra;
+    tt::tt_metal::Tensor& a = *(((TensorWithMetadata*)src0->extra)->tensor);
+    tt::tt_metal::Tensor& b = *(((TensorWithMetadata*)src1->extra)->tensor);
     TensorWithMetadata* cm = (TensorWithMetadata*)dst->extra;
 
-    GGML_ASSERT(am != NULL);
-    GGML_ASSERT(bm != NULL);
     GGML_ASSERT(cm != NULL);
-    GGML_ASSERT(am->tensor != NULL);
-    GGML_ASSERT(bm->tensor != NULL);
-
-    tt::tt_metal::Tensor& a = *am->tensor;
-    tt::tt_metal::Tensor& b = *bm->tensor;
-
-    GGML_ASSERT(a.storage_type() == tt::tt_metal::StorageType::DEVICE || a.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
-    GGML_ASSERT(b.storage_type() == tt::tt_metal::StorageType::DEVICE || b.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
 
     auto aT = tt::tt_metal::transpose(a, -2, -1);
 #if !defined(NDEBUG) || 1
@@ -247,18 +257,19 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     // TODO: Ask TT to support multiplication of pre-transposed tensors. Calling transpose here is inefficient
     // https://github.com/tenstorrent/tt-metal/issues/9709
     cm->tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::fully_connected(b, aT));
+    cm->ggtype = dst->type; // Hope this is the correct approach
+    GGML_ASSERT(cm->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || cm->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
     GGML_UNUSED(ctx);
 }
 
 static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
     GGML_UNUSED(ctx);
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+
     const struct ggml_tensor * src0 = dst->src[0];
     TensorWithMetadata* meta = (TensorWithMetadata*)src0->extra;
-    GGML_ASSERT(meta != NULL);
-    GGML_ASSERT(meta->tensor != NULL);
-
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
-    GGML_ASSERT(dst_meta != NULL);
 
     tt::tt_metal::Tensor ret = tt::tt_metal::zeros_like(*meta->tensor);
     ret.deepcopy(*meta->tensor);
@@ -268,14 +279,13 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
 }
 
 static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst, ggml_unary_op op) {
-    const struct ggml_tensor * src0 = dst->src[0];
-    TensorWithMetadata* meta = (TensorWithMetadata*)src0->extra;
-    GGML_ASSERT(meta != NULL);
-    GGML_ASSERT(meta->tensor != NULL);
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
     GGML_UNUSED(ctx);
 
+    const struct ggml_tensor * src0 = dst->src[0];
+    TensorWithMetadata* meta = (TensorWithMetadata*)src0->extra;
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
-    GGML_ASSERT(dst_meta != NULL);
 
     tt::tt_metal::Tensor ret;
     switch (op) {

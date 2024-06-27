@@ -340,6 +340,23 @@ static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ct
     dst_meta->ggtype = dst->type;
     return true;
 }
+static void ggml_backend_metalium_leaky_relu(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+    GGML_UNUSED(ctx);
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    TensorWithMetadata* meta = (TensorWithMetadata*)src0->extra;
+    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+
+    float negative_slope;
+    GGML_ASSERT(dst->op_params != NULL);
+    memcpy(&negative_slope, dst->op_params, sizeof(float));
+
+    dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::leaky_relu(*meta->tensor, negative_slope));
+    dst_meta->ggtype = dst->type;
+    GGML_ASSERT(dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
+}
 
 // backend interface
 
@@ -632,6 +649,9 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
                 GGML_ASSERT(ok && "Failed to execute unary op");
                 break;
             }
+            case GGML_OP_LEAKY_RELU:
+                ggml_backend_metalium_leaky_relu(ctx, node);
+                break;
             case GGML_OP_MUL_MAT:
                 ggml_backend_metalium_mul_mat(ctx, node);
                 break;
@@ -704,6 +724,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
                 default:
                     return false;
             }
+        case GGML_OP_LEAKY_RELU:
         case GGML_OP_NONE:
             return  true;
         // FIXME: This crash for most shapes due to a bug in TTNN transpose implementation. Unmask this

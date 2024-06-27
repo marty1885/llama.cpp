@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <tt_eager/tensor/tensor.hpp>
 #include <ttnn/core.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
@@ -29,6 +30,7 @@
 
 
 #include <memory>
+#include <type_traits>
 
 struct ggml_backend_metalium_context {
     ttnn::device::Device* device = nullptr;
@@ -52,6 +54,114 @@ static std::map<int, ttnn::Device*> g_device_map;
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 // Actual backend code
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename SrcType, typename DstType>
+tt::tt_metal::OwnedStorage data2owned_storage(const SrcType* src, size_t size) {
+    // Converts GGML types to TT types
+    // TODO: Support quantized data conversion
+    // TODO: See if we can use BorrowedStorage to avoid copying the data
+    std::vector<DstType> vec(size);
+    using Src = std::remove_cv_t<std::remove_reference_t<SrcType>>;
+    using Dst = std::remove_cv_t<std::remove_reference_t<DstType>>;
+    // Convert from  GGML types to TT types
+    static_assert(std::is_same_v<Src, float> || std::is_same_v<Src, ggml_bf16_t> || std::is_same_v<Src, ggml_fp16_t>);
+    static_assert(std::is_same_v<Dst, float> || std::is_same_v<Dst, bfloat16>);
+
+    auto src_adaptor = [](const SrcType& src) -> float {
+        if constexpr(std::is_same_v<Src, ggml_fp16_t>) {
+            return ggml_fp16_to_fp32(src);
+        }
+        else if constexpr(std::is_same_v<Src, ggml_bf16_t>) {
+            return ggml_bf16_to_fp32(src);
+        }
+        else if constexpr(std::is_same_v<Src, float>) {
+            return src;
+        }
+        GGML_UNREACHABLE();
+    };
+
+    auto dst_adaptor = [](DstType& dst, float val) {
+        if constexpr(std::is_same_v<Dst, bfloat16>) {
+            dst = bfloat16(val);
+        }
+        else {
+            dst = val;
+        }
+    };
+
+    // special case for F32 and BF16 since no conversion is needed
+    if constexpr(std::is_same_v<Src, Dst> || (std::is_same_v<Src, ggml_fp16_t> && std::is_same_v<Dst, bfloat16>)) {
+        memcpy(vec.data(), src, size * sizeof(Src));
+    }
+    else {
+        for(size_t i = 0; i < size; i++) {
+            dst_adaptor(vec[i], src_adaptor(src[i]));
+        }
+    }
+    auto owned = tt::tt_metal::owned_buffer::create(std::move(vec));
+    return OwnedStorage(std::move(owned));
+
+}
+
+template <typename SrcType, typename DstType>
+void tensor2ggml(const tt::tt_metal::Tensor& tensor, DstType* dst, tt::tt_metal::CommandQueue& queue) {
+    // Converts TT tensors to GGML types
+    // TODO: Support reading quantized data
+    static_assert(std::is_same_v<SrcType, bfloat16>, "Unsupported data type conversion");
+    ttnn::Shape shape = tensor.shape();
+
+    tt::tt_metal::Tensor row_major_tensor = tt::tt_metal::untilize(tensor);
+    GGML_ASSERT(row_major_tensor.layout() == tt::tt_metal::Layout::ROW_MAJOR);
+
+    std::vector<bfloat16> buf(shape.volume()); // .volume() returns the underlying volume of the tensor not the logical one (TT enforces 32x32 tiles)
+    tt::tt_metal::memcpy(queue, buf.data(), row_major_tensor);
+    tt::tt_metal::Finish(queue);
+
+    ttnn::Shape tt_underlying_shape = row_major_tensor.shape().with_tile_padding();
+    std::array<size_t, 4> stride = {1, tt_underlying_shape[3], tt_underlying_shape[3] * tt_underlying_shape[2], tt_underlying_shape[3] * tt_underlying_shape[2] * tt_underlying_shape[1]};
+
+    auto dst_adaptor = [](DstType& dst, float val) {
+        if constexpr(std::is_same_v<DstType, float>) {
+            dst = val;
+        }
+        else if constexpr(std::is_same_v<DstType, ggml_fp16_t>) {
+            dst = ggml_fp32_to_fp16(val);
+        }
+        else if constexpr(std::is_same_v<DstType, ggml_bf16_t>) {
+            dst = ggml_fp32_to_bf16(val);
+        }
+        else {
+            abort();
+        }
+        return;
+    };
+
+    auto src_adaptor = [](const SrcType& src) -> float {
+        if constexpr(std::is_same_v<SrcType, bfloat16>) {
+            return src.to_float();
+        }
+        else if (std::is_same_v<SrcType, float>) {
+            return src;
+        }
+        GGML_UNREACHABLE();
+    };
+
+    // Tilize to ROW_MAJOR doesn't mean the tensor is contiguous. It still has the underlying 32x32 tiles
+    // we need to view into the tensor to get the contiguous data
+    // TODO: Make sure this is correct. As of now not tested for large (>32x32) tensors
+    static_assert(GGML_MAX_DIMS == 4, "Looping depth is hardcoded to 4");
+    size_t idx = 0;
+    for(size_t w = 0; w < shape[0]; w++) {
+        for(size_t z = 0; z < shape[1]; z++) {
+            for(size_t x = 0; x < shape[3]; x++) { // FIXME: Don't know why but the shape is reversed...????
+                for(size_t y = 0; y < shape[2]; y++) {
+                    const size_t src_idx = x * stride[0] + y * stride[1] + z * stride[2] + w * stride[3];
+                    dst_adaptor(dst[idx++], src_adaptor(buf[src_idx]));
+                }
+            }
+        }
+    }
+}
 
 static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
@@ -106,6 +216,8 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     GGML_ASSERT(aT.shape()[2] == a.shape()[3]);
 #endif
 
+    std::cout << "a.shape: " << a.shape() << " b.shape: " << b.shape() << std::endl;
+
     // TODO: Ask TT to support multiplication of pre-transposed tensors. Calling transpose here is inefficient
     // https://github.com/tenstorrent/tt-metal/issues/9709
     cm->tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::fully_connected(b, aT));
@@ -126,12 +238,6 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
     ret.deepcopy(*meta->tensor);
     GGML_ASSERT(ret.storage_type() == tt::tt_metal::StorageType::DEVICE || ret.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
     dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(ret));
-}
-
-static void ggml_backend_metalium_out_prod(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
-    abort();
 }
 
 // backend interface
@@ -209,6 +315,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(size == ggml_nbytes(tensor));
     GGML_ASSERT(tensor->extra != NULL);
+    GGML_ASSERT((size_t)ggml_nelements(tensor) == size / ggml_type_size(tensor->type) && "Must write the entire tensor at once");
 
     ggml_backend_metalium_buffer_context * bufctx = (ggml_backend_metalium_buffer_context *)buffer->context;
     ggml_type ggtype = tensor->type;
@@ -218,29 +325,23 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     // only grayskull is supported for now.
     GGML_ASSERT(processor_class == tt::ARCH::GRAYSKULL);
 
-    // TODO: See if we can use BorrowedStorage to avoid copying the data
     OwnedStorage storage;
 
-    if (ggtype == GGML_TYPE_BF16) {
-        std::vector<bfloat16> bfloat16_data(size / sizeof(bfloat16));
-        std::memcpy(bfloat16_data.data(), data, size);
-        auto owned = tt::tt_metal::owned_buffer::create(std::move(bfloat16_data));
-        storage = OwnedStorage{std::move(owned)};
-    }
-    else if (ggtype == GGML_TYPE_F32) {
-        // For now we cast F32 to BF16. Need a scalable way to handle this as WORMHOLD_B0 have native support for F32
-        // TODO: Might want to consider disabling F32 support for Grayskull in the future
-        std::vector<bfloat16> bfloat16_data(size / sizeof(float));
-        const float* f32_data = (const float*)data;
-        for(size_t i = 0; i < size / sizeof(float); i++) {
-            bfloat16_data[i] = bfloat16(f32_data[i]);
-        }
-        auto owned = tt::tt_metal::owned_buffer::create(std::move(bfloat16_data));
-        storage = OwnedStorage{std::move(owned)};
-    }
-    else {
-        // TODO: Support other types
-        GGML_ASSERT(false && "Unsupported data type");
+    switch (ggtype) {
+        case GGML_TYPE_F32:
+            // For now we cast F32 to BF16. Need a scalable way to handle this as WORMHOLD_B0 have native support for F32
+            // TODO: Might want to consider disabling F32 support for Grayskull in the future
+            storage = data2owned_storage<float, bfloat16>((const float*)data, size / sizeof(float));
+            break;
+        case GGML_TYPE_BF16:
+            storage = data2owned_storage<ggml_bf16_t, bfloat16>((const ggml_bf16_t*)data, size / sizeof(bfloat16));
+            break;
+        case GGML_TYPE_F16:
+            // TT hardware claims to support FP16 but the API does not expose it. For now we use BF16 as it is close enough
+            storage = data2owned_storage<ggml_fp16_t, bfloat16>((const ggml_fp16_t*)data, size / sizeof(ggml_fp16_t));
+            break;
+        default:
+            GGML_ASSERT(false && "Unsupported data type");
     }
     
     // TODO: Make sure this is correct
@@ -274,6 +375,7 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
     GGML_UNUSED(offset);
 
     TensorWithMetadata * meta = (TensorWithMetadata *)tensor->extra;
+    GGML_ASSERT(meta->tensor != NULL);
     GGML_ASSERT(meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || meta->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
 
     ggml_backend_metalium_buffer_context * ctx = (ggml_backend_metalium_buffer_context *)buffer->context;
@@ -281,41 +383,17 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
     ggml_type dst_ggtype = tensor->type;
     tt::tt_metal::CommandQueue& queue = ctx->device->command_queue(0);
 
+    // some sanity checks, Could remove them once TTNN is more stable
+    auto shape = meta->tensor->shape();
+    GGML_ASSERT(shape[0] == tensor->ne[3] && "Shape mismatch between GGML and TTNN tensor on dimension 0");
+    GGML_ASSERT(shape[1] == tensor->ne[2] && "Shape mismatch between GGML and TTNN tensor on dimension 1");
+    GGML_ASSERT(shape[2] == tensor->ne[1] && "Shape mismatch between GGML and TTNN tensor on dimension 2");
+    GGML_ASSERT(shape[3] == tensor->ne[0] && "Shape mismatch between GGML and TTNN tensor on dimension 3");
+
     // TODO: Proper handling of data types
     if(dst_ggtype == GGML_TYPE_F32) {
         if(meta->tensor->dtype() == tt::tt_metal::DataType::BFLOAT16) {
-            ttnn::Shape shape = meta->tensor->shape();
-            size_t real_volume = 1;
-            for(size_t i = 0; i < shape.size(); i++) {
-                real_volume *= shape[i];
-            }
-
-            GGML_ASSERT((int64_t)real_volume == ggml_nelements(tensor) && "Mismatched tensor sizes");
-            
-            tt::tt_metal::Tensor row_major_tensor = tt::tt_metal::untilize(*meta->tensor);
-            GGML_ASSERT(row_major_tensor.layout() == tt::tt_metal::Layout::ROW_MAJOR);
-
-            std::vector<bfloat16> buf(shape.volume()); // .volume() returns the underlying volume of the tensor not the logical one (TT enforces 32x32 tiles)
-            tt::tt_metal::memcpy(queue, buf.data(), row_major_tensor);
-            tt::tt_metal::Finish(queue);
-
-            ttnn::Shape tt_underlying_shape = row_major_tensor.shape().with_tile_padding();
-            std::array<size_t, 4> stride = {1, tt_underlying_shape[3], tt_underlying_shape[3] * tt_underlying_shape[2], tt_underlying_shape[3] * tt_underlying_shape[2] * tt_underlying_shape[1]};
-
-            // Tilize to ROW_MAJOR doesn't mean the tensor is contiguous. It still has the underlying 32x32 tiles
-            // we need to view into the tensor to get the contiguous data
-            // TODO: Make sure this is correct. As of now not tested for large (>32x32) tensors
-            size_t idx = 0;
-            for(size_t w = 0; w < shape[0]; w++) {
-                for(size_t z = 0; z < shape[1]; z++) {
-                    for(size_t x = 0; x < shape[3]; x++) { // FIXME: Don't know why but the shape is reversed...????
-                        for(size_t y = 0; y < shape[2]; y++) {
-                            const size_t src_idx = x * stride[0] + y * stride[1] + z * stride[2] + w * stride[3];
-                            ((float*)data)[idx++] = (float)buf[src_idx].to_float();
-                        }
-                    }
-                }
-            }
+            tensor2ggml<bfloat16, float>(*meta->tensor, (float*)data, queue);
         }
         else {
             GGML_ASSERT(false && "Unsupported data type held in TT kernel");
@@ -323,45 +401,22 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
     }
     else if(dst_ggtype == GGML_TYPE_BF16) {
         if(meta->tensor->dtype() == tt::tt_metal::DataType::BFLOAT16) {
-            ttnn::Shape shape = meta->tensor->shape();
-            size_t real_volume = 1;
-            for(size_t i = 0; i < shape.size(); i++) {
-                real_volume *= shape[i];
-            }
-
-            GGML_ASSERT((int64_t)real_volume == ggml_nelements(tensor) && "Mismatched tensor sizes");
-            
-            tt::tt_metal::Tensor row_major_tensor = tt::tt_metal::untilize(*meta->tensor);
-            GGML_ASSERT(row_major_tensor.layout() == tt::tt_metal::Layout::ROW_MAJOR);
-
-            std::vector<bfloat16> buf(shape.volume()); // .volume() returns the underlying volume of the tensor not the logical one (TT enforces 32x32 tiles)
-            tt::tt_metal::memcpy(queue, buf.data(), row_major_tensor);
-            tt::tt_metal::Finish(queue);
-
-            ttnn::Shape tt_underlying_shape = row_major_tensor.shape().with_tile_padding();
-            std::array<size_t, 4> stride = {1, tt_underlying_shape[3], tt_underlying_shape[3] * tt_underlying_shape[2], tt_underlying_shape[3] * tt_underlying_shape[2] * tt_underlying_shape[1]};
-
-            // Tilize to ROW_MAJOR doesn't mean the tensor is contiguous. It still has the underlying 32x32 tiles
-            // we need to view into the tensor to get the contiguous data
-            // TODO: Make sure this is correct. As of now not tested for large (>32x32) tensors
-            size_t idx = 0;
-            for(size_t w = 0; w < shape[0]; w++) {
-                for(size_t z = 0; z < shape[1]; z++) {
-                    for(size_t x = 0; x < shape[3]; x++) { // FIXME: Don't know why but the shape is reversed...????
-                        for(size_t y = 0; y < shape[2]; y++) {
-                            const size_t src_idx = x * stride[0] + y * stride[1] + z * stride[2] + w * stride[3];
-                            ((bfloat16*)data)[idx++] = buf[src_idx];
-                        }
-                    }
-                }
-            }
+            tensor2ggml<bfloat16, ggml_bf16_t>(*meta->tensor, (ggml_bf16_t*)data, queue);
+        }
+        else {
+            GGML_ASSERT(false && "Unsupported data type held in TT kernel");
+        }
+    }
+    else if(dst_ggtype == GGML_TYPE_F16) {
+        if(meta->tensor->dtype() == tt::tt_metal::DataType::BFLOAT16) {
+            tensor2ggml<bfloat16, ggml_fp16_t>(*meta->tensor, (ggml_fp16_t*)data, queue);
         }
         else {
             GGML_ASSERT(false && "Unsupported data type held in TT kernel");
         }
     }
     else {
-        GGML_ASSERT(false && "Unsupported data type");
+        GGML_ASSERT(false && "Unsupported destination data type");
     }
 }
 
@@ -453,10 +508,6 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
             case GGML_OP_MUL_MAT:
                 ggml_backend_metalium_mul_mat(ctx, node);
                 break;
-
-            case GGML_OP_OUT_PROD:
-                ggml_backend_metalium_out_prod(ctx, node);
-                break;
             
             case GGML_OP_CPY:
                 ggml_backend_metalium_cpy(ctx, node);
@@ -482,7 +533,8 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
 
 GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
-    const struct ggml_tensor * src1 = op->src[1];
+    [[maybe_unused]] const struct ggml_tensor * src1 = op->src[1];
+    
     GGML_ASSERT(op != NULL);
 
     switch (op->op) {
@@ -493,7 +545,8 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         // case GGML_OP_MUL_MAT:
         //     return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
         case GGML_OP_CPY:
-            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_BF16) && src0->type == GGML_TYPE_F32;
+            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_BF16 || op->type == GGML_TYPE_F16) &&
+                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
         default:
             return false;
     }

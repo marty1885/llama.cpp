@@ -634,6 +634,7 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
                 case GGML_UNARY_OP_SGN:
                 case GGML_UNARY_OP_NEG:
                 //case GGML_UNARY_OP_TANH:
+                case GGML_UNARY_OP_ELU:
                 case GGML_UNARY_OP_RELU:
                 //case GGML_UNARY_OP_SIGMOID:
                 case GGML_UNARY_OP_GELU:

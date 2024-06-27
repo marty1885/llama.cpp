@@ -307,9 +307,9 @@ static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ct
         //     ret = tt::tt_metal::tanh(*meta->tensor);
         //     break;
         // ELU needs an additional parameter. Find where in GGML this is stored
-        // case GGML_UNARY_OP_ELU:
-        //     ret = tt::tt_metal::elu(*meta->tensor);
-        //     break;
+        case GGML_UNARY_OP_ELU:
+            ret = tt::tt_metal::elu(*meta->tensor, 1.0f);
+            break;
         case GGML_UNARY_OP_RELU:
             ret = tt::tt_metal::relu(*meta->tensor);
             break;
@@ -663,14 +663,18 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
     // what we can convert to and from. For now we only support F32, F16, and BF16. Quantized data types will be
     // supported in the future
     auto input_supported = [&](const struct ggml_tensor * tensor) {
-        if (!(tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16)) {
+        if(tensor == NULL ||
+            !(tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16) ||
+            !ggml_is_contiguous(tensor)) {
             return false;
         }
         // TTNN requires the tensor to be 4-byte aligned
         return tensor->ne[0] * tttype_size(ggml2tt_type(tensor->type, ctx->device->arch())) % 4 == 0;
     };
     auto output_supported = [&](const struct ggml_tensor * tensor) {
-        if (!(tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16)) {
+        if(tensor == NULL ||
+            !(tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16) ||
+            !ggml_is_contiguous(tensor)) {
             return false;
         }
         // TTNN requires the tensor to be 4-byte aligned

@@ -55,11 +55,37 @@ static std::map<int, ttnn::Device*> g_device_map;
 // Actual backend code
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 
+static tt::tt_metal::DataType ggml2tt_type(ggml_type ggtype, tt::ARCH arch) {
+    if(arch == tt::ARCH::GRAYSKULL) {
+        switch(ggtype) {
+            case GGML_TYPE_F32:
+            case GGML_TYPE_F16:
+            case GGML_TYPE_BF16:
+                return tt::tt_metal::DataType::BFLOAT16;
+            default:
+                GGML_ASSERT(false && "Unsupported data type");
+        }
+    }
+    else {
+        GGML_ASSERT(false && "Unsupported Tenstorrent card architecture");
+    }
+}
+
+static size_t tttype_size(tt::tt_metal::DataType type) {
+    switch(type) {
+        case tt::tt_metal::DataType::BFLOAT16:
+            return sizeof(bfloat16);
+        case tt::tt_metal::DataType::FLOAT32:
+            return sizeof(float);
+        default:
+            GGML_ASSERT(false && "Unsupported data type");
+    }
+}
+
 template <typename SrcType, typename DstType>
 tt::tt_metal::OwnedStorage data2owned_storage(const SrcType* src, size_t size) {
     // Converts GGML types to TT types
     // TODO: Support quantized data conversion
-    // TODO: See if we can use BorrowedStorage to avoid copying the data
     std::vector<DstType> vec(size);
     using Src = std::remove_cv_t<std::remove_reference_t<SrcType>>;
     using Dst = std::remove_cv_t<std::remove_reference_t<DstType>>;
@@ -238,6 +264,71 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
     ret.deepcopy(*meta->tensor);
     GGML_ASSERT(ret.storage_type() == tt::tt_metal::StorageType::DEVICE || ret.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
     dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(ret));
+    dst_meta->ggtype = dst->type;
+}
+
+static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst, ggml_unary_op op) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    TensorWithMetadata* meta = (TensorWithMetadata*)src0->extra;
+    GGML_ASSERT(meta != NULL);
+    GGML_ASSERT(meta->tensor != NULL);
+    GGML_UNUSED(ctx);
+
+    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+    GGML_ASSERT(dst_meta != NULL);
+
+    tt::tt_metal::Tensor ret;
+    switch (op) {
+        case GGML_UNARY_OP_ABS:
+            ret = tt::tt_metal::abs(*meta->tensor);
+            break;
+        case GGML_UNARY_OP_SGN:
+            ret = tt::tt_metal::sign(*meta->tensor);
+            break;
+        case GGML_UNARY_OP_NEG:
+            ret = tt::tt_metal::neg(*meta->tensor);
+            break;
+        // Not supported in TTNN
+        // case GGML_UNARY_OP_STEP:
+        //     ret = tt::tt_metal::step(*meta->tensor);
+        //     break;
+        // Not accurate enough to pass unit tests
+        // case GGML_UNARY_OP_TANH:
+        //     ret = tt::tt_metal::tanh(*meta->tensor);
+        //     break;
+        // ELU needs an additional parameter. Find where in GGML this is stored
+        // case GGML_UNARY_OP_ELU:
+        //     ret = tt::tt_metal::elu(*meta->tensor);
+        //     break;
+        case GGML_UNARY_OP_RELU:
+            ret = tt::tt_metal::relu(*meta->tensor);
+            break;
+        // Not accurate enough to pass unit tests
+        // case GGML_UNARY_OP_SIGMOID:
+        //     ret = tt::tt_metal::sigmoid(*meta->tensor);
+        //     break;
+        case GGML_UNARY_OP_GELU:
+            ret = tt::tt_metal::gelu(*meta->tensor, false);
+            break;
+        case GGML_UNARY_OP_GELU_QUICK:
+            ret = tt::tt_metal::gelu(*meta->tensor);
+            break;
+        case GGML_UNARY_OP_SILU:
+            ret = tt::tt_metal::silu(*meta->tensor);
+            break;
+        case GGML_UNARY_OP_HARDSWISH:
+            ret = tt::tt_metal::hardswish(*meta->tensor);
+            break;
+        case GGML_UNARY_OP_HARDSIGMOID:
+            ret = tt::tt_metal::hardsigmoid(*meta->tensor);
+            break;
+        default:
+            return false;
+    }
+    GGML_ASSERT(ret.storage_type() == tt::tt_metal::StorageType::DEVICE || ret.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
+    dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(ret));
+    dst_meta->ggtype = dst->type;
+    return true;
 }
 
 // backend interface
@@ -325,8 +416,8 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     // only grayskull is supported for now.
     GGML_ASSERT(processor_class == tt::ARCH::GRAYSKULL);
 
+    // TODO: See if we can use BorrowedStorage to avoid copying the data
     OwnedStorage storage;
-
     switch (ggtype) {
         case GGML_TYPE_F32:
             // For now we cast F32 to BF16. Need a scalable way to handle this as WORMHOLD_B0 have native support for F32
@@ -359,6 +450,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
 
     // TODO: Make sure this is the correct tilize we want to use
     t = tt::tt_metal::tilize_with_zero_padding(t.to(bufctx->device));
+    GGML_ASSERT(t.dtype() == ggml2tt_type(ggtype, processor_class));
     *meta = TensorWithMetadata {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(t)),
         .ggtype = ggtype,
@@ -460,6 +552,7 @@ ggml_backend_metalium_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
     ctx->ggml_buffer_size_bytes = size;
     ctx->name = ctx->name;
     ctx->device = buft_ctx->device;
+    // FIXME: GGML unit tests fails if I don't add some additional memory to the buffer beyond the requested size
     return ggml_backend_buffer_init(buft, ggml_backend_metalium_buffer_interface, ctx, size + 4096 * 1024);
 }
 
@@ -504,7 +597,31 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
 
+
         switch (node->op) {
+            case GGML_OP_UNARY: {
+                ggml_unary_op unary_op = ggml_get_unary_op(node);
+                bool ok = false;
+                switch (unary_op) {
+                case GGML_UNARY_OP_ABS:
+                case GGML_UNARY_OP_SGN:
+                case GGML_UNARY_OP_NEG:
+                //case GGML_UNARY_OP_TANH:
+                case GGML_UNARY_OP_RELU:
+                //case GGML_UNARY_OP_SIGMOID:
+                case GGML_UNARY_OP_GELU:
+                case GGML_UNARY_OP_GELU_QUICK:
+                case GGML_UNARY_OP_SILU:
+                case GGML_UNARY_OP_HARDSWISH:
+                case GGML_UNARY_OP_HARDSIGMOID:
+                    ok = ggml_backend_metalium_activations(ctx, node, unary_op);
+                    break;
+                default:
+                    fprintf(stderr, "%s: unsupported unary op %s\n", __func__, ggml_unary_op_name(unary_op));
+                }
+                GGML_ASSERT(ok && "Failed to execute unary op");
+                break;
+            }
             case GGML_OP_MUL_MAT:
                 ggml_backend_metalium_mul_mat(ctx, node);
                 break;
@@ -512,12 +629,8 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
             case GGML_OP_CPY:
                 ggml_backend_metalium_cpy(ctx, node);
                 break;
-
+            
             case GGML_OP_NONE:
-            case GGML_OP_RESHAPE:
-            case GGML_OP_VIEW:
-            case GGML_OP_PERMUTE:
-            case GGML_OP_TRANSPOSE:
                 break;
 
             default:
@@ -534,10 +647,49 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
 GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     [[maybe_unused]] const struct ggml_tensor * src1 = op->src[1];
+    ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
+
+    // The metalium backend has seperated internal data types from the GGML data types. We really only care about
+    // what we can convert to and from. For now we only support F32, F16, and BF16. Quantized data types will be
+    // supported in the future
+    auto input_supported = [&](const struct ggml_tensor * tensor) {
+        if (!(tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16)) {
+            return false;
+        }
+        // TTNN requires the tensor to be 4-byte aligned
+        return tensor->ne[0] * tttype_size(ggml2tt_type(tensor->type, ctx->device->arch())) % 4 == 0;
+    };
+    auto output_supported = [&](const struct ggml_tensor * tensor) {
+        if (!(tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16)) {
+            return false;
+        }
+        // TTNN requires the tensor to be 4-byte aligned
+        return tensor->ne[0] * tttype_size(ggml2tt_type(tensor->type, ctx->device->arch())) % 4 == 0;
+    };
     
     GGML_ASSERT(op != NULL);
+    if(!output_supported(op)) {
+        return false;
+    }
 
     switch (op->op) {
+        case GGML_OP_UNARY:
+            switch (ggml_get_unary_op(op)) {
+                case GGML_UNARY_OP_ABS:
+                case GGML_UNARY_OP_SGN:
+                case GGML_UNARY_OP_NEG:
+                //case GGML_UNARY_OP_TANH:
+                case GGML_UNARY_OP_RELU:
+                //case GGML_UNARY_OP_SIGMOID:
+                case GGML_UNARY_OP_GELU:
+                case GGML_UNARY_OP_GELU_QUICK:
+                case GGML_UNARY_OP_SILU:
+                case GGML_UNARY_OP_HARDSWISH:
+                case GGML_UNARY_OP_HARDSIGMOID:
+                    return true;
+                default:
+                    return false;
+            }
         case GGML_OP_NONE:
             return  true;
         // FIXME: This crash for most shapes due to a bug in TTNN transpose implementation. Unmask this
@@ -545,13 +697,10 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         // case GGML_OP_MUL_MAT:
         //     return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
         case GGML_OP_CPY:
-            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_BF16 || op->type == GGML_TYPE_F16) &&
-                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
+            return input_supported(src0) && output_supported(op);
         default:
             return false;
     }
-
-    GGML_UNUSED(backend);
 }
 
 GGML_CALL static bool ggml_backend_metalium_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft) {

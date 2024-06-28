@@ -223,7 +223,10 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, [[maybe_unused]]
     // tt::tt_metal::Finish(queue);
 
     ttnn::Shape tt_underlying_shape = row_major_tensor.shape().with_tile_padding();
-    std::array<size_t, 4> stride = {1, tt_underlying_shape[3], tt_underlying_shape[3] * tt_underlying_shape[2], tt_underlying_shape[3] * tt_underlying_shape[2] * tt_underlying_shape[1]};
+    const std::array<size_t, 4> stride = {tt_underlying_shape[1] * tt_underlying_shape[2] * tt_underlying_shape[3],
+                                    tt_underlying_shape[2] * tt_underlying_shape[3],
+                                    tt_underlying_shape[3],
+                                    1};
 
     void* intermid = nullptr;
     std::vector<uint8_t> intermid_buf;
@@ -270,9 +273,9 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, [[maybe_unused]]
     size_t idx = 0;
     for(size_t w = 0; w < shape[0]; w++) {
         for(size_t z = 0; z < shape[1]; z++) {
-            for(size_t x = 0; x < shape[3]; x++) { // FIXME: Don't know why but the shape is reversed...????
-                for(size_t y = 0; y < shape[2]; y++) {
-                    const size_t src_idx = x * stride[0] + y * stride[1] + z * stride[2] + w * stride[3];
+            for(size_t y = 0; y < shape[2]; y++) {
+                for(size_t x = 0; x < shape[3]; x++) {
+                    const size_t src_idx = w * stride[0] + z * stride[1] + y * stride[2] + x * stride[3];
                     if(src_dst_same) {
                         mempcpy((SrcType*)intermid + idx, buf.data() + src_idx, sizeof(SrcType));
                     }

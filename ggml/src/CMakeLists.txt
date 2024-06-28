@@ -780,7 +780,7 @@ if(GGML_METALIUM)
     )
 
     # HACK: Metalium needs libc++. Find a way to get this info into GGML
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --stdlib=libc++")
 
     set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} ${METALIUM_LIBRARIES})
     set(GGML_EXTRA_INCLUDES ${GGML_EXTRA_INCLUDES} ${METALIUM_INCLUDE_DIRS})

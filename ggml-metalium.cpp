@@ -55,20 +55,58 @@ static std::map<int, ttnn::Device*> g_device_map;
 // Actual backend code
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static tt::tt_metal::DataType ggml2tt_type(ggml_type ggtype, tt::ARCH arch) {
+static tt::tt_metal::DataType ggml2tt_type_internal(ggml_type ggtype, tt::ARCH arch) {
+    // This table is consulted to map GGML types to TT types dueing tensor creation
     if(arch == tt::ARCH::GRAYSKULL) {
-        switch(ggtype) {
-            case GGML_TYPE_F32:
-            case GGML_TYPE_F16:
-            case GGML_TYPE_BF16:
-                return tt::tt_metal::DataType::BFLOAT16;
-            default:
-                GGML_ASSERT(false && "Unsupported data type");
-        }
+        static constexpr std::array<tt::tt_metal::DataType, GGML_TYPE_COUNT> table = {
+            /*GGML_TYPE_F32 = */ tt::tt_metal::DataType::BFLOAT16,
+            /*GGML_TYPE_F16 = */ tt::tt_metal::DataType::BFLOAT16,
+            /*GGML_TYPE_Q4_0 = */ tt::tt_metal::DataType::BFLOAT4_B,
+            /*GGML_TYPE_Q4_1 = */ tt::tt_metal::DataType::INVALID,      // Does work but causes issues in unit tests
+            tt::tt_metal::DataType::INVALID,
+            tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_Q5_0 = */ tt::tt_metal::DataType::BFLOAT8_B,
+            /*GGML_TYPE_Q5_1 = */ tt::tt_metal::DataType::INVALID,      // Does work but causes issues in unit tests
+            /*GGML_TYPE_Q8_0 = */ tt::tt_metal::DataType::BFLOAT8_B,
+            /*GGML_TYPE_Q8_1 = */ tt::tt_metal::DataType::BFLOAT8_B,
+            /*GGML_TYPE_Q2_K = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_Q3_K = */ tt::tt_metal::DataType::BFLOAT4_B,
+            /*GGML_TYPE_Q4_K = */ tt::tt_metal::DataType::BFLOAT4_B,
+            /*GGML_TYPE_Q5_K = */ tt::tt_metal::DataType::BFLOAT8_B,
+            /*GGML_TYPE_Q6_K = */ tt::tt_metal::DataType::BFLOAT8_B,
+            /*GGML_TYPE_Q8_K = */ tt::tt_metal::DataType::BFLOAT8_B,
+            /*GGML_TYPE_IQ2_XXS = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_IQ2_XS = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_IQ3_XXS = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_IQ1_S = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_IQ4_NL = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_IQ3_S = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_IQ2_S = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_IQ4_XS = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_I8 = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_I16 = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_I32 = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_I64 = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_F64 = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_IQ1_M = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_BF16 = */ tt::tt_metal::DataType::BFLOAT16,
+        };
+        tt::tt_metal::DataType type = table[ggtype];
+        return type;
     }
-    else {
-        GGML_ASSERT(false && "Unsupported Tenstorrent card architecture");
-    }
+    GGML_ASSERT(false && "Unsupported Tenstorrent card architecture");
+}
+
+static tt::tt_metal::DataType ggml2tt_type(ggml_type ggtype, tt::ARCH arch)
+{
+    tt::tt_metal::DataType type = ggml2tt_type_internal(ggtype, arch);
+    GGML_ASSERT(type != tt::tt_metal::DataType::INVALID && "Unsupported data type");
+    return type;
+
+}
+
+static bool is_ggml_type_supported_by_metalium(ggml_type ggtype, tt::ARCH arch) {
+    return ggml2tt_type_internal(ggtype, arch) != tt::tt_metal::DataType::INVALID;
 }
 
 static size_t tttype_size(tt::tt_metal::DataType type) {
@@ -195,6 +233,7 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, tt::tt_metal::Co
     // we need to view into the tensor to get the contiguous data
     // TODO: Make sure this is correct. As of now not tested for large (>32x32) tensors
     // TODO: There's a lot of optimization that can be done here
+    // TODO: Chunk this loop to avoid cache misses
     static_assert(GGML_MAX_DIMS == 4, "Looping depth is hardcoded to 4");
     size_t idx = 0;
     for(size_t w = 0; w < shape[0]; w++) {
@@ -465,6 +504,23 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
                                                 const void *data, size_t offset,
                                                 size_t size)
 {
+    // Here's the general logic of set_tensor
+    // 1. Make a flat buffer and copy the data into it
+    //    - If the data is quantized, convert it to BFLOAT16
+    //    - Try to directly copy the data if it is already in the correct format
+    // 2. Create a TT tensor from the flat buffer as ROW_MAJOR. Send it to the device and tile it
+    // 3. If the data is quantized, cast down to BFLOAT8_B or BFLOAT4_B
+    // There's a lot of things to do here.
+    // TODO: On grayskull the best I can do is BFLOAT16 so the final dimension must be a multiple of 2.
+    //       But on Wormhole we can use FP32 then the final dimension can be anything. But currently it 
+    //       is hard coded to BFLOAT16. Use FP32 as intermidate when the hardware supports it and when
+    //       it makes sense.
+    // TODO: Handle integer data type for Wormhole
+    // TODO: Currently FP32 is hard coded to convert to BFLOAT16. Use FP32 when the hardware supports it
+    // TODO: Make a scalable way to decide which GGML type casts to TT quantized types
+    // TODO: In theory, we can cast BFLOAT16 to FP32, tile it, then cast it back to BFLOAT16, to support
+    //       arbitrary tensor dimensions. Do we want to implement this?
+    // TODO: Use the simpler tilize() when the final 2 dimensions are both multiples of 32
     // Must be setting the entire tensor at once
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(size == ggml_nbytes(tensor));
@@ -481,24 +537,23 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     // TODO: See if we can use BorrowedStorage to avoid copying the data
     bool source_is_quantized = ggml_is_quantized(ggtype);
     OwnedStorage storage;
-    switch (ggtype) {
-        case GGML_TYPE_F32:
-            // For now we cast F32 to BF16. Need a scalable way to handle this as WORMHOLD_B0 have native support for F32
-            // TODO: Might want to consider disabling F32 support for Grayskull in the future
-            storage = data2owned_storage<float, bfloat16>((const float*)data, size / sizeof(float));
-            break;
-        case GGML_TYPE_BF16:
-            storage = data2owned_storage<ggml_bf16_t, bfloat16>((const ggml_bf16_t*)data, size / sizeof(bfloat16));
-            break;
-        case GGML_TYPE_F16:
-            // TT hardware claims to support FP16 but the API does not expose it. For now we use BF16 as it is close enough
-            storage = data2owned_storage<ggml_fp16_t, bfloat16>((const ggml_fp16_t*)data, size / sizeof(ggml_fp16_t));
-            break;
-        case GGML_TYPE_Q4_0:
-            storage = ggml_quantized2owned_storage<bfloat16>(data, tensor);
-            break;
-        default:
-            GGML_ASSERT(false && "Unsupported data type");
+    if(ggtype == GGML_TYPE_F32) {
+        // For now we cast F32 to BF16. Need a scalable way to handle this as WORMHOLD_B0 have native support for F32
+        // TODO: Might want to consider disabling F32 support for Grayskull in the future
+        storage = data2owned_storage<float, bfloat16>((const float*)data, size / sizeof(float));
+    }
+    else if (ggtype == GGML_TYPE_F16) {
+        // TT hardware claims to support FP16 but the API does not expose it. For now we use BF16 as it is close enough
+        storage = data2owned_storage<ggml_fp16_t, bfloat16>((const ggml_fp16_t*)data, size / sizeof(ggml_fp16_t));
+    }
+    else if (ggtype == GGML_TYPE_BF16) {
+        storage = data2owned_storage<ggml_bf16_t, bfloat16>((const ggml_bf16_t*)data, size / sizeof(ggml_bf16_t));
+    }
+    else if (source_is_quantized) {
+        storage = ggml_quantized2owned_storage<bfloat16>(data, tensor);
+    }
+    else {
+        GGML_ASSERT(false && "Unsupported data type");
     }
     
     // TODO: Make sure this is correct
@@ -516,11 +571,12 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
 
     // TODO: Make sure this is the correct tilize we want to use
     t = tt::tt_metal::tilize_with_zero_padding(t.to(bufctx->device));
-    // GGML_ASSERT(t.dtype() == ggml2tt_type(ggtype, processor_class));
-    if(source_is_quantized) {
-        // TODO: Cast into corresponding data type
-        t = typecast(t, tt::tt_metal::DataType::BFLOAT8_B);
+    tt::tt_metal::DataType final_type = ggml2tt_type(ggtype, processor_class);
+    if(final_type != t.dtype()) {
+        t = typecast(t, final_type);
     }
+    GGML_ASSERT(t.storage_type() == tt::tt_metal::StorageType::DEVICE || t.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
+    GGML_ASSERT(t.dtype() == final_type);
     *meta = TensorWithMetadata {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(t)),
         .ggtype = ggtype,
@@ -532,6 +588,11 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
                                                 void *data, size_t offset,
                                                 size_t size)
 {
+    // Here's the general logic of get_tensor
+    // 1. Get the TT tensor from the metadata
+    // 2. If the TT tensor is quantized, cast it to BFLOAT16
+    // 3. Call tensor2ggml to convert the TT tensor to GGML tensor
+    //    - tensor2ggml internally handles the data type conversion
     GGML_ASSERT(size == ggml_nbytes(tensor));
     GGML_ASSERT(tensor->extra != NULL);
     GGML_UNUSED(offset);
@@ -720,22 +781,22 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
     // supported in the future
     auto input_supported = [&](const struct ggml_tensor * tensor) {
         if(tensor == NULL ||
-            !(tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16) ||
+            !is_ggml_type_supported_by_metalium(tensor->type, ctx->device->arch()) ||
             !ggml_is_contiguous(tensor)) {
             return false;
         }
         // TTNN requires the tensor to be 4-byte aligned
-        return tensor->ne[0] * tttype_size(ggml2tt_type(tensor->type, ctx->device->arch())) % 4 == 0;
+        return tensor->ne[0] % 2 == 0;
     };
     auto output_supported = [&](const struct ggml_tensor * tensor) {
         if(tensor == NULL ||
-            !(tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16 || tensor->type == GGML_TYPE_Q4_0) ||
+            !is_ggml_type_supported_by_metalium(tensor->type, ctx->device->arch()) ||
             !ggml_is_contiguous(tensor)) {
             return false;
         }
         // TTNN requires the tensor to be 4-byte aligned
         if(!ggml_is_quantized(tensor->type)) {
-            return tensor->ne[0] * tttype_size(ggml2tt_type(tensor->type, ctx->device->arch())) % 4 == 0;
+            return tensor->ne[0] % 2 == 0;
         }
         return tensor->ne[0] % 4 == 0;
     };

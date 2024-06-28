@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <tt_eager/tensor/tensor.hpp>
 #include <ttnn/core.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
@@ -28,6 +29,7 @@
 #include <tt_dnn/op_library/eltwise_unary/eltwise_unary_op.hpp>
 #include <tt_dnn/op_library/copy/copy_op.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
+#include <ttnn/operations/matmul.hpp>
 
 
 #include <memory>
@@ -193,7 +195,7 @@ tt::tt_metal::OwnedStorage ggml_quantized2owned_storage(const void* src, ggml_te
 }
 
 template <typename SrcType>
-void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, tt::tt_metal::CommandQueue& queue, ggml_type dst_ggtype) {
+void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, [[maybe_unused]] tt::tt_metal::CommandQueue& queue, ggml_type dst_ggtype) {
     // Converts TT tensors to GGML types
     // TODO: Support reading quantized data
     ttnn::Shape shape = tensor.shape();
@@ -350,7 +352,7 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     auto aT = tt::tt_metal::transpose(a, -2, -1);
     // TODO: Ask TT to support multiplication of pre-transposed tensors. Calling transpose here is inefficient
     // https://github.com/tenstorrent/tt-metal/issues/9709
-    cm->tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::fully_connected(b, aT));
+    cm->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::operations::matmul::matmul(b, aT, std::nullopt));
     cm->ggtype = dst->type; // Hope this is the correct approach
     GGML_ASSERT(cm->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || cm->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
     GGML_UNUSED(ctx);
@@ -400,7 +402,6 @@ static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ct
         // case GGML_UNARY_OP_TANH:
         //     ret = tt::tt_metal::tanh(*meta->tensor);
         //     break;
-        // ELU needs an additional parameter. Find where in GGML this is stored
         case GGML_UNARY_OP_ELU:
             ret = tt::tt_metal::elu(*meta->tensor, 1.0f);
             break;
@@ -571,6 +572,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     // TODO: In theory, we can cast BFLOAT16 to FP32, tile it, then cast it back to BFLOAT16, to support
     //       arbitrary tensor dimensions. Do we want to implement this?
     // TODO: Use the simpler tilize() when the final 2 dimensions are both multiples of 32
+    // TODO: Check if Metalium tensors can do reuce of there's a way to write to already allocated tensors
     // Must be setting the entire tensor at once
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(size == ggml_nbytes(tensor));
@@ -971,6 +973,9 @@ GGML_CALL bool ggml_backend_is_metalium(ggml_backend_t backend) {
 
 GGML_CALL ggml_backend_t ggml_backend_reg_metalium_init(const char * params, void * user_data)
 {
+    // Sanity check for the environment
+    static_assert(tt::tt_metal::MAX_NUM_DIMENSIONS >= GGML_MAX_DIMS, "tt::tt_metal::MAX_NUM_DIMENSIONS must be at least GGML_MAX_DIMS");
+
     GGML_UNUSED(params);
     GGML_UNUSED(user_data);
     return ggml_backend_metalium_init();

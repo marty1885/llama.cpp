@@ -32,6 +32,7 @@
 
 #include <memory>
 #include <type_traits>
+#include <variant>
 
 struct ggml_backend_metalium_context {
     ttnn::device::Device* device = nullptr;
@@ -96,6 +97,20 @@ static tt::tt_metal::DataType ggml2tt_type_internal(ggml_type ggtype, tt::ARCH a
         return type;
     }
     GGML_ASSERT(false && "Unsupported Tenstorrent card architecture");
+}
+
+static bool numpy_broadcast_rule(const ggml_tensor* t, const ggml_tensor* q)
+{
+    int tdim = ggml_n_dims(t);
+    int qdim = ggml_n_dims(q);
+
+    int min_dim = tdim < qdim ? tdim : qdim;
+    for(int i = 0; i < min_dim; i++) {
+        if(t->ne[i] != q->ne[i] && t->ne[i] != 1 && q->ne[i] != 1) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static tt::tt_metal::DataType ggml2tt_type(ggml_type ggtype, tt::ARCH arch)
@@ -184,12 +199,26 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, tt::tt_metal::Co
     ttnn::Shape shape = tensor.shape();
     static_assert(std::is_same_v<SrcType, float> || std::is_same_v<SrcType, bfloat16>);
 
-    tt::tt_metal::Tensor row_major_tensor = tt::tt_metal::untilize(tensor);
-    GGML_ASSERT(row_major_tensor.layout() == tt::tt_metal::Layout::ROW_MAJOR);
-
+    tt::tt_metal::Tensor row_major_tensor = tensor.cpu().to(tt::tt_metal::Layout::ROW_MAJOR);
     std::vector<SrcType> buf(shape.volume()); // .volume() returns the underlying volume of the tensor not the logical one (TT enforces 32x32 tiles)
-    tt::tt_metal::memcpy(queue, buf.data(), row_major_tensor);
-    tt::tt_metal::Finish(queue);
+    GGML_ASSERT(row_major_tensor.storage_type() == StorageType::OWNED or row_major_tensor.storage_type() == StorageType::BORROWED);
+    GGML_ASSERT(std::holds_alternative<OwnedStorage>(row_major_tensor.storage()) || std::holds_alternative<BorrowedStorage>(row_major_tensor.storage()));
+    if(std::holds_alternative<OwnedStorage>(row_major_tensor.storage())) {
+        const OwnedStorage& owned = std::get<OwnedStorage>(row_major_tensor.storage());
+        memcpy(buf.data(), std::get<owned_buffer::Buffer<SrcType>>(owned.buffer).data(), shape.volume() * sizeof(SrcType));
+    }
+    else if(std::holds_alternative<BorrowedStorage>(row_major_tensor.storage())) {
+        const BorrowedStorage& borrowed = std::get<BorrowedStorage>(row_major_tensor.storage());
+        memcpy(buf.data(), std::get<borrowed_buffer::Buffer<SrcType>>(borrowed.buffer).data(), shape.volume() * sizeof(SrcType));
+    } else {
+        GGML_ASSERT(false && "Unsupported buffer type");
+    }
+    // TODO: Measure the performance of the following code. This is much simpeer and does untiling on the device
+    // But does not work for large tensors
+    // row_major_tensor = tt::tt_metal::untilize(tensor);
+    // GGML_ASSERT(row_major_tensor.layout() == tt::tt_metal::Layout::ROW_MAJOR);
+    // tt::tt_metal::memcpy(queue, buf.data(), row_major_tensor);
+    // tt::tt_metal::Finish(queue);
 
     ttnn::Shape tt_underlying_shape = row_major_tensor.shape().with_tile_padding();
     std::array<size_t, 4> stride = {1, tt_underlying_shape[3], tt_underlying_shape[3] * tt_underlying_shape[2], tt_underlying_shape[3] * tt_underlying_shape[2] * tt_underlying_shape[1]};
@@ -445,17 +474,21 @@ static void ggml_backend_metalium_bin_op(ggml_backend_metalium_context * ctx, st
     TensorWithMetadata* meta1 = (TensorWithMetadata*)src1->extra;
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
 
-    if(op == GGML_OP_ADD) {
-        dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::add(*meta0->tensor, *meta1->tensor));
-    }
-    else if(op == GGML_OP_MUL) {
-        dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::multiply(*meta0->tensor, *meta1->tensor));
-    }
-    else if(op == GGML_OP_SUB) {
-        dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::subtract(*meta0->tensor, *meta1->tensor));
-    }
-    else if(op == GGML_OP_DIV) {
-        dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::divide(*meta0->tensor, *meta1->tensor));
+    switch(op) {
+        case GGML_OP_ADD:
+            dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::add(*meta0->tensor, *meta1->tensor));
+            break;
+        case GGML_OP_MUL:
+            dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::multiply(*meta0->tensor, *meta1->tensor));
+            break;
+        case GGML_OP_SUB:
+            dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::subtract(*meta0->tensor, *meta1->tensor));
+            break;
+        case GGML_OP_DIV:
+            dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::divide(*meta0->tensor, *meta1->tensor));
+            break;
+        default:
+            GGML_ASSERT(false && "Unsupported binary operation");
     }
     dst_meta->ggtype = dst->type;
     GGML_ASSERT(dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
@@ -848,7 +881,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
                 case GGML_UNARY_OP_ABS:
                 case GGML_UNARY_OP_SGN:
                 case GGML_UNARY_OP_NEG:
-                //case GGML_UNARY_OP_TANH:
+                //case GGML_UNARY_OP_TANH: // Not accurate enough on Grayskull to pass unit tests
                 case GGML_UNARY_OP_RELU:
                 //case GGML_UNARY_OP_SIGMOID:
                 case GGML_UNARY_OP_GELU:
@@ -863,12 +896,13 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         case GGML_OP_LEAKY_RELU:
         case GGML_OP_NONE:
             return true;
-        case GGML_OP_ADD:
+        // case GGML_OP_ADD: // Not accurate enough on Grayskull to pass unit tests
         case GGML_OP_SUB:
         case GGML_OP_DIV:
-        case GGML_OP_MUL:
-            // Disable broadcasting for now
-            return input_supported(src0) && input_supported(src1) && memcmp(src0->ne, src1->ne, sizeof(op->ne)) == 0;
+        // case GGML_OP_MUL:
+            // DIV does not support broadcasting on TTNN
+            return input_supported(src0) && input_supported(src1) &&
+                (memcmp(src0->ne, src1->ne, sizeof(src0->ne)) == 0 || (numpy_broadcast_rule(src0, src1) && op->op != GGML_OP_DIV));
         // FIXME: This crash for most shapes due to a bug in TTNN transpose implementation. Unmask this
         // when the bug is fixed
         // case GGML_OP_MUL_MAT:

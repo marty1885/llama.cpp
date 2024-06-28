@@ -27,6 +27,7 @@
 #include <tt_dnn/op_library/fully_connected/fully_connected_op.hpp>
 #include <tt_dnn/op_library/eltwise_unary/eltwise_unary_op.hpp>
 #include <tt_dnn/op_library/copy/copy_op.hpp>
+#include <ttnn/operations/eltwise/binary/binary.hpp>
 
 
 #include <memory>
@@ -432,6 +433,33 @@ static void ggml_backend_metalium_leaky_relu(ggml_backend_metalium_context * ctx
     dst_meta->ggtype = dst->type;
     GGML_ASSERT(dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
 }
+static void ggml_backend_metalium_bin_op(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst, ggml_op op) {
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC1_SANITY_CHECK(dst);
+    GGML_UNUSED(ctx);
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    TensorWithMetadata* meta0 = (TensorWithMetadata*)src0->extra;
+    TensorWithMetadata* meta1 = (TensorWithMetadata*)src1->extra;
+    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+
+    if(op == GGML_OP_ADD) {
+        dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::add(*meta0->tensor, *meta1->tensor));
+    }
+    else if(op == GGML_OP_MUL) {
+        dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::multiply(*meta0->tensor, *meta1->tensor));
+    }
+    else if(op == GGML_OP_SUB) {
+        dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::subtract(*meta0->tensor, *meta1->tensor));
+    }
+    else if(op == GGML_OP_DIV) {
+        dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::divide(*meta0->tensor, *meta1->tensor));
+    }
+    dst_meta->ggtype = dst->type;
+    GGML_ASSERT(dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
+}
 
 // backend interface
 
@@ -749,6 +777,12 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
             case GGML_OP_LEAKY_RELU:
                 ggml_backend_metalium_leaky_relu(ctx, node);
                 break;
+            case GGML_OP_ADD:
+            case GGML_OP_SUB:
+            case GGML_OP_DIV:
+            case GGML_OP_MUL:
+                ggml_backend_metalium_bin_op(ctx, node, node->op);
+                break;
             case GGML_OP_MUL_MAT:
                 ggml_backend_metalium_mul_mat(ctx, node);
                 break;
@@ -786,6 +820,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
             return false;
         }
         // TTNN requires the tensor to be 4-byte aligned
+        // TODO: Update this when we supported FP32
         return tensor->ne[0] % 2 == 0;
     };
     auto output_supported = [&](const struct ggml_tensor * tensor) {
@@ -795,6 +830,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
             return false;
         }
         // TTNN requires the tensor to be 4-byte aligned
+        // TODO: Update this when we supported FP32
         if(!ggml_is_quantized(tensor->type)) {
             return tensor->ne[0] % 2 == 0;
         }
@@ -826,7 +862,13 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
             }
         case GGML_OP_LEAKY_RELU:
         case GGML_OP_NONE:
-            return  true;
+            return true;
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_DIV:
+        case GGML_OP_MUL:
+            // Disable broadcasting for now
+            return input_supported(src0) && input_supported(src1) && memcmp(src0->ne, src1->ne, sizeof(op->ne)) == 0;
         // FIXME: This crash for most shapes due to a bug in TTNN transpose implementation. Unmask this
         // when the bug is fixed
         // case GGML_OP_MUL_MAT:

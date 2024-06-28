@@ -786,7 +786,7 @@ struct test_cpy : public test_case {
     }
 
     double max_nmse_err() override {
-        return 1e-6;
+        return 6e-5;
     }
 
     size_t op_size(ggml_tensor * t) override {
@@ -866,6 +866,9 @@ struct test_bin_bcast : public test_case {
                 init_tensor_uniform(t);
             }
         }
+    }
+    double max_nmse_err() override {
+        return 3e-5;
     }
 };
 

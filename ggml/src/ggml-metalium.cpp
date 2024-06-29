@@ -174,7 +174,8 @@ tt::tt_metal::OwnedStorage data2owned_storage(const SrcType* src, size_t size) {
 
     // special case for F32 and BF16 since no conversion is needed
     if constexpr(std::is_same_v<Src, Dst> || (std::is_same_v<Src, ggml_fp16_t> && std::is_same_v<Dst, bfloat16>)) {
-        memcpy(vec.data(), src, size * sizeof(Src));
+        // Make GCC shut up about writing into a class like it's flat memory
+        memcpy((void*)vec.data(), src, size * sizeof(Src));
     }
     else {
         for(size_t i = 0; i < size; i++) {
@@ -487,6 +488,24 @@ static void ggml_backend_metalium_bin_op(ggml_backend_metalium_context * ctx, st
     GGML_ASSERT(dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
 }
 
+static void ggml_backend_metalium_reshape(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
+{
+    GGML_UNUSED(ctx);
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+
+    tt::tt_metal::Tensor& t = *((TensorWithMetadata*)dst->src[0]->extra)->tensor;
+    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+
+    std::vector<uint32_t> target_shape(GGML_MAX_DIMS, 1);
+    for(int i = 0; i < GGML_MAX_DIMS; i++) {
+        target_shape[i] = dst->ne[GGML_MAX_DIMS - i - 1];
+    }
+
+    dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(t.reshape(target_shape));
+    GGML_ASSERT(dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
+}
+
 // backend interface
 
 GGML_CALL static const char * ggml_backend_metalium_name(ggml_backend_t backend) {
@@ -734,6 +753,7 @@ ggml_backend_metalium_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
     GGML_ASSERT(ret.storage_type() == tt::tt_metal::StorageType::DEVICE || ret.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
     dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(ret));
     dst_meta->ggtype = dst->type;
+    return true;
 }
 
 static struct ggml_backend_buffer_i ggml_backend_metalium_buffer_interface = {
@@ -848,6 +868,10 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
 
             case GGML_OP_CPY:
                 ggml_backend_metalium_cpy(ctx, node);
+                break;
+
+            case GGML_OP_RESHAPE:
+                ggml_backend_metalium_reshape(ctx, node);
                 break;
 
             case GGML_OP_NONE:

@@ -746,7 +746,10 @@ ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(int device) {
     GGML_ASSERT((size_t)device < tt::tt_metal::GetNumAvailableDevices());
     static std::map<int, ggml_backend_buffer_type> buffer_type_map;
 
-    GGML_ASSERT(g_device_map.contains(device));
+    if(!g_device_map.contains(device)) {
+        ggml_backend_metalium_init();
+        GGML_ASSERT(g_device_map.contains(device));
+    }
 
     if(buffer_type_map.contains(device)) {
         return &buffer_type_map[device];
@@ -765,7 +768,6 @@ ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(int device) {
 GGML_CALL static ggml_backend_buffer_type_t ggml_backend_metalium_get_default_buffer_type(ggml_backend_t backend) {
     auto* ctx = (ggml_backend_metalium_context *)backend->context;
     return ggml_backend_metalium_buffer_type(ctx->device_id);
-    GGML_UNUSED(backend);
 }
 
 GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -906,9 +908,12 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
 }
 
 GGML_CALL static bool ggml_backend_metalium_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
-    return ggml_backend_buft_is_host(buft);
-
-    GGML_UNUSED(backend);
+    if (buft->iface.get_name != ggml_backend_metalium_buffer_type_name) {
+        return false;
+    }
+    ggml_backend_metalium_buffer_type_context * buft_ctx = (ggml_backend_metalium_buffer_type_context *)buft->context;
+    ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
+    return buft_ctx->device == ctx->device;
 }
 
 static void ggml_backend_metalium_synchronize(ggml_backend_t backend)

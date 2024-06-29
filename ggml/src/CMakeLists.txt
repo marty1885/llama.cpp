@@ -781,9 +781,10 @@ if(GGML_METALIUM)
     add_compile_definitions(${METALIUM_DEDINES})
     #target_compile_options(ggml PUBLIC ${METALIUM_OPTIONS})
     add_compile_definitions(GGML_USE_METALIUM)
-    add_compile_definitions(LLAMA_USE_METALIUM)
     set(GGML_HEADERS_METALIUM ../include/ggml-metalium.h)
     set(GGML_SOURCES_METALIUM ggml-metalium.cpp)
+
+    list(APPEND GGML_CDEF_PUBLIC GGML_USE_METALIUM)
 endif()
 
 if (GGML_CPU_HBM)

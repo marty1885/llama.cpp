@@ -2701,11 +2701,8 @@ static ggml_backend_buffer_type_t llama_default_buffer_type_offload(const llama_
     if (buft == nullptr) {
         LLAMA_LOG_WARN("%s: cannot use GPU %d, check `vulkaninfo --summary`\n", __func__, gpu);
     }
-// #elif defined(GGML_USE_METALIUM)
-//     buft = ggml_backend_metalium_buffer_type(gpu);
-//     if (buft == nullptr) {
-//         LLAMA_LOG_WARN("%s: cannot use GPU %d, check `metalinfo`\n", __func__, gpu);
-//     }
+#elif defined(GGML_USE_METALIUM)
+    buft = ggml_backend_metalium_buffer_type(gpu);
 #endif
 
     if (buft == nullptr) {

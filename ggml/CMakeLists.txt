@@ -166,6 +166,8 @@ endif()
 
 if (GGML_METALIUM)
     set(CMAKE_CXX_STANDARD 20)
+    set(CMAKE_CXX_EXTENSIONS ON)
+    set(CMAKE_CXX_FLAGS "-std=gnu++2b")
 endif()
 
 set(CMAKE_CXX_STANDARD_REQUIRED true)

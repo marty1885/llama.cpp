@@ -351,7 +351,6 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     TensorWithMetadata* cm = (TensorWithMetadata*)dst->extra;
 
     GGML_ASSERT(cm != NULL);
-
     auto aT = tt::tt_metal::transpose(a, -2, -1);
     // TODO: Ask TT to support multiplication of pre-transposed tensors. Calling transpose here is inefficient
     // https://github.com/tenstorrent/tt-metal/issues/9709
@@ -959,7 +958,7 @@ ggml_backend_t ggml_backend_metalium_init(void) {
 
     // store the device in the global map because tensor creation uses device ID but Metalium disallows opening the same device twice
     g_device_map[device_id] = ctx->device;
-    ttnn::enable_program_cache(*ctx->device);
+    // ttnn::enable_program_cache(*ctx->device);
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_metalium_guid(),

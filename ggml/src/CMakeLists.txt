@@ -775,13 +775,6 @@ if(GGML_METALIUM)
         FMT_HEADER_ONLY
     )
 
-    set(METALIUM_OPTIONS
-        -stdlib=libc++
-    )
-
-    # HACK: Metalium needs libc++. Find a way to get this info into GGML
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --stdlib=libc++")
-
     set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} ${METALIUM_LIBRARIES})
     set(GGML_EXTRA_INCLUDES ${GGML_EXTRA_INCLUDES} ${METALIUM_INCLUDE_DIRS})
     link_directories(${METALIUM_LIB_DIRS})

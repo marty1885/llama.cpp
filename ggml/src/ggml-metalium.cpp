@@ -54,6 +54,7 @@ struct TensorWithMetadata
 
 // maps device id to device
 static std::map<int, ttnn::Device*> g_device_map;
+static std::map<int, ggml_backend_t> g_backend_map;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 // Actual backend code
@@ -705,6 +706,36 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
     GGML_UNUSED(buffer);
 }
 
+GGML_CALL static void ggml_backend_metalium_buffer_clear(ggml_backend_buffer_t buffer,
+                                                        uint8_t value)
+{
+    // Not using this. Metalium's allication model is not compatible with GGML's allocator
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(value);
+}
+
+GGML_CALL static bool
+ggml_backend_metalium_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
+                                    const ggml_tensor *src,
+                                    ggml_tensor *dst)
+{
+    GGML_UNUSED(buffer);
+
+    GGML_ASSERT(src->extra != NULL);
+    GGML_ASSERT(dst->extra != NULL);
+
+    TensorWithMetadata * src_meta = (TensorWithMetadata *)src->extra;
+    TensorWithMetadata * dst_meta = (TensorWithMetadata *)dst->extra;
+
+    tt::tt_metal::Tensor& src_tensor = *src_meta->tensor;
+
+    tt::tt_metal::Tensor ret = tt::tt_metal::zeros_like(src_tensor);
+    ret.deepcopy(src_tensor);
+    GGML_ASSERT(ret.storage_type() == tt::tt_metal::StorageType::DEVICE || ret.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
+    dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(ret));
+    dst_meta->ggtype = dst->type;
+}
+
 static struct ggml_backend_buffer_i ggml_backend_metalium_buffer_interface = {
     /* .get_name        = */ ggml_backend_metalium_buffer_get_name,
     /* .free_buffer     = */ ggml_backend_metalium_buffer_free_buffer,
@@ -712,8 +743,8 @@ static struct ggml_backend_buffer_i ggml_backend_metalium_buffer_interface = {
     /* .init_tensor     = */ ggml_backend_sycl_buffer_init_tensor,
     /* .set_tensor      = */ ggml_backend_metalium_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_metalium_buffer_get_tensor,
-    /* .cpy_tensor      = */ nullptr, //ggml_backend_metalium_buffer_cpy_tensor,
-    /* .clear           = */ nullptr, //ggml_backend_metalium_buffer_clear,
+    /* .cpy_tensor      = */ ggml_backend_metalium_buffer_cpy_tensor,
+    /* .clear           = */ ggml_backend_metalium_buffer_clear,
     /* .reset           = */ nullptr,
 };
 
@@ -953,6 +984,12 @@ static ggml_guid_t ggml_backend_metalium_guid(void) {
 ggml_backend_t ggml_backend_metalium_init(void) {
     // TODO: Support multiple devices (do we even need to? TT supports merging diverse devices into a single device, at least the API suggests that)
     const int device_id = 0;
+
+    auto it = g_backend_map.find(device_id);
+    if (it != g_backend_map.end()) {
+        return it->second;
+    }
+
     ggml_backend_metalium_context * ctx = new ggml_backend_metalium_context {
         /* device            = */ &ttnn::device::open_device(device_id),
         /* device_id         = */ device_id,
@@ -970,6 +1007,7 @@ ggml_backend_t ggml_backend_metalium_init(void) {
         /* .interface = */ metalium_backend_i,
         /* .context   = */ ctx,
     };
+    g_backend_map[device_id] = backend;
     return backend;
 }
 

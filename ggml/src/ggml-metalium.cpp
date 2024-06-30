@@ -223,13 +223,6 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, [[maybe_unused]]
     // GGML_ASSERT(row_major_tensor.layout() == tt::tt_metal::Layout::ROW_MAJOR);
     // tt::tt_metal::memcpy(queue, buf.data(), row_major_tensor);
     // tt::tt_metal::Finish(queue);
-
-    ttnn::Shape tt_underlying_shape = row_major_tensor.shape().with_tile_padding();
-    const std::array<size_t, 4> stride = {tt_underlying_shape[1] * tt_underlying_shape[2] * tt_underlying_shape[3],
-                                    tt_underlying_shape[2] * tt_underlying_shape[3],
-                                    tt_underlying_shape[3],
-                                    1};
-
     void* intermid = nullptr;
     std::vector<uint8_t> intermid_buf;
     bool need_quantized_conversion = false;
@@ -271,6 +264,11 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, [[maybe_unused]]
     // TODO: Make sure this is correct. As of now not tested for large (>32x32) tensors
     // TODO: There's a lot of optimization that can be done here
     // TODO: Chunk this loop to avoid cache misses
+    ttnn::Shape tt_underlying_shape = row_major_tensor.shape().with_tile_padding();
+    const std::array<size_t, 4> stride = {tt_underlying_shape[1] * tt_underlying_shape[2] * tt_underlying_shape[3],
+                                    tt_underlying_shape[2] * tt_underlying_shape[3],
+                                    tt_underlying_shape[3],
+                                    1};
     static_assert(GGML_MAX_DIMS == 4, "Looping depth is hardcoded to 4");
     size_t idx = 0;
     for(size_t w = 0; w < shape[0]; w++) {
@@ -354,6 +352,9 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
 
     GGML_ASSERT(cm != NULL);
     auto aT = tt::tt_metal::transpose(a, -2, -1);
+    // HACK: Workaround data corruption in TTNN
+    // https://github.com/tenstorrent/tt-metal/issues/9849
+    cm->tensor.reset();
     // TODO: Ask TT to support multiplication of pre-transposed tensors. Calling transpose here is inefficient
     // https://github.com/tenstorrent/tt-metal/issues/9709
     cm->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::operations::matmul::matmul(b, aT, std::nullopt));
@@ -403,9 +404,9 @@ static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ct
         //     ret = tt::tt_metal::step(*meta->tensor);
         //     break;
         // Not accurate enough to pass unit tests
-        // case GGML_UNARY_OP_TANH:
-        //     ret = tt::tt_metal::tanh(*meta->tensor);
-        //     break;
+        case GGML_UNARY_OP_TANH:
+            ret = tt::tt_metal::tanh(*meta->tensor);
+            break;
         case GGML_UNARY_OP_ELU:
             ret = tt::tt_metal::elu(*meta->tensor, 1.0f);
             break;
@@ -413,9 +414,9 @@ static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ct
             ret = tt::tt_metal::relu(*meta->tensor);
             break;
         // Not accurate enough to pass unit tests
-        // case GGML_UNARY_OP_SIGMOID:
-        //     ret = tt::tt_metal::sigmoid(*meta->tensor);
-        //     break;
+        case GGML_UNARY_OP_SIGMOID:
+            ret = tt::tt_metal::sigmoid(*meta->tensor);
+            break;
         case GGML_UNARY_OP_GELU:
             ret = tt::tt_metal::gelu(*meta->tensor, false);
             break;
@@ -836,10 +837,10 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
                 case GGML_UNARY_OP_ABS:
                 case GGML_UNARY_OP_SGN:
                 case GGML_UNARY_OP_NEG:
-                //case GGML_UNARY_OP_TANH:
+                case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_ELU:
                 case GGML_UNARY_OP_RELU:
-                //case GGML_UNARY_OP_SIGMOID:
+                case GGML_UNARY_OP_SIGMOID:
                 case GGML_UNARY_OP_GELU:
                 case GGML_UNARY_OP_GELU_QUICK:
                 case GGML_UNARY_OP_SILU:
@@ -931,9 +932,9 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
                 case GGML_UNARY_OP_ABS:
                 case GGML_UNARY_OP_SGN:
                 case GGML_UNARY_OP_NEG:
-                //case GGML_UNARY_OP_TANH: // Not accurate enough on Grayskull to pass unit tests
+                case GGML_UNARY_OP_TANH: // Not accurate enough on Grayskull to pass unit tests
                 case GGML_UNARY_OP_RELU:
-                //case GGML_UNARY_OP_SIGMOID:
+                case GGML_UNARY_OP_SIGMOID:
                 case GGML_UNARY_OP_GELU:
                 case GGML_UNARY_OP_GELU_QUICK:
                 case GGML_UNARY_OP_SILU:
@@ -946,10 +947,10 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         case GGML_OP_LEAKY_RELU:
         case GGML_OP_NONE:
             return true;
-        // case GGML_OP_ADD: // Not accurate enough on Grayskull to pass unit tests
+        case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_DIV:
-        // case GGML_OP_MUL:
+        case GGML_OP_MUL: // DITTO
             // DIV does not support broadcasting on TTNN
             return input_supported(src0) && input_supported(src1) &&
                 (memcmp(src0->ne, src1->ne, sizeof(src0->ne)) == 0 || (numpy_broadcast_rule(src0, src1) && op->op != GGML_OP_DIV));
@@ -1024,7 +1025,7 @@ ggml_backend_t ggml_backend_metalium_init(void) {
 
     // store the device in the global map because tensor creation uses device ID but Metalium disallows opening the same device twice
     g_device_map[device_id] = ctx->device;
-    // ttnn::enable_program_cache(*ctx->device);
+    ttnn::enable_program_cache(*ctx->device);
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_metalium_guid(),

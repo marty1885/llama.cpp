@@ -145,14 +145,10 @@ struct ggml_cgraph * build_graph(const test_model& model) {
     struct ggml_cgraph * gf = ggml_new_graph(ctx0);
 
     // zT = x @ yT
-    /*
     struct ggml_tensor * result = ggml_mul_mat(ctx0, model.a, ggml_cont(ctx0, model.b));
 
     // z = (zT)T
     ggml_build_forward_expand(gf, ggml_cont(ctx0, ggml_transpose(ctx0, result)));
-    */
-    struct ggml_tensor * result = ggml_mul_mat(ctx0, model.a, model.b);
-    ggml_build_forward_expand(gf, result);
 
     // delete the temporally context used to build the graph
     ggml_free(ctx0);

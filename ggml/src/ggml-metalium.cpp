@@ -15,10 +15,12 @@
 #include "tt_dnn/op_library/composite/composite_ops.hpp"
 #include "tt_dnn/op_library/tilize/tilize_op.hpp"
 #include "tt_dnn/op_library/untilize/untilize_op.hpp"
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <optional>
 #include <tt_eager/tensor/tensor.hpp>
 #include <ttnn/core.hpp>
@@ -34,6 +36,7 @@
 
 #include <memory>
 #include <type_traits>
+#include <unordered_map>
 #include <variant>
 
 struct ggml_backend_metalium_context {
@@ -42,11 +45,71 @@ struct ggml_backend_metalium_context {
     std::string name;
 };
 
+struct TensorWithMetadata;
+
+// GGML views are lazy and it's not 100% of the times we get a tensor with `extra` populated to direct the writes.
+// Solution? Look at the tensor's supposed address that WE faked and figure out which tensor it is referring to.
+struct FakeMemoryMap
+{
+    TensorWithMetadata* find(std::ptrdiff_t address)
+    {
+        // auto it = std::lower_bound(address_tensor_map.begin(), address_tensor_map.end(), address, [](const auto& pair, std::ptrdiff_t address) {
+        //     return pair.first < address;
+        // });
+        // if(it == address_tensor_map.end() || it->first != address) {
+        //     return nullptr;
+        // }
+        std::cout << "Looking for address: " << address << std::endl;
+        auto it = address_tensor_map.find(address);
+        if(it == address_tensor_map.end()) {
+            return nullptr;
+        }
+        return it->second;
+    }
+
+    bool contains(std::ptrdiff_t address) const
+    {
+        return address_tensor_map.contains(address);
+    }
+
+    void insert(std::ptrdiff_t address, TensorWithMetadata* tensor)
+    {
+        GGML_ASSERT(address_tensor_map.contains(address) == false);
+        address_tensor_map.insert({address, tensor});
+    }
+    std::unordered_map<std::ptrdiff_t, TensorWithMetadata*> address_tensor_map;
+};
+
+struct ggml_backend_metalium_buffer_context {
+
+    size_t ggml_buffer_size_bytes = 0;
+    std::string name;
+    ttnn::device::Device* device = nullptr;
+
+    // Tracking our own allocations because Metalium limitations and GGML assuming them
+    std::vector<std::unique_ptr<TensorWithMetadata>> metadata_to_free;
+    FakeMemoryMap address_tensor_map;
+};
+
 struct TensorWithMetadata
 {
     std::shared_ptr<tt::tt_metal::Tensor> tensor;
     ggml_type ggtype = (ggml_type)-1;
+    ggml_backend_metalium_buffer_context* bufctx = nullptr;
 };
+
+static const tt::tt_metal::Tensor& resolve_from_ggml_tensor(const ggml_tensor* tensor, ggml_backend_metalium_buffer_context* bufctx)
+{
+    GGML_ASSERT(tensor->extra != NULL);
+    const auto *meta = (TensorWithMetadata*)tensor->extra;
+    if(meta->tensor != nullptr) {
+        return *meta->tensor;
+    }
+
+    auto *ptr = bufctx->address_tensor_map.find((std::ptrdiff_t)tensor);
+    GGML_ASSERT(ptr != nullptr);
+    return *ptr->tensor;
+}
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 // Backend internal state tracking because GGML API does not allow
@@ -366,17 +429,69 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
 static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
     GGML_UNUSED(ctx);
     GGML_METALIUM_OP_SANITY_CHECK(dst);
-    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
 
     const struct ggml_tensor * src0 = dst->src[0];
     TensorWithMetadata* meta = (TensorWithMetadata*)src0->extra;
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
 
-    tt::tt_metal::Tensor ret = tt::tt_metal::zeros_like(*meta->tensor);
-    ret.deepcopy(*meta->tensor);
-    GGML_ASSERT(ret.storage_type() == tt::tt_metal::StorageType::DEVICE || ret.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
-    dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(ret));
-    dst_meta->ggtype = dst->type;
+    GGML_ASSERT(meta != NULL);
+    // std::cout << "dst->ne: " << dst->ne[0] << " " << dst->ne[1] << " " << dst->ne[2] << " " << dst->ne[3] << std::endl;
+    // std::cout << "dst->nb: " << dst->nb[0] << " " << dst->nb[1] << " " << dst->nb[2] << " " << dst->nb[3] << std::endl;
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    // Fast path for copying contiguous tensors
+    if(ggml_is_contiguous(src0)) {
+        const auto& ref_tensor = resolve_from_ggml_tensor(src0, dst_meta->bufctx);
+        tt::tt_metal::Tensor ret = tt::tt_metal::zeros_like(ref_tensor);
+        ret.deepcopy(*meta->tensor);
+        GGML_ASSERT(ret.storage_type() == tt::tt_metal::StorageType::DEVICE || ret.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
+        *dst_meta = {
+            .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(ret)),
+            .ggtype = dst->type,
+            .bufctx = meta->bufctx
+        };
+        return;
+    }
+    // Now we deal with non-contiguous source tensors. Metalium can only unpad (slice but without spacing) the tensor
+    std::array src_size = std::to_array(src0->ne);
+    std::array dst_size = std::to_array(dst->ne);
+    std::array src_stride = std::to_array(src0->nb);
+    std::array dst_stride = std::to_array(dst->nb);
+
+    // If just doing transpose, we can just do a reshape
+    // Transpose = same shape, but stride of the 1st two dimensions are swapped
+    if(src_size[0] == dst_size[0] && src_size[1] == dst_size[1] && src_size[2] == dst_size[2] && src_size[3] == dst_size[3] &&
+        src_stride[1] == dst_stride[0] && src_stride[0] == dst_stride[1] / dst_size[1] && src_stride[2] == dst_stride[2] && src_stride[3] == dst_stride[3]) {
+        // TODO: I feel this is wrong. But the results are correct. Need to investigate
+        const auto& ref_tensor = resolve_from_ggml_tensor(src0, dst_meta->bufctx);
+        tt::tt_metal::Tensor ret = tt::tt_metal::zeros_like(ref_tensor);
+        ret.deepcopy(*meta->tensor);
+        GGML_ASSERT(ret.storage_type() == tt::tt_metal::StorageType::DEVICE || ret.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
+        *dst_meta = {
+            .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(ret)),
+            .ggtype = dst->type,
+            .bufctx = meta->bufctx
+        };
+        return;
+    }
+    // Check we can do the unpad
+    for(size_t i = 0; i < GGML_MAX_DIMS; i++) {
+        GGML_ASSERT(src_size[i] >= dst_size[i]);
+        GGML_ASSERT(src_stride[i] >= dst_stride[i]);
+    }
+
+    std::array<uint32_t, GGML_MAX_DIMS> start;
+    std::array<uint32_t, GGML_MAX_DIMS> end;
+
+    for(size_t i = 0; i < GGML_MAX_DIMS; i++) {
+        start[i] = 0; // TODO: How do I calculate the start?
+        end[i] = dst_size[i] + start[i];
+    }
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(meta->tensor->unpad(start, end)),
+        .ggtype = dst->type,
+        .bufctx = meta->bufctx
+    };
 }
 
 static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst, ggml_unary_op op) {
@@ -436,8 +551,11 @@ static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ct
             return false;
     }
     GGML_ASSERT(ret.storage_type() == tt::tt_metal::StorageType::DEVICE || ret.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
-    dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(ret));
-    dst_meta->ggtype = dst->type;
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(ret)),
+        .ggtype = dst->type,
+        .bufctx = meta->bufctx
+    };
     return true;
 }
 static void ggml_backend_metalium_leaky_relu(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
@@ -453,8 +571,11 @@ static void ggml_backend_metalium_leaky_relu(ggml_backend_metalium_context * ctx
     GGML_ASSERT(dst->op_params != NULL);
     memcpy(&negative_slope, dst->op_params, sizeof(float));
 
-    dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::leaky_relu(*meta->tensor, negative_slope));
-    dst_meta->ggtype = dst->type;
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::leaky_relu(*meta->tensor, negative_slope)),
+        .ggtype = dst->type,
+        .bufctx = meta->bufctx
+    };
     GGML_ASSERT(dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
 }
 static void ggml_backend_metalium_bin_op(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst, ggml_op op) {
@@ -469,23 +590,28 @@ static void ggml_backend_metalium_bin_op(ggml_backend_metalium_context * ctx, st
     TensorWithMetadata* meta1 = (TensorWithMetadata*)src1->extra;
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
 
+    std::shared_ptr<tt::tt_metal::Tensor> ret;
     switch(op) {
         case GGML_OP_ADD:
-            dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::add(*meta0->tensor, *meta1->tensor));
+            ret = std::make_shared<tt::tt_metal::Tensor>(ttnn::add(*meta0->tensor, *meta1->tensor));
             break;
         case GGML_OP_MUL:
-            dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::multiply(*meta0->tensor, *meta1->tensor));
+            ret = std::make_shared<tt::tt_metal::Tensor>(ttnn::multiply(*meta0->tensor, *meta1->tensor));
             break;
         case GGML_OP_SUB:
-            dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::subtract(*meta0->tensor, *meta1->tensor));
+            ret = std::make_shared<tt::tt_metal::Tensor>(ttnn::subtract(*meta0->tensor, *meta1->tensor));
             break;
         case GGML_OP_DIV:
-            dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::divide(*meta0->tensor, *meta1->tensor));
+            ret = std::make_shared<tt::tt_metal::Tensor>(ttnn::divide(*meta0->tensor, *meta1->tensor));
             break;
         default:
             GGML_ASSERT(false && "Unsupported binary operation");
     }
-    dst_meta->ggtype = dst->type;
+    *dst_meta = {
+        .tensor = std::move(ret),
+        .ggtype = dst->type,
+        .bufctx = meta0->bufctx
+    };
     GGML_ASSERT(dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
 }
 
@@ -503,9 +629,38 @@ static void ggml_backend_metalium_reshape(ggml_backend_metalium_context * ctx, s
         target_shape[i] = dst->ne[GGML_MAX_DIMS - i - 1];
     }
 
-    dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(t.reshape(target_shape));
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(t.reshape(target_shape)),
+        .ggtype = dst->type,
+        .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
+    };
+
     GGML_ASSERT(dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
 }
+
+static void ggml_backend_metalium_transpose(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
+{
+    GGML_UNUSED(ctx);
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+
+    tt::tt_metal::Tensor& t = *((TensorWithMetadata*)dst->src[0]->extra)->tensor;
+    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+
+    std::vector<uint32_t> target_shape(GGML_MAX_DIMS, 1);
+    for(int i = 0; i < GGML_MAX_DIMS; i++) {
+        target_shape[i] = dst->ne[GGML_MAX_DIMS - i - 1];
+    }
+
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::transpose(t, -2, -1)),
+        .ggtype = dst->type,
+        .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
+    };
+
+    GGML_ASSERT(dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
+}
+
 
 // backend interface
 
@@ -552,16 +707,6 @@ GGML_CALL static size_t ggml_backend_metalium_buffer_type_get_alloc_size(ggml_ba
     GGML_UNUSED(buft);
 }
 
-struct ggml_backend_metalium_buffer_context {
-
-    size_t ggml_buffer_size_bytes = 0;
-    std::string name;
-    ttnn::device::Device* device = nullptr;
-
-    // Tracking our own allocations because Metalium limitations and GGML assuming them
-    std::vector<std::unique_ptr<TensorWithMetadata>> metadata_to_free;
-};
-
 GGML_CALL static const char * ggml_backend_metalium_buffer_get_name(ggml_backend_buffer_t buffer) {
     ggml_backend_metalium_buffer_context * ctx = (ggml_backend_metalium_buffer_context *)buffer->context;
     return ctx->name.c_str();
@@ -598,12 +743,16 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     // TODO: Check if Metalium tensors can do reuce of there's a way to write to already allocated tensors
     // Must be setting the entire tensor at once
     GGML_ASSERT(offset == 0);
-    GGML_ASSERT(size == ggml_nbytes(tensor));
     GGML_ASSERT(tensor->extra != NULL);
 
     ggml_backend_metalium_buffer_context * bufctx = (ggml_backend_metalium_buffer_context *)buffer->context;
     ggml_type ggtype = tensor->type;
     TensorWithMetadata * meta = (TensorWithMetadata *)tensor->extra;
+
+    if(size != ggml_nbytes(tensor)) {
+        fprintf(stderr, "Warning: Does not supprt writing to segmented tensor\n");
+        return;
+    }
 
     tt::ARCH processor_class = bufctx->device->arch();
     // only grayskull is supported for now.
@@ -655,7 +804,15 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     *meta = TensorWithMetadata {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(t)),
         .ggtype = ggtype,
+        .bufctx = bufctx
     };
+    if(ggml_is_contiguous(tensor)) {
+        // std::cerr << "Adding tensor w/ address = " << (void*)tensor->data << ", shape = " << tensor->ne[0] << " " << tensor->ne[1] << " " << tensor->ne[2] << " " << tensor->ne[3] << std::endl;
+        if(bufctx->address_tensor_map.contains((uintptr_t)tensor->data)) {
+            return;
+        }
+        bufctx->address_tensor_map.insert((uintptr_t)tensor->data, meta);
+    }
 }
 
 static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer,
@@ -721,7 +878,11 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
                                      ggml_tensor *tensor)
 {
     ggml_backend_metalium_buffer_context * bufctx = (ggml_backend_metalium_buffer_context *)buffer->context;
-    bufctx->metadata_to_free.push_back(std::make_unique<TensorWithMetadata>());
+    bufctx->metadata_to_free.push_back(std::make_unique<TensorWithMetadata>(TensorWithMetadata{
+        .tensor = nullptr,
+        .ggtype = (ggml_type)-1,
+        .bufctx = bufctx
+    }));
     tensor->extra = bufctx->metadata_to_free.back().get();
     GGML_UNUSED(buffer);
 }
@@ -867,12 +1028,18 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
                 ggml_backend_metalium_mul_mat(ctx, node);
                 break;
 
+            case GGML_OP_CONT:
             case GGML_OP_CPY:
+            case GGML_OP_VIEW:
                 ggml_backend_metalium_cpy(ctx, node);
                 break;
 
             case GGML_OP_RESHAPE:
                 ggml_backend_metalium_reshape(ctx, node);
+                break;
+
+            case GGML_OP_TRANSPOSE:
+                ggml_backend_metalium_transpose(ctx, node);
                 break;
 
             case GGML_OP_NONE:
@@ -897,20 +1064,20 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
     // The metalium backend has seperated internal data types from the GGML data types. We really only care about
     // what we can convert to and from. For now we only support F32, F16, and BF16. Quantized data types will be
     // supported in the future
-    auto input_supported = [&](const struct ggml_tensor * tensor) {
+    auto input_supported = [&](const struct ggml_tensor * tensor, bool req_contingous = true) {
         if(tensor == NULL ||
             !is_ggml_type_supported_by_metalium(tensor->type, ctx->device->arch()) ||
-            !ggml_is_contiguous(tensor)) {
+            !(!req_contingous || ggml_is_contiguous(tensor))) {
             return false;
         }
         // TTNN requires the tensor to be 4-byte aligned
         // TODO: Update this when we supported FP32
         return tensor->ne[0] % 2 == 0;
     };
-    auto output_supported = [&](const struct ggml_tensor * tensor) {
+    auto output_supported = [&](const struct ggml_tensor * tensor, bool req_contingous = true) {
         if(tensor == NULL ||
             !is_ggml_type_supported_by_metalium(tensor->type, ctx->device->arch()) ||
-            !ggml_is_contiguous(tensor)) {
+            !(!req_contingous || ggml_is_contiguous(tensor))) {
             return false;
         }
         // TTNN requires the tensor to be 4-byte aligned
@@ -922,7 +1089,15 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
     };
 
     GGML_ASSERT(op != NULL);
-    if(!output_supported(op)) {
+    if(!output_supported(op, true)) {
+        return false;
+    }
+
+    if(op->op == GGML_OP_CONT || op->op == GGML_OP_VIEW || op->op == GGML_OP_CPY || op->op == GGML_OP_TRANSPOSE) {
+        return input_supported(src0, false);
+    }
+
+    if(!ggml_is_contiguous(op)) {
         return false;
     }
 
@@ -956,8 +1131,6 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
                 (memcmp(src0->ne, src1->ne, sizeof(src0->ne)) == 0 || (numpy_broadcast_rule(src0, src1) && op->op != GGML_OP_DIV));
         case GGML_OP_MUL_MAT:
             return true;
-        case GGML_OP_CPY:
-            return input_supported(src0);
         default:
             return false;
     }

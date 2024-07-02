@@ -666,11 +666,6 @@ static void ggml_backend_metalium_transpose(ggml_backend_metalium_context * ctx,
     tt::tt_metal::Tensor& t = *((TensorWithMetadata*)dst->src[0]->extra)->tensor;
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
 
-    std::vector<uint32_t> target_shape(GGML_MAX_DIMS, 1);
-    for(int i = 0; i < GGML_MAX_DIMS; i++) {
-        target_shape[i] = dst->ne[GGML_MAX_DIMS - i - 1];
-    }
-
     *dst_meta = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::transpose(t, -2, -1)),
         .ggtype = dst->type,

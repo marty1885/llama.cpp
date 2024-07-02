@@ -657,6 +657,19 @@ static void ggml_backend_metalium_transpose(ggml_backend_metalium_context * ctx,
         target_shape[i] = dst->ne[GGML_MAX_DIMS - i - 1];
     }
 
+    if(dst->ne[0] % tt::constants::TILE_WIDTH != 0 || dst->ne[1] % tt::constants::TILE_HEIGHT != 0) {
+        // This path is SLOW. Reshape on a tilized tensor only works when the last two dimensions are tile aligned
+        tt::tt_metal::Tensor row_major_tensor = tt::tt_metal::untilize(t);
+        tt::tt_metal::Tensor reshaped = row_major_tensor.reshape(target_shape);
+        tt::tt_metal::Tensor ret = tt::tt_metal::tilize_with_zero_padding(reshaped);
+        *dst_meta = {
+            .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(ret)),
+            .ggtype = dst->type,
+            .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
+        };
+        return;
+    }
+
     *dst_meta = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::transpose(t, -2, -1)),
         .ggtype = dst->type,

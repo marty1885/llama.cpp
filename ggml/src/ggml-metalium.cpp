@@ -476,6 +476,24 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
         }
         return std::make_shared<tt::tt_metal::Tensor>(res);
     }
+    if(op == GGML_OP_RESHAPE) {
+        std::vector<uint32_t> target_shape(GGML_MAX_DIMS, 1);
+        for(int i = 0; i < GGML_MAX_DIMS; i++) {
+            target_shape[i] = tensor->ne[GGML_MAX_DIMS - i - 1];
+        }
+        auto t = realize_ggml_view(src0);
+
+        if(tensor->ne[0] % tt::constants::TILE_WIDTH != 0 || tensor->ne[1] % tt::constants::TILE_HEIGHT != 0) {
+            // This path is SLOW. Reshape on a tilized tensor only works when the last two dimensions are tile aligned
+            tt::tt_metal::Tensor row_major_tensor = tt::tt_metal::untilize(*t);
+            tt::tt_metal::Tensor reshaped = row_major_tensor.reshape(target_shape);
+            tt::tt_metal::Tensor ret = tt::tt_metal::tilize_with_zero_padding(reshaped);
+            return std::make_shared<tt::tt_metal::Tensor>(ret);
+        }
+
+        // Fast path if the tensor is already tile aligned
+        return std::make_shared<tt::tt_metal::Tensor>(t->reshape(target_shape));
+    }
 
     if(TensorWithMetadata* meta = (TensorWithMetadata*)tensor->extra; meta != nullptr && meta->tensor != nullptr) {
         return meta->tensor;
@@ -1094,7 +1112,8 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
         //     << "  src0 addr: " << (void*)(node->src[0] ? node->src[0]->data : 0) << "\n"
         //     << "  src1 addr: " << (void*)(node->src[1] ? node->src[1]->data : 0) << "\n";
 
-        if(node->op == GGML_OP_VIEW || node->op == GGML_OP_TRANSPOSE) {
+        // Bypass post conition checks for these ops because they are evaluated lazily
+        if(node->op == GGML_OP_VIEW || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_RESHAPE) {
             continue;
         }
 
@@ -1140,16 +1159,6 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
             case GGML_OP_CPY:
                 ggml_backend_metalium_cpy(ctx, node);
                 break;
-
-            case GGML_OP_RESHAPE:
-                ggml_backend_metalium_reshape(ctx, node);
-                break;
-
-            // TODO: Convert transpose to be lazy
-            // case GGML_OP_TRANSPOSE:
-            //     ggml_backend_metalium_transpose(ctx, node);
-            //     break;
-
             case GGML_OP_NONE:
                 break;
 
@@ -1226,7 +1235,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         return false;
     }
 
-    if(op->op == GGML_OP_CONT || op->op == GGML_OP_VIEW || op->op == GGML_OP_CPY || op->op == GGML_OP_TRANSPOSE) {
+    if(op->op == GGML_OP_CONT || op->op == GGML_OP_VIEW || op->op == GGML_OP_CPY || op->op == GGML_OP_TRANSPOSE || op->op == GGML_OP_RESHAPE) {
         return input_supported(src0, false);
     }
 

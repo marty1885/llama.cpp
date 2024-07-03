@@ -418,6 +418,23 @@ int main()
         return b;
     }, "4D tensor copy"));
 
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 4, 4, 4);
+        return ggml_view_2d(ctx, ggml_transpose(ctx, a), 4, 12, 4 * 4, 0);
+    }, "View of transposed 4D tensor"));
+
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, 64, 4, 1);
+        return ggml_reshape_4d(ctx, a, 32, 128, 4, 1);
+        
+    }, "Reshape to tile aligned tensor"));
+
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 32, 1, 1);
+        return ggml_reshape_4d(ctx, a, 16, 32, 2, 1);
+        
+    }, "Reshape to non tile aligned tensor"));
+
 
     // (Basics of) what we need to get KV cache working
     // TODO: Map GGML operations into TTNN nlp_kv_cache_load_slice and update_cache_multi_core

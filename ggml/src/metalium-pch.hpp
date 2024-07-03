@@ -6,20 +6,24 @@
 #include "ggml.h"
 #include "ggml-metalium.h"
 
-#include "tt_metal/host_api.hpp"
+#include "host_api.hpp"
 #include "hostdevcommon/kernel_structs.h"
 #include "impl/dispatch/command_queue.hpp"
 #include "tensor/host_buffer/functions.hpp"
 #include "tensor/host_buffer/types.hpp"
 #include "tensor/types.hpp"
 #include "tt_dnn/op_library/auto_format.hpp"
+#include "tt_dnn/op_library/unpad/unpad_op.hpp"
 #include "tt_dnn/op_library/composite/composite_ops.hpp"
 #include "tt_dnn/op_library/tilize/tilize_op.hpp"
 #include "tt_dnn/op_library/untilize/untilize_op.hpp"
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <optional>
 #include <tt_eager/tensor/tensor.hpp>
 #include <ttnn/core.hpp>
@@ -31,4 +35,11 @@
 #include <tt_dnn/op_library/copy/copy_op.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
 #include <ttnn/operations/matmul.hpp>
+
+
+#include <memory>
+#include <type_traits>
+#include <unordered_map>
+#include <variant>
+
 #endif

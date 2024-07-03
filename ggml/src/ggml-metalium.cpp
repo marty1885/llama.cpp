@@ -401,6 +401,94 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, [[maybe_unused]]
     }
 }
 
+static bool is_view(const ggml_tensor* tensor)
+{
+    return tensor->view_src != nullptr ||
+        tensor->op == GGML_OP_VIEW ||
+        tensor->op == GGML_OP_RESHAPE ||
+        tensor->op == GGML_OP_TRANSPOSE;
+}
+
+static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tensor)
+{
+    // Since TTNN does not support the traditional view operation, we had to support it ourselves
+    // This function, realize, extracts the data from the source tensor and creates a new tensor
+    // that is separate from the source tensor. DO NOT eagerly call this function
+
+    ggml_tensor* src0 = tensor->src[0];
+    ggml_op op = tensor->op;
+
+    // std::cout << "\nrealize_ggml_view() OP: " << ggml_op_desc(tensor) << std::endl;
+    // std::cout << "  dst shape: " << tensor->ne[0] << " " << tensor->ne[1] << " " << tensor->ne[2] << " " << tensor->ne[3] << std::endl;
+    // std::cout << "  dst stride: " << tensor->nb[0] << " " << tensor->nb[1] << " " << tensor->nb[2] << " " << tensor->nb[3] << std::endl;
+    // std::cout << "  dst extra: " << tensor->extra << std::endl;
+    // if(tensor->extra != nullptr) {
+    //     TensorWithMetadata* meta = (TensorWithMetadata*)tensor->extra;
+    //     std::cout << "  dst tensor: " << meta->tensor << std::endl;
+    //     if(meta->tensor != nullptr) {
+    //         std::cout << "  dst tensor shape: " << meta->tensor->shape() << std::endl;
+    //     }
+    // }
+    // std::cout << "  dst data: " << tensor->data << std::endl;
+    // std::cout << "  dst view_src: " << tensor->view_src << std::endl;
+    // std::cout << "  dst src0: " << src0 << std::endl;
+    // std::cout << "  dst src1: " << tensor->src[1] << std::endl;
+
+    if(op == GGML_OP_CONT || op == GGML_OP_CPY) {
+        GGML_ASSERT(src0 != nullptr);
+        return realize_ggml_view(src0);
+    }
+    // Do we really need to lazy evaluate this? Currently transpose is eagerly evaluated
+    if(op == GGML_OP_TRANSPOSE) {
+        auto patent = realize_ggml_view(src0);
+        return std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::transpose(*patent, -2, -1));
+    }
+    if(op == GGML_OP_VIEW) {
+        std::shared_ptr<tt::tt_metal::Tensor> parent = realize_ggml_view(tensor->view_src);
+        std::array dst_size = std::to_array(tensor->ne);
+        std::array dst_stride = std::to_array(tensor->nb);
+        std::array src_size = std::to_array(src0->ne);
+        std::array src_stride = std::to_array(src0->nb);
+        size_t offset = tensor->view_offs;
+        ggml_backend_metalium_buffer_context* bufctx = ((TensorWithMetadata*)tensor->extra)->bufctx;
+
+        // Fast path if we can just return the parent tensor (view is a no-op)
+        if(dst_size == src_size && dst_stride == src_stride && offset == 0) {
+            return parent;
+        }
+        std::array<uint32_t, GGML_MAX_DIMS> start;
+        std::array<uint32_t, GGML_MAX_DIMS> end;
+
+        for(size_t i = 0; i < GGML_MAX_DIMS; i++) {
+            start[i] = 0; // TODO: How do I calculate the start?
+            end[i] = dst_size[i] + start[i] - 1; // end is inclusive (WTF?)
+        }
+        std::reverse(start.begin(), start.end());
+        std::reverse(end.begin(), end.end());
+        tt::tt_metal::Tensor res;
+        if(dst_size[0] % tt::constants::TILE_WIDTH == 0 && dst_size[1] % tt::constants::TILE_HEIGHT == 0) {
+            res = tt::tt_metal::unpad(*parent, start, end);
+        }
+        else {
+            // THIS is EXTREMELY SLOW. But it works
+            tt::tt_metal::Tensor tmp = parent->cpu().to(tt::tt_metal::Layout::ROW_MAJOR).unpad(start, end);
+            res = tt::tt_metal::tilize_with_zero_padding(tmp.to(bufctx->device));
+        }
+        return std::make_shared<tt::tt_metal::Tensor>(res);
+    }
+
+    if(TensorWithMetadata* meta = (TensorWithMetadata*)tensor->extra; meta != nullptr && meta->tensor != nullptr) {
+        return meta->tensor;
+    }
+
+    GGML_ASSERT(is_view(tensor));
+    GGML_ASSERT(tensor->view_src != nullptr);
+
+    // recursivly resolve the source tensor
+    std::shared_ptr<tt::tt_metal::Tensor> parent = realize_ggml_view(tensor->view_src);
+    return parent;
+}
+
 // Sanity check macros to ensure that the tensors are in the correct format and we won't crash
 #define GGML_METALIUM_OP_SANITY_CHECK(_node) \
     GGML_ASSERT((_node)->extra != NULL);
@@ -448,8 +536,10 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     GGML_ASSERT(src1->extra != NULL);
     GGML_ASSERT(dst->extra != NULL);
 
-    tt::tt_metal::Tensor& a = *(((TensorWithMetadata*)src0->extra)->tensor);
-    tt::tt_metal::Tensor& b = *(((TensorWithMetadata*)src1->extra)->tensor);
+    auto ap = realize_ggml_view(src0);
+    auto bp = realize_ggml_view(src1);
+    auto &a = *ap;
+    auto &b = *bp;
     TensorWithMetadata* cm = (TensorWithMetadata*)dst->extra;
 
     GGML_ASSERT(cm != NULL);
@@ -468,111 +558,13 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
 static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
     GGML_UNUSED(ctx);
     GGML_METALIUM_OP_SANITY_CHECK(dst);
-
-    const struct ggml_tensor * src0 = dst->src[0];
-    TensorWithMetadata* meta = (TensorWithMetadata*)src0->extra;
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
 
-
-    // std::cout << "ggml_backend_metalium_cpy() OP: " << ggml_op_desc(dst) << std::endl;
-    // std::cout << "  src shape: " << src0->ne[0] << " " << src0->ne[1] << " " << src0->ne[2] << " " << src0->ne[3] << std::endl;
-    // std::cout << "  dst shape: " << dst->ne[0] << " " << dst->ne[1] << " " << dst->ne[2] << " " << dst->ne[3] << std::endl;
-    // std::cout << "  src stride: " << src0->nb[0] << " " << src0->nb[1] << " " << src0->nb[2] << " " << src0->nb[3] << std::endl;
-    // std::cout << "  dst stride: " << dst->nb[0] << " " << dst->nb[1] << " " << dst->nb[2] << " " << dst->nb[3] << std::endl;
-
-    GGML_ASSERT(meta != NULL);
-    // GGML_ASSERT(ggml_is_contiguous(dst));
-
-    std::array src_size = std::to_array(src0->ne);
-    std::array dst_size = std::to_array(dst->ne);
-    std::array src_stride = std::to_array(src0->nb);
-    std::array<size_t, GGML_MAX_DIMS> dst_stride;
-
-    // TODO: Support quantized data
-    size_t stride = 1;
-    for(size_t i = 0; i < GGML_MAX_DIMS; i++) {
-        dst_stride[i] = stride;
-        stride *= dst_size[i];
-    }
-
-    std::array transposed_src_size = src_size;
-    std::swap(transposed_src_size[0], transposed_src_size[1]);
-    std::array transposed_src_stride = src_stride;
-    std::swap(transposed_src_stride[0], transposed_src_stride[1]);
-    // std::cout << "Transposed src size: " << transposed_src_size[0] << " " << transposed_src_size[1] << " " << transposed_src_size[2] << " " << transposed_src_size[3] << std::endl;
-    // std::cout << "Transposed src stride: " << transposed_src_stride[0] << " " << transposed_src_stride[1] << " " << transposed_src_stride[2] << " " << transposed_src_stride[3] << std::endl;
-    // std::cout << "Transpose test 1: " << (memcmp(transposed_src_size.data(), dst_size.data(), GGML_MAX_DIMS * sizeof(long)) == 0) << std::endl;
-    // std::cout << "Transpose test 2: " << (memcmp(transposed_src_stride.data(), dst_stride.data(), GGML_MAX_DIMS * sizeof(long)) == 0) << std::endl;
-    // Fast path when both tensors are contiguous and have the same shape
-    if((ggml_is_contiguous(src0) &&
-        memcmp(src_size.data(), dst_size.data(), GGML_MAX_DIMS * sizeof(long)) == 0 &&
-        memcmp(src_stride.data(), dst_stride.data(), GGML_MAX_DIMS * sizeof(long)) == 0)
-        // SRC is actually a transposed tensor. Which has been eagerly evaluated
-        || (ggml_is_contiguous(dst) &&
-            memcmp(src_size.data(), dst_size.data(), GGML_MAX_DIMS * sizeof(long)) == 0 && 
-            // FIXME: Don't know why must compare aganst the original dst->nb. The copied one failes
-            // XXX: I don't think we need it
-            true)
-            /*memcmp(transposed_src_stride.data(), dst->nb, GGML_MAX_DIMS * sizeof(long)) == 0)*/) {
-        const auto& ref_tensor = resolve_from_ggml_tensor(src0, dst_meta->bufctx);
-        tt::tt_metal::Tensor ret = tt::tt_metal::zeros_like(ref_tensor);
-        ret.deepcopy(*meta->tensor);
-        GGML_ASSERT(ret.storage_type() == tt::tt_metal::StorageType::DEVICE || ret.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
-        *dst_meta = {
-            .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(ret)),
-            .ggtype = dst->type,
-            .bufctx = meta->bufctx
-        };
-        return;
-    }
-    // If just doing transpose, we can just do a reshape
-    // Transpose = same shape, but stride of the 1st two dimensions are swapped
-    if(src_size[0] == dst_size[0] && src_size[1] == dst_size[1] && src_size[2] == dst_size[2] && src_size[3] == dst_size[3] &&
-        src_stride[1] == dst_stride[0] && src_stride[0] == dst_stride[1] / dst_size[1] && src_stride[2] == dst_stride[2] && src_stride[3] == dst_stride[3]) {
-        // TODO: I feel this is wrong. But the results are correct. Need to investigate
-        const auto& ref_tensor = resolve_from_ggml_tensor(src0, dst_meta->bufctx);
-        tt::tt_metal::Tensor ret = tt::tt_metal::zeros_like(ref_tensor);
-        ret.deepcopy(*meta->tensor);
-        GGML_ASSERT(ret.storage_type() == tt::tt_metal::StorageType::DEVICE || ret.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
-        *dst_meta = {
-            .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(ret)),
-            .ggtype = dst->type,
-            .bufctx = meta->bufctx
-        };
-        return;
-    }
-
-    // Now we deal with non-contiguous source tensors. Metalium can only unpad (slice but without spacing) the tensor
-
-    // Check we can do the unpad
-    for(size_t i = 0; i < GGML_MAX_DIMS; i++) {
-        GGML_ASSERT(src_size[i] >= dst_size[i]);
-        GGML_ASSERT(src_stride[i] >= dst_stride[i]);
-    }
-
-    std::array<uint32_t, GGML_MAX_DIMS> start;
-    std::array<uint32_t, GGML_MAX_DIMS> end;
-
-    for(size_t i = 0; i < GGML_MAX_DIMS; i++) {
-        start[i] = 0; // TODO: How do I calculate the start?
-        end[i] = dst_size[i] + start[i] - 1; // end is inclusive (WTF?)
-    }
-    std::reverse(start.begin(), start.end());
-    std::reverse(end.begin(), end.end());
-    tt::tt_metal::Tensor res;
-    if(dst->ne[0] % tt::constants::TILE_WIDTH == 0 && dst->ne[1] % tt::constants::TILE_HEIGHT == 0) {
-        res = tt::tt_metal::unpad(*meta->tensor, start, end);
-    }
-    else {
-        // THIS is EXTREMELY SLOW. But it works
-        tt::tt_metal::Tensor tmp = meta->tensor->cpu().to(tt::tt_metal::Layout::ROW_MAJOR).unpad(start, end);
-        res = tt::tt_metal::tilize_with_zero_padding(tmp.to(meta->bufctx->device));
-    }
-
     *dst_meta = {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(res),
+        // TODO: Type cast to the appropriate type
+        .tensor = realize_ggml_view(dst),
         .ggtype = dst->type,
-        .bufctx = meta->bufctx
+        .bufctx = dst_meta->bufctx
     };
 }
 
@@ -585,49 +577,51 @@ static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ct
     TensorWithMetadata* meta = (TensorWithMetadata*)src0->extra;
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
 
+    auto src_tensor = realize_ggml_view(src0);
+
     tt::tt_metal::Tensor ret;
     switch (op) {
         case GGML_UNARY_OP_ABS:
-            ret = tt::tt_metal::abs(*meta->tensor);
+            ret = tt::tt_metal::abs(*src_tensor);
             break;
         case GGML_UNARY_OP_SGN:
-            ret = tt::tt_metal::sign(*meta->tensor);
+            ret = tt::tt_metal::sign(*src_tensor);
             break;
         case GGML_UNARY_OP_NEG:
-            ret = tt::tt_metal::neg(*meta->tensor);
+            ret = tt::tt_metal::neg(*src_tensor);
             break;
         // Not supported in TTNN
         // case GGML_UNARY_OP_STEP:
-        //     ret = tt::tt_metal::step(*meta->tensor);
+        //     ret = tt::tt_metal::step(*src_tensor);
         //     break;
         // Not accurate enough to pass unit tests
         case GGML_UNARY_OP_TANH:
-            ret = tt::tt_metal::tanh(*meta->tensor);
+            ret = tt::tt_metal::tanh(*src_tensor);
             break;
         case GGML_UNARY_OP_ELU:
-            ret = tt::tt_metal::elu(*meta->tensor, 1.0f);
+            ret = tt::tt_metal::elu(*src_tensor, 1.0f);
             break;
         case GGML_UNARY_OP_RELU:
-            ret = tt::tt_metal::relu(*meta->tensor);
+            ret = tt::tt_metal::relu(*src_tensor);
             break;
         // Not accurate enough to pass unit tests
         case GGML_UNARY_OP_SIGMOID:
-            ret = tt::tt_metal::sigmoid(*meta->tensor);
+            ret = tt::tt_metal::sigmoid(*src_tensor);
             break;
         case GGML_UNARY_OP_GELU:
-            ret = tt::tt_metal::gelu(*meta->tensor, false);
+            ret = tt::tt_metal::gelu(*src_tensor, false);
             break;
         case GGML_UNARY_OP_GELU_QUICK:
-            ret = tt::tt_metal::gelu(*meta->tensor);
+            ret = tt::tt_metal::gelu(*src_tensor);
             break;
         case GGML_UNARY_OP_SILU:
-            ret = tt::tt_metal::silu(*meta->tensor);
+            ret = tt::tt_metal::silu(*src_tensor);
             break;
         case GGML_UNARY_OP_HARDSWISH:
-            ret = tt::tt_metal::hardswish(*meta->tensor);
+            ret = tt::tt_metal::hardswish(*src_tensor);
             break;
         case GGML_UNARY_OP_HARDSIGMOID:
-            ret = tt::tt_metal::hardsigmoid(*meta->tensor);
+            ret = tt::tt_metal::hardsigmoid(*src_tensor);
             break;
         default:
             return false;
@@ -647,13 +641,14 @@ static void ggml_backend_metalium_leaky_relu(ggml_backend_metalium_context * ctx
     const struct ggml_tensor * src0 = dst->src[0];
     TensorWithMetadata* meta = (TensorWithMetadata*)src0->extra;
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+    auto src_tensor = realize_ggml_view(src0);
 
     float negative_slope;
     GGML_ASSERT(dst->op_params != NULL);
     memcpy(&negative_slope, dst->op_params, sizeof(float));
 
     *dst_meta = {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::leaky_relu(*meta->tensor, negative_slope)),
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::leaky_relu(*src_tensor, negative_slope)),
         .ggtype = dst->type,
         .bufctx = meta->bufctx
     };
@@ -670,19 +665,22 @@ static void ggml_backend_metalium_bin_op(ggml_backend_metalium_context * ctx, st
     TensorWithMetadata* meta1 = (TensorWithMetadata*)src1->extra;
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
 
+    auto src_tensor0 = realize_ggml_view(src0);
+    auto src_tensor1 = realize_ggml_view(src1);
+
     std::shared_ptr<tt::tt_metal::Tensor> ret;
     switch(op) {
         case GGML_OP_ADD:
-            ret = std::make_shared<tt::tt_metal::Tensor>(ttnn::add(*meta0->tensor, *meta1->tensor));
+            ret = std::make_shared<tt::tt_metal::Tensor>(ttnn::add(*src_tensor0, *src_tensor1));
             break;
         case GGML_OP_MUL:
-            ret = std::make_shared<tt::tt_metal::Tensor>(ttnn::multiply(*meta0->tensor, *meta1->tensor));
+            ret = std::make_shared<tt::tt_metal::Tensor>(ttnn::multiply(*src_tensor0, *src_tensor1));
             break;
         case GGML_OP_SUB:
-            ret = std::make_shared<tt::tt_metal::Tensor>(ttnn::subtract(*meta0->tensor, *meta1->tensor));
+            ret = std::make_shared<tt::tt_metal::Tensor>(ttnn::subtract(*src_tensor0, *src_tensor1));
             break;
         case GGML_OP_DIV:
-            ret = std::make_shared<tt::tt_metal::Tensor>(ttnn::divide(*meta0->tensor, *meta1->tensor));
+            ret = std::make_shared<tt::tt_metal::Tensor>(ttnn::divide(*src_tensor0, *src_tensor1));
             break;
         default:
             GGML_ASSERT(false && "Unsupported binary operation");
@@ -736,13 +734,13 @@ static void ggml_backend_metalium_transpose(ggml_backend_metalium_context * ctx,
     GGML_METALIUM_OP_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
 
-    tt::tt_metal::Tensor& t = *((TensorWithMetadata*)dst->src[0]->extra)->tensor;
+    auto t = realize_ggml_view(dst->src[0]);
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
 
     // std::cout << "GGML wants reshape to: " << dst->ne[0] << " " << dst->ne[1] << " " << dst->ne[2] << " " << dst->ne[3] << std::endl;
 
     *dst_meta = {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::transpose(t, -2, -1)),
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::transpose(*t, -2, -1)),
         .ggtype = dst->type,
         .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
     };
@@ -928,12 +926,12 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
     // std::cout << "get_tensor():\n";
     // std::cout << "  GGML thinks shape: " << tensor->ne[0] << " " << tensor->ne[1] << " " << tensor->ne[2] << " " << tensor->ne[3] << std::endl;
     // std::cout << "  TTNN thinks shape: " << shape << std::endl;
-    GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, *meta->tensor));
-    tt::tt_metal::Tensor* t = meta->tensor.get();
+    std::shared_ptr<tt::tt_metal::Tensor> t = realize_ggml_view(tensor);
+    GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, *t));
     tt::tt_metal::Tensor holder;
     if(t->dtype() != tt::tt_metal::DataType::BFLOAT16 || t->dtype() != tt::tt_metal::DataType::FLOAT32) {
         holder = tt::tt_metal::typecast(*t, tt::tt_metal::DataType::BFLOAT16);
-        t = &holder;
+        t = std::make_shared<tt::tt_metal::Tensor>(std::move(holder));
     }
 
     // TODO: Proper handling of data types
@@ -1096,7 +1094,9 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
         //     << "  src0 addr: " << (void*)(node->src[0] ? node->src[0]->data : 0) << "\n"
         //     << "  src1 addr: " << (void*)(node->src[1] ? node->src[1]->data : 0) << "\n";
 
-
+        if(node->op == GGML_OP_VIEW || node->op == GGML_OP_TRANSPOSE) {
+            continue;
+        }
 
         switch (node->op) {
             case GGML_OP_UNARY: {
@@ -1138,7 +1138,6 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
 
             case GGML_OP_CONT:
             case GGML_OP_CPY:
-            case GGML_OP_VIEW:
                 ggml_backend_metalium_cpy(ctx, node);
                 break;
 
@@ -1146,9 +1145,10 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
                 ggml_backend_metalium_reshape(ctx, node);
                 break;
 
-            case GGML_OP_TRANSPOSE:
-                ggml_backend_metalium_transpose(ctx, node);
-                break;
+            // TODO: Convert transpose to be lazy
+            // case GGML_OP_TRANSPOSE:
+            //     ggml_backend_metalium_transpose(ctx, node);
+            //     break;
 
             case GGML_OP_NONE:
                 break;
@@ -1158,6 +1158,7 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
                 GGML_ASSERT(false);
         }
         TensorWithMetadata* meta = (TensorWithMetadata*)node->extra;
+        // std::cout << "Executed " << ggml_op_desc(node) << " with address " << node->data << " and shape " << meta->tensor->shape() << ", GGML wants " << node->ne[0] << " " << node->ne[1] << " " << node->ne[2] << " " << node->ne[3] << std::endl;
         GGML_ASSERT(meta != NULL);
         GGML_ASSERT(meta->tensor != NULL);
         GGML_ASSERT(meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || meta->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);

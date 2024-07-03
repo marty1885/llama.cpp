@@ -12,9 +12,11 @@
 #include "tensor/host_buffer/types.hpp"
 #include "tensor/types.hpp"
 #include "tt_dnn/op_library/auto_format.hpp"
+#include "tt_dnn/op_library/unpad/unpad_op.hpp"
 #include "tt_dnn/op_library/composite/composite_ops.hpp"
 #include "tt_dnn/op_library/tilize/tilize_op.hpp"
 #include "tt_dnn/op_library/untilize/untilize_op.hpp"
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -475,10 +477,24 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
     // std::cout << "VIEW dst shape: " << dst->ne[0] << " " << dst->ne[1] << " " << dst->ne[2] << " " << dst->ne[3] << std::endl;
 
     GGML_ASSERT(meta != NULL);
-    GGML_ASSERT(ggml_is_contiguous(dst));
+    // GGML_ASSERT(ggml_is_contiguous(dst));
 
-    // Fast path for copying contiguous tensors
-    if(ggml_is_contiguous(src0)) {
+    std::array src_size = std::to_array(src0->ne);
+    std::array dst_size = std::to_array(dst->ne);
+    std::array src_stride = std::to_array(src0->nb);
+    std::array<size_t, GGML_MAX_DIMS> dst_stride;
+
+    // TODO: Support quantized data
+    size_t stride = 1;
+    for(size_t i = 0; i < GGML_MAX_DIMS; i++) {
+        dst_stride[i] = stride;
+        stride *= dst_size[i];
+    }
+
+    // Fast path when both tensors are contiguous and have the same shape
+    if(ggml_is_contiguous(src0) &&
+        memcmp(src_size.data(), dst_size.data(), GGML_MAX_DIMS * sizeof(size_t)) == 0 &&
+        memcmp(src_stride.data(), dst_stride.data(), GGML_MAX_DIMS * sizeof(size_t)) == 0) {
         const auto& ref_tensor = resolve_from_ggml_tensor(src0, dst_meta->bufctx);
         tt::tt_metal::Tensor ret = tt::tt_metal::zeros_like(ref_tensor);
         ret.deepcopy(*meta->tensor);
@@ -490,12 +506,6 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
         };
         return;
     }
-    // Now we deal with non-contiguous source tensors. Metalium can only unpad (slice but without spacing) the tensor
-    std::array src_size = std::to_array(src0->ne);
-    std::array dst_size = std::to_array(dst->ne);
-    std::array src_stride = std::to_array(src0->nb);
-    std::array dst_stride = std::to_array(dst->nb);
-
     // If just doing transpose, we can just do a reshape
     // Transpose = same shape, but stride of the 1st two dimensions are swapped
     if(src_size[0] == dst_size[0] && src_size[1] == dst_size[1] && src_size[2] == dst_size[2] && src_size[3] == dst_size[3] &&
@@ -512,6 +522,9 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
         };
         return;
     }
+
+    // Now we deal with non-contiguous source tensors. Metalium can only unpad (slice but without spacing) the tensor
+
     // Check we can do the unpad
     for(size_t i = 0; i < GGML_MAX_DIMS; i++) {
         GGML_ASSERT(src_size[i] >= dst_size[i]);
@@ -523,10 +536,22 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
 
     for(size_t i = 0; i < GGML_MAX_DIMS; i++) {
         start[i] = 0; // TODO: How do I calculate the start?
-        end[i] = dst_size[i] + start[i];
+        end[i] = dst_size[i] + start[i] - 1; // end is inclusive (WTF?)
     }
+    std::reverse(start.begin(), start.end());
+    std::reverse(end.begin(), end.end());
+    tt::tt_metal::Tensor res;
+    if(dst->ne[0] % tt::constants::TILE_WIDTH == 0 && dst->ne[1] % tt::constants::TILE_HEIGHT == 0) {
+        res = tt::tt_metal::unpad(*meta->tensor, start, end);
+    }
+    else {
+        // THIS is EXTREMELY SLOW. But it works
+        tt::tt_metal::Tensor tmp = meta->tensor->cpu().to(tt::tt_metal::Layout::ROW_MAJOR).unpad(start, end);
+        res = tt::tt_metal::tilize_with_zero_padding(tmp.to(meta->bufctx->device));
+    }
+
     *dst_meta = {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(meta->tensor->unpad(start, end)),
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(res),
         .ggtype = dst->type,
         .bufctx = meta->bufctx
     };
@@ -695,11 +720,14 @@ static void ggml_backend_metalium_transpose(ggml_backend_metalium_context * ctx,
     tt::tt_metal::Tensor& t = *((TensorWithMetadata*)dst->src[0]->extra)->tensor;
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
 
+    // std::cout << "GGML wants reshape to: " << dst->ne[0] << " " << dst->ne[1] << " " << dst->ne[2] << " " << dst->ne[3] << std::endl;
+
     *dst_meta = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::transpose(t, -2, -1)),
         .ggtype = dst->type,
         .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
     };
+    // std::cout << "TT wants reshape to: " << dst_meta->tensor->shape() << std::endl;
 }
 
 
@@ -876,11 +904,9 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
 
     // some sanity checks, Could remove them once TTNN is more stable
     auto shape = meta->tensor->shape();
-    GGML_ASSERT(shape[0] == tensor->ne[3] && "Shape mismatch between GGML and TTNN tensor on dimension 0");
-    GGML_ASSERT(shape[1] == tensor->ne[2] && "Shape mismatch between GGML and TTNN tensor on dimension 1");
-    GGML_ASSERT(shape[2] == tensor->ne[1] && "Shape mismatch between GGML and TTNN tensor on dimension 2");
-    GGML_ASSERT(shape[3] == tensor->ne[0] && "Shape mismatch between GGML and TTNN tensor on dimension 3");
-
+    // std::cout << "GGML thinks shape: " << tensor->ne[0] << " " << tensor->ne[1] << " " << tensor->ne[2] << " " << tensor->ne[3] << std::endl;
+    // std::cout << "TTNN thinks shape: " << shape << std::endl;
+    GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, *meta->tensor));
     tt::tt_metal::Tensor* t = meta->tensor.get();
     tt::tt_metal::Tensor holder;
     if(t->dtype() != tt::tt_metal::DataType::BFLOAT16 || t->dtype() != tt::tt_metal::DataType::FLOAT32) {
@@ -1153,8 +1179,27 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         return tensor->ne[0] % 4 == 0;
     };
 
+    // std::cout << "Checking if op is supported: " << ggml_op_desc(op) << std::endl;
+    // std::cout << "Output supported: " << output_supported(op, false) << std::endl;
+    // if(op->op == GGML_OP_CONT || op->op == GGML_OP_VIEW || op->op == GGML_OP_CPY || op->op == GGML_OP_TRANSPOSE) {
+    //     std::cout << "Output tensor details:\n"
+    //         << "  data: " << op->data << "\n"
+    //         << "  ne: " << op->ne[0] << " " << op->ne[1] << " " << op->ne[2] << " " << op->ne[3] << "\n"
+    //         << "  nb: " << op->nb[0] << " " << op->nb[1] << " " << op->nb[2] << " " << op->nb[3] << "\n"
+    //         << "  type: " << ggml_type_name(op->type) << "\n"
+    //         << "  view_src: " << op->view_src << "\n"
+    //         << "\n\n"
+    //         << "Source 0 tensor details:\n"
+    //         << "  data: " << src0->data << "\n"
+    //         << "  ne: " << src0->ne[0] << " " << src0->ne[1] << " " << src0->ne[2] << " " << src0->ne[3] << "\n"
+    //         << "  nb: " << src0->nb[0] << " " << src0->nb[1] << " " << src0->nb[2] << " " << src0->nb[3] << "\n"
+    //         << "  type: " << ggml_type_name(src0->type) << "\n"
+    //         << "  view_src: " << src0->view_src << "\n"
+    //         << "\n";
+    // }
+
     GGML_ASSERT(op != NULL);
-    if(!output_supported(op, true)) {
+    if(!output_supported(op, false)) {
         return false;
     }
 
@@ -1174,6 +1219,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
                 case GGML_UNARY_OP_NEG:
                 case GGML_UNARY_OP_TANH: // Not accurate enough on Grayskull to pass unit tests
                 case GGML_UNARY_OP_RELU:
+                case GGML_UNARY_OP_ELU:
                 case GGML_UNARY_OP_SIGMOID:
                 case GGML_UNARY_OP_GELU:
                 case GGML_UNARY_OP_GELU_QUICK:

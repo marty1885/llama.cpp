@@ -143,3 +143,7 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 # HACK: Test files so I can debug metalium.
 # TODO: Remove these tests when done.
 llama_target_and_test(test-mul-mat.cpp)
+
+if (GGML_METALIUM)
+    llama_target_and_test(test-metalium.cpp)
+endif()

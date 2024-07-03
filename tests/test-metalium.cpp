@@ -437,6 +437,10 @@ int main()
         ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
         return ggml_dup_tensor(ctx, a);
     }, "Tensor duplication"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
+        return ggml_dup_tensor(ctx, ggml_view_tensor(ctx, a));
+    }, "Tensor duplication via view"));
 
     // (Basics of) what we need to get KV cache working
     // TODO: Map GGML operations into TTNN nlp_kv_cache_load_slice and update_cache_multi_core
@@ -467,6 +471,12 @@ int main()
         ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 38, 72);
         return ggml_mul_mat(ctx, a, b);
     }, "2D matrix multiplication (result non square, non tile aligned)"));
+
+    // Misc
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 38, 64, 3, 26);
+        return ggml_clamp(ctx, a, -0.1, 0.25);
+    }, "Clamp"));
 
     size_t total_tests = 0;
     size_t passed_tests = 0;

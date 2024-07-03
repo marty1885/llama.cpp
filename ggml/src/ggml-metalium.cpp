@@ -789,6 +789,25 @@ static void ggml_backend_metalium_set(ggml_backend_metalium_context * ctx, struc
         };
     }
 }
+static void ggml_backend_metalium_clamp(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
+{
+    GGML_UNUSED(ctx);
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+
+    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+
+    float data[2];
+    memcpy(data, dst->op_params, sizeof(data));
+    auto [min, max] = std::to_array(data);
+
+    auto t = realize_ggml_view(dst->src[0]);
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::clamp(*t, min, max)),
+        .ggtype = dst->type,
+        .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
+    };
+}
 
 // backend interface
 
@@ -1175,6 +1194,10 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
             case GGML_OP_SET:
                 ggml_backend_metalium_set(ctx, node);
                 break;
+            
+            case GGML_OP_CLAMP:
+                ggml_backend_metalium_clamp(ctx, node);
+                break;
 
             case GGML_OP_NONE:
                 break;
@@ -1286,6 +1309,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         case GGML_OP_DUP:
         case GGML_OP_RESHAPE:
         case GGML_OP_TRANSPOSE:
+        case GGML_OP_CLAMP:
             return true;
 
         case GGML_OP_ADD:

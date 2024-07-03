@@ -59,7 +59,7 @@ struct FakeMemoryMap
         // if(it == address_tensor_map.end() || it->first != address) {
         //     return nullptr;
         // }
-        std::cout << "Looking for address: " << address << std::endl;
+        // std::cout << "Looking for address: " << (void*)address << std::endl;
         auto it = address_tensor_map.find(address);
         if(it == address_tensor_map.end()) {
             return nullptr;
@@ -74,10 +74,20 @@ struct FakeMemoryMap
 
     void insert(std::ptrdiff_t address, TensorWithMetadata* tensor)
     {
+        // std::cout << "Adding address: " << (void*)address << std::endl;
         GGML_ASSERT(address_tensor_map.contains(address) == false);
-        address_tensor_map.insert({address, tensor});
+        address_tensor_map[address] = tensor;
+        // std::cout << "Virtual table size: " << address_tensor_map.size() << std::endl;
     }
+
+
     std::unordered_map<std::ptrdiff_t, TensorWithMetadata*> address_tensor_map;
+
+    using MapType = decltype(address_tensor_map);
+    MapType::iterator begin() { return address_tensor_map.begin(); }
+    MapType::iterator end() { return address_tensor_map.end(); }
+    MapType::const_iterator begin() const { return address_tensor_map.begin(); }
+    MapType::const_iterator end() const { return address_tensor_map.end(); }
 };
 
 struct ggml_backend_metalium_buffer_context {
@@ -85,6 +95,7 @@ struct ggml_backend_metalium_buffer_context {
     size_t ggml_buffer_size_bytes = 0;
     std::string name;
     ttnn::device::Device* device = nullptr;
+    size_t base_offset = 0;
 
     // Tracking our own allocations because Metalium limitations and GGML assuming them
     std::vector<std::unique_ptr<TensorWithMetadata>> metadata_to_free;
@@ -106,9 +117,23 @@ static const tt::tt_metal::Tensor& resolve_from_ggml_tensor(const ggml_tensor* t
         return *meta->tensor;
     }
 
-    auto *ptr = bufctx->address_tensor_map.find((std::ptrdiff_t)tensor);
-    GGML_ASSERT(ptr != nullptr);
-    return *ptr->tensor;
+    std::ptrdiff_t ptr = 0;
+    if(tensor->view_src != nullptr) {
+        // std::cout << "View data: " << (void*)tensor->view_src->data << " View offs: " << tensor->view_offs << std::endl;
+        ptr = (std::ptrdiff_t)tensor->view_src->data - tensor->view_offs;
+    }
+    else {
+        // std::cout << "Data: " << (void*)tensor->data << std::endl;
+        ptr = (std::ptrdiff_t)tensor->data;
+    }
+    // std::cout << "Virtual table size: " << bufctx->address_tensor_map.address_tensor_map.size() << std::endl;
+    // for(auto& [addr, _] : bufctx->address_tensor_map.address_tensor_map) {
+    //     std::cout << "  Entry address: " << (void*)addr << std::endl;
+    // }
+    auto *indirect_meta = bufctx->address_tensor_map.find((std::ptrdiff_t)ptr);
+    GGML_ASSERT(indirect_meta != nullptr);
+    GGML_ASSERT(indirect_meta->tensor != nullptr);
+    return *indirect_meta->tensor;
 }
 
 static bool ggml_tt_tensors_shape_equal(const ggml_tensor* ggtensor, const tt::tt_metal::Tensor& ttensor)
@@ -127,6 +152,9 @@ static bool ggml_tt_tensors_shape_equal(const ggml_tensor* ggtensor, const tt::t
 // maps device id to device
 static std::map<int, ttnn::Device*> g_device_map;
 static std::map<int, ggml_backend_t> g_backend_map;
+
+// Maintain all base addresses are unique
+static size_t g_metalium_base_offset = 0;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 // Actual backend code
@@ -443,9 +471,10 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
     TensorWithMetadata* meta = (TensorWithMetadata*)src0->extra;
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
 
+    // std::cout << "VIEW src shape: " << src0->ne[0] << " " << src0->ne[1] << " " << src0->ne[2] << " " << src0->ne[3] << std::endl;
+    // std::cout << "VIEW dst shape: " << dst->ne[0] << " " << dst->ne[1] << " " << dst->ne[2] << " " << dst->ne[3] << std::endl;
+
     GGML_ASSERT(meta != NULL);
-    // std::cout << "dst->ne: " << dst->ne[0] << " " << dst->ne[1] << " " << dst->ne[2] << " " << dst->ne[3] << std::endl;
-    // std::cout << "dst->nb: " << dst->nb[0] << " " << dst->nb[1] << " " << dst->nb[2] << " " << dst->nb[3] << std::endl;
     GGML_ASSERT(ggml_is_contiguous(dst));
 
     // Fast path for copying contiguous tensors
@@ -766,6 +795,8 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
         return;
     }
 
+    // std::cout << "Writing to tensor with address: " << tensor->data << std::endl;
+
     tt::ARCH processor_class = bufctx->device->arch();
     // only grayskull is supported for now.
     GGML_ASSERT(processor_class == tt::ARCH::GRAYSKULL);
@@ -818,12 +849,6 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
         .ggtype = ggtype,
         .bufctx = bufctx
     };
-    if(ggml_is_contiguous(tensor)) {
-        if(bufctx->address_tensor_map.contains((uintptr_t)tensor->data)) {
-            return;
-        }
-        bufctx->address_tensor_map.insert((uintptr_t)tensor->data, meta);
-    }
 }
 
 static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer,
@@ -879,22 +904,33 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
 }
 
 static void * ggml_backend_metalium_buffer_get_base(ggml_backend_buffer_t buffer) {
-    // Not using this. Metalium's allication model is not compatible with GGML's allocator
-    GGML_UNUSED(buffer);
-    return (void*)0xdeadbeef;
+    ggml_backend_metalium_buffer_context * ctx = (ggml_backend_metalium_buffer_context *)buffer->context;
+    return (uint8_t*)0xdeadbeef + ctx->base_offset;
 }
 
 GGML_CALL static void
-ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
+ggml_backend_metalium_buffer_init_tensor(ggml_backend_buffer_t buffer,
                                      ggml_tensor *tensor)
 {
     ggml_backend_metalium_buffer_context * bufctx = (ggml_backend_metalium_buffer_context *)buffer->context;
+    auto * ptr = bufctx->address_tensor_map.find((uintptr_t)tensor->data);
+    if(ptr != nullptr) {
+        GGML_ASSERT(ptr->ggtype == tensor->type || ptr->ggtype == (ggml_type)-1);
+        for(int i = 0; ptr->tensor != nullptr && i < GGML_MAX_DIMS; i++) {
+            GGML_ASSERT(ptr->tensor->shape()[i] == tensor->ne[GGML_MAX_DIMS - i - 1]);
+        }
+        tensor->extra = ptr;
+        return;
+    }
+
     bufctx->metadata_to_free.push_back(std::make_unique<TensorWithMetadata>(TensorWithMetadata{
         .tensor = nullptr,
         .ggtype = (ggml_type)-1,
         .bufctx = bufctx
     }));
     tensor->extra = bufctx->metadata_to_free.back().get();
+    // std::cout << "Creating tensor with address: " << tensor->data << ", shape = " << tensor->ne[0] << " " << tensor->ne[1] << " " << tensor->ne[2] << " " << tensor->ne[3] << ", name " << tensor->name << std::endl;
+    bufctx->address_tensor_map.insert((uintptr_t)tensor->data, (TensorWithMetadata *)tensor->extra);
     GGML_UNUSED(buffer);
 }
 
@@ -933,7 +969,7 @@ static struct ggml_backend_buffer_i ggml_backend_metalium_buffer_interface = {
     /* .get_name        = */ ggml_backend_metalium_buffer_get_name,
     /* .free_buffer     = */ ggml_backend_metalium_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_metalium_buffer_get_base,
-    /* .init_tensor     = */ ggml_backend_sycl_buffer_init_tensor,
+    /* .init_tensor     = */ ggml_backend_metalium_buffer_init_tensor,
     /* .set_tensor      = */ ggml_backend_metalium_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_metalium_buffer_get_tensor,
     /* .cpy_tensor      = */ ggml_backend_metalium_buffer_cpy_tensor,
@@ -946,15 +982,22 @@ GGML_CALL static ggml_backend_buffer_t
 ggml_backend_metalium_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
                                            size_t size) {
     ggml_backend_metalium_buffer_type_context * buft_ctx = (ggml_backend_metalium_buffer_type_context *)buft->context;
-    ggml_backend_metalium_buffer_context* ctx = new ggml_backend_metalium_buffer_context;
 
-    // real allocation is deferred until the first tensor is set because we don't know the underlying tensor type yet
-    // TODO: Use a constructor
-    ctx->ggml_buffer_size_bytes = size;
-    ctx->name = ctx->name;
-    ctx->device = buft_ctx->device;
     // FIXME: GGML unit tests fails if I don't add some additional memory to the buffer beyond the requested size
-    return ggml_backend_buffer_init(buft, ggml_backend_metalium_buffer_interface, ctx, size + 4096 * 1024);
+    size_t alloc_size = size + 4096 * 1024;
+    // real allocation is deferred until the first tensor is set because we don't know the underlying tensor type yet
+    ggml_backend_metalium_buffer_context* ctx = new ggml_backend_metalium_buffer_context {
+        .ggml_buffer_size_bytes = size,
+        .name = buft_ctx->name,
+        .device = buft_ctx->device,
+        .base_offset = g_metalium_base_offset,
+
+        .metadata_to_free = {},
+        .address_tensor_map = {},
+    };
+    g_metalium_base_offset += alloc_size;
+    // std::cout << "Allocating buffer of size " << size << " bytes\n";
+    return ggml_backend_buffer_init(buft, ggml_backend_metalium_buffer_interface, ctx, alloc_size);
 }
 
 static ggml_backend_buffer_type_i ggml_backend_metalium_buffer_type_interface = {
@@ -999,6 +1042,12 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
+
+        // std::cout << "Graph compute " << ggml_op_desc(node) << "\n"
+        //     << "  dst addr: " << node->data << "\n"
+        //     << "  src0 addr: " << (void*)(node->src[0] ? node->src[0]->data : 0) << "\n"
+        //     << "  src1 addr: " << (void*)(node->src[1] ? node->src[1]->data : 0) << "\n";
+
 
 
         switch (node->op) {

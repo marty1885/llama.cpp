@@ -737,6 +737,8 @@ if(GGML_METALIUM)
         message(FATAL_ERROR "ARCH_NAME is not set")
     endif()
 
+    message(STATUS "Metalium found. Compiling with archicture \"$ENV{ARCH_NAME}\".")
+
     set(METALIUM_INCLUDE_DIRS
         # Metalium
         $ENV{TT_METAL_HOME}

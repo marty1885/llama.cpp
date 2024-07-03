@@ -480,6 +480,16 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
 #define GGML_METALIUM_OP_SRC0_CHECK_TTTENSOR(_node) GGML_METALIUM_OP_CHECK_TTTENSOR(_node, 0)
 #define GGML_METALIUM_OP_SRC1_CHECK_TTTENSOR(_node) GGML_METALIUM_OP_CHECK_TTTENSOR(_node, 1)
 
+static bool ggml_backend_metalium_can_mul_mat(const struct ggml_tensor * dst)
+{
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    // Does not support broadcasting for now
+    return src0->ne[0] == src1->ne[0] && src0->ne[2] == src1->ne[2] &&
+        src0->ne[3] == src1->ne[3];
+}
+
 static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
     GGML_METALIUM_OP_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
@@ -524,8 +534,11 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     cm->tensor.reset();
     // TODO: Ask TT to support multiplication of pre-transposed tensors. Calling transpose here is inefficient
     // https://github.com/tenstorrent/tt-metal/issues/9709
-    cm->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::operations::matmul::matmul(b, aT, std::nullopt));
-    cm->ggtype = dst->type; // Hope this is the correct approach
+    *cm = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::operations::matmul::matmul(b, aT, std::nullopt)),
+        .ggtype = dst->type,
+        .bufctx = cm->bufctx
+    };
     GGML_ASSERT(cm->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || cm->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
     GGML_UNUSED(ctx);
 }
@@ -1282,7 +1295,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
             return input_supported(src0) && input_supported(src1) &&
                 (memcmp(src0->ne, src1->ne, sizeof(src0->ne)) == 0 || (numpy_broadcast_rule(src0, src1) && op->op != GGML_OP_DIV));
         case GGML_OP_MUL_MAT:
-            return true;
+            return ggml_backend_metalium_can_mul_mat(op);
         default:
             return false;
     }

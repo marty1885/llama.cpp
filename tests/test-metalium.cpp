@@ -451,6 +451,23 @@ int main()
         return ggml_set_2d(ctx, a, b, b->nb[1], a->nb[1]);
     }, "Set row of 2D matrix with offset"));
 
+    // Matrix multiplication
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 64);
+        ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 64);
+        return ggml_mul_mat(ctx, a, b);
+    }, "2D matrix multiplication"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 64);
+        ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 128);
+        return ggml_mul_mat(ctx, a, b);
+    }, "2D matrix multiplication (result non square)"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 38, 64);
+        ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 38, 72);
+        return ggml_mul_mat(ctx, a, b);
+    }, "2D matrix multiplication (result non square, non tile aligned)"));
+
     size_t total_tests = 0;
     size_t passed_tests = 0;
     size_t not_supported = 0;

@@ -452,8 +452,8 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
     GGML_ASSERT(tensor->view_src != nullptr);
 
     // recursivly resolve the source tensor
-    std::shared_ptr<tt::tt_metal::Tensor> parent = realize_ggml_view(tensor->view_src);
-    return parent;
+    // TODO: Should it even reach here?
+    return realize_ggml_view(tensor->view_src);
 }
 
 // Sanity check macros to ensure that the tensors are in the correct format and we won't crash
@@ -1198,34 +1198,35 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
 
 GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
-    [[maybe_unused]] const struct ggml_tensor * src1 = op->src[1];
+    const struct ggml_tensor * src1 = op->src[1];
     ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
 
     // The metalium backend has seperated internal data types from the GGML data types. We really only care about
     // what we can convert to and from. For now we only support F32, F16, and BF16. Quantized data types will be
     // supported in the future
-    auto input_supported = [&](const struct ggml_tensor * tensor, bool req_contingous = true) {
-        if(tensor == NULL ||
-            !is_ggml_type_supported_by_metalium(tensor->type, ctx->device->arch()) ||
-            !(!req_contingous || ggml_is_contiguous(tensor))) {
+    auto tensor_supported = [&](const struct ggml_tensor * tensor) {
+        if(tensor == NULL || !is_ggml_type_supported_by_metalium(tensor->type, ctx->device->arch())) {
             return false;
         }
-        // TTNN requires the tensor to be 4-byte aligned
-        // TODO: Update this when we supported FP32
-        return tensor->ne[0] % 2 == 0;
-    };
-    auto output_supported = [&](const struct ggml_tensor * tensor, bool req_contingous = true) {
-        if(tensor == NULL ||
-            !is_ggml_type_supported_by_metalium(tensor->type, ctx->device->arch()) ||
-            !(!req_contingous || ggml_is_contiguous(tensor))) {
-            return false;
+        // TTNN requires the tensor to be 4-byte aligned and all quantized tensors must be a multiple of 32
+
+        tt::tt_metal::DataType tt_type = ggml2tt_type(tensor->type, ctx->device->arch());
+        switch(tt_type) {
+            case tt::tt_metal::DataType::BFLOAT16:
+            case tt::tt_metal::DataType::UINT16:
+                return tensor->ne[0] % 2 == 0;
+            case tt::tt_metal::DataType::FLOAT32:
+            case tt::tt_metal::DataType::UINT32:
+                return true;
+            case tt::tt_metal::DataType::UINT8:
+                return tensor->ne[0] % 4 == 0;
+            case tt::tt_metal::DataType::INVALID:
+                GGML_ASSERT(false && "Unsupported data type");
+                break;
+            default:
+                return tensor->ne[0] % 32 == 0;
         }
-        // TTNN requires the tensor to be 4-byte aligned
-        // TODO: Update this when we supported FP32
-        if(!ggml_is_quantized(tensor->type)) {
-            return tensor->ne[0] % 2 == 0;
-        }
-        return tensor->ne[0] % 4 == 0;
+        GGML_UNREACHABLE();
     };
 
     // std::cout << "Checking if op is supported: " << ggml_op_desc(op) << std::endl;
@@ -1248,20 +1249,13 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
     // }
 
     GGML_ASSERT(op != NULL);
-    if(!output_supported(op, false)) {
+    if(!tensor_supported(op)) {
         return false;
     }
-
-    if(op->op == GGML_OP_CONT || op->op == GGML_OP_VIEW || op->op == GGML_OP_CPY || op->op == GGML_OP_TRANSPOSE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_DUP) {
-        return input_supported(src0, false);
+    if(op->op == GGML_OP_NONE) {
+        return true;
     }
-
-    // TODO: Refine the supported conditions
-    if(op->op == GGML_OP_SET && ggml_backend_metalium_can_set(op)) {
-        return input_supported(src0, false);
-    }
-
-    if(!ggml_is_contiguous(op)) {
+    if(!tensor_supported(src0)) {
         return false;
     }
 
@@ -1286,16 +1280,25 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
             }
         case GGML_OP_LEAKY_RELU:
         case GGML_OP_NONE:
+        case GGML_OP_CONT:
+        case GGML_OP_VIEW:
+        case GGML_OP_CPY:
+        case GGML_OP_DUP:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_TRANSPOSE:
             return true;
+
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_DIV:
         case GGML_OP_MUL:
             // DIV does not support broadcasting on TTNN
-            return input_supported(src0) && input_supported(src1) &&
+            return tensor_supported(src1) &&
                 (memcmp(src0->ne, src1->ne, sizeof(src0->ne)) == 0 || (numpy_broadcast_rule(src0, src1) && op->op != GGML_OP_DIV));
         case GGML_OP_MUL_MAT:
-            return ggml_backend_metalium_can_mul_mat(op);
+            return tensor_supported(src1) && ggml_backend_metalium_can_mul_mat(op);
+        case GGML_OP_SET:
+            return tensor_supported(src1) && ggml_backend_metalium_can_set(op);
         default:
             return false;
     }

@@ -16,6 +16,7 @@
 #include "tt_dnn/op_library/composite/composite_ops.hpp"
 #include "tt_dnn/op_library/tilize/tilize_op.hpp"
 #include "tt_dnn/op_library/untilize/untilize_op.hpp"
+#include "ttnn/operations/creation.hpp"
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -32,6 +33,7 @@
 #include <tt_dnn/op_library/fully_connected/fully_connected_op.hpp>
 #include <tt_dnn/op_library/eltwise_unary/eltwise_unary_op.hpp>
 #include <tt_dnn/op_library/copy/copy_op.hpp>
+#include <tt_dnn/op_library/update_cache/update_cache_op.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
 #include <ttnn/operations/matmul.hpp>
 
@@ -49,6 +51,24 @@ struct ggml_backend_metalium_context {
 
 struct TensorWithMetadata;
 
+static std::string dump_tt_tensor(const tt::tt_metal::Tensor& tensor)
+{
+    std::stringstream ss;
+    auto tmp = tt::tt_metal::untilize(tensor);
+    std::vector<bfloat16> vec(tmp.shape().volume());
+    memcpy(vec.data(), tmp);
+    for(size_t i = 0; i < vec.size(); i++) {
+        if(i % 32 == 0) {
+            ss << std::endl;
+        }
+        if(i % 1024 == 0) {
+            ss << std::endl;
+        }
+        ss << vec[i].to_float() << " ";
+    }
+    ss << std::endl;
+    return ss.str();
+}
 // GGML views are lazy and it's not 100% of the times we get a tensor with `extra` populated to direct the writes.
 // Solution? Look at the tensor's supposed address that WE faked and figure out which tensor it is referring to.
 struct FakeMemoryMap
@@ -763,6 +783,61 @@ static void ggml_backend_metalium_transpose(ggml_backend_metalium_context * ctx,
     // std::cout << "TT wants reshape to: " << dst_meta->tensor->shape() << std::endl;
 }
 
+static bool ggml_backend_metalium_can_set(const struct ggml_tensor * dst)
+{
+    int32_t params[5];
+    memcpy(params, dst->op_params, sizeof(params));
+    auto [nb1, nb2, nb3, offset, inplace] = std::to_array(params);
+
+    if(offset >= nb3 || offset % nb1 != 0 || ggml_n_dims(dst->src[0]) < ggml_n_dims(dst->src[1]) ||
+        ggml_n_dims(dst->src[1]) != 1) {
+        return false;
+    }
+
+    return true;
+}
+
+static void ggml_backend_metalium_set(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
+{
+    GGML_UNUSED(ctx);
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC1_SANITY_CHECK(dst);
+
+    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+    TensorWithMetadata* src0_meta = (TensorWithMetadata*)dst->src[0]->extra;
+    TensorWithMetadata* src1_meta = (TensorWithMetadata*)dst->src[1]->extra;
+
+    int32_t params[5];
+    memcpy(params, dst->op_params, sizeof(params));
+    auto [nb1, nb2, nb3, offset, inplace] = std::to_array(params);
+
+    int idx = offset / nb1;
+    int batch_idx = offset / nb2;
+    GGML_ASSERT(offset < nb3);
+    GGML_ASSERT(offset % nb1 == 0);
+    auto res = tt::tt_metal::update_cache(*src0_meta->tensor, *src1_meta->tensor, idx, batch_idx);
+    if(!inplace) {
+        *dst_meta = {
+            .tensor = std::make_shared<tt::tt_metal::Tensor>(res),
+            .ggtype = dst->type,
+            .bufctx = src0_meta->bufctx
+        };
+    }
+    else {
+        std::shared_ptr<tt::tt_metal::Tensor> tensor = std::make_shared<tt::tt_metal::Tensor>(res);
+        *src0_meta = {
+            .tensor = tensor,
+            .ggtype = dst->type,
+            .bufctx = src0_meta->bufctx
+        };
+        *dst_meta = {
+            .tensor = tensor,
+            .ggtype = dst->type,
+            .bufctx = src0_meta->bufctx
+        };
+    }
+}
 
 // backend interface
 
@@ -1155,8 +1230,13 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
 
             case GGML_OP_CONT:
             case GGML_OP_CPY:
+            case GGML_OP_DUP:
                 ggml_backend_metalium_cpy(ctx, node);
                 break;
+            case GGML_OP_SET:
+                ggml_backend_metalium_set(ctx, node);
+                break;
+
             case GGML_OP_NONE:
                 break;
 
@@ -1233,7 +1313,12 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         return false;
     }
 
-    if(op->op == GGML_OP_CONT || op->op == GGML_OP_VIEW || op->op == GGML_OP_CPY || op->op == GGML_OP_TRANSPOSE || op->op == GGML_OP_RESHAPE) {
+    if(op->op == GGML_OP_CONT || op->op == GGML_OP_VIEW || op->op == GGML_OP_CPY || op->op == GGML_OP_TRANSPOSE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_DUP) {
+        return input_supported(src0, false);
+    }
+
+    // TODO: Refine the supported conditions
+    if(op->op == GGML_OP_SET && ggml_backend_metalium_can_set(op)) {
         return input_supported(src0, false);
     }
 
@@ -1266,7 +1351,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_DIV:
-        case GGML_OP_MUL: // DITTO
+        case GGML_OP_MUL:
             // DIV does not support broadcasting on TTNN
             return input_supported(src0) && input_supported(src1) &&
                 (memcmp(src0->ne, src1->ne, sizeof(src0->ne)) == 0 || (numpy_broadcast_rule(src0, src1) && op->op != GGML_OP_DIV));

@@ -169,22 +169,15 @@ struct test_case
         fflush(stdout);
 
         // check if the backends support the ops
-        bool supported = true;
         for (ggml_backend_t backend : {backend1, backend2}) {
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
                 if (!ggml_backend_supports_op(backend, t)) {
-                    printf("not supported [%s]. Rejected OP: %s", ggml_backend_name(backend), ggml_op_desc(t));
-                    supported = false;
-                    break;
+                    printf("\033[1;33mNOT_SUPPORTED\033[0m by [%s]. Rejected OP: %s\n", ggml_backend_name(backend), ggml_op_desc(t));
+                    ggml_free(ctx);
+                    return TestResult::NOT_SUPPORTED;
                 }
             }
         }
-        if (!supported) {
-            printf("\n");
-            ggml_free(ctx);
-            return TestResult::NOT_SUPPORTED;
-        }
-
         // post-graph sentinel
         add_sentinel(ctx);
 
@@ -440,17 +433,23 @@ int main()
         return ggml_reshape_4d(ctx, a, 16, 32, 2, 1);
     }, "Reshape to non tile aligned tensor"));
 
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
+        return ggml_dup_tensor(ctx, a);
+    }, "Tensor duplication"));
 
     // (Basics of) what we need to get KV cache working
     // TODO: Map GGML operations into TTNN nlp_kv_cache_load_slice and update_cache_multi_core
-    // NOTE: Unfortunatly, might need a graph optimizer to merge the two operations into one
-    //       because I'm eagerly evaluating VIEW operations now.
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 28);
-    //     ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
-    //     return ggml_set_2d(ctx, a, b, b->nb[1], 0);
-    // }, "Set row of 2D matrix"));
-
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 24);
+        ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32);
+        return ggml_set_2d(ctx, a, b, b->nb[1], 0);
+    }, "Set row of 2D matrix"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 24);
+        ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32);
+        return ggml_set_2d(ctx, a, b, b->nb[1], a->nb[1]);
+    }, "Set row of 2D matrix with offset"));
 
     size_t total_tests = 0;
     size_t passed_tests = 0;

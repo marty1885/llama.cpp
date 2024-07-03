@@ -394,20 +394,48 @@ int main()
 
     tests.push_back(make_test([](ggml_context* ctx) {
         ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* view = ggml_view_2d(ctx, a, 48, 1, a->nb[1], 0);
+        ggml_tensor* b = ggml_cont(ctx, view);
+        return b;
+    }, "1D view into 2D matrix"));
+
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
         ggml_tensor* view = ggml_view_2d(ctx, a, 30, 28, a->nb[1], 0);
         ggml_tensor* b = ggml_cont(ctx, view);
         return b;
-    }, "Rectangular into 2D matrix"));
+    }, "Rectangular view into 2D matrix"));
 
     tests.push_back(make_test([](ggml_context* ctx) {
         ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
         return ggml_transpose(ctx, a);
     }, "transpose 2D square matrix"));
 
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 28);
+        return ggml_transpose(ctx, a);
+    }, "transpose 2D rectangular matrix"));
+
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 64, 64);
+        return ggml_transpose(ctx, a);
+    }, "transpose 3D square matrix"));
+
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 64, 64);
+        return ggml_cont(ctx, ggml_transpose(ctx, a));
+    }, "transpose 3D square matrix"));
+
+
+    // (Basics of) what we need to get KV cache working
+    // TODO: Map GGML operations into TTNN nlp_kv_cache_load_slice and update_cache_multi_core
+    // NOTE: Unfortunatly, might need a graph optimizer to merge the two operations into one
+    //       because I'm eagerly evaluating VIEW operations now.
     // tests.push_back(make_test([](ggml_context* ctx) {
     //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 28);
-    //     return ggml_transpose(ctx, a);
-    // }, "transpose 2D rectangular matrix"));
+    //     ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+    //     return ggml_set_2d(ctx, a, b, b->nb[1], 0);
+    // }, "Set row of 2D matrix"));
 
 
     size_t total_tests = 0;

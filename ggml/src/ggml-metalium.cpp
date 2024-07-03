@@ -473,8 +473,12 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
     TensorWithMetadata* meta = (TensorWithMetadata*)src0->extra;
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
 
-    // std::cout << "VIEW src shape: " << src0->ne[0] << " " << src0->ne[1] << " " << src0->ne[2] << " " << src0->ne[3] << std::endl;
-    // std::cout << "VIEW dst shape: " << dst->ne[0] << " " << dst->ne[1] << " " << dst->ne[2] << " " << dst->ne[3] << std::endl;
+
+    // std::cout << "ggml_backend_metalium_cpy() OP: " << ggml_op_desc(dst) << std::endl;
+    // std::cout << "  src shape: " << src0->ne[0] << " " << src0->ne[1] << " " << src0->ne[2] << " " << src0->ne[3] << std::endl;
+    // std::cout << "  dst shape: " << dst->ne[0] << " " << dst->ne[1] << " " << dst->ne[2] << " " << dst->ne[3] << std::endl;
+    // std::cout << "  src stride: " << src0->nb[0] << " " << src0->nb[1] << " " << src0->nb[2] << " " << src0->nb[3] << std::endl;
+    // std::cout << "  dst stride: " << dst->nb[0] << " " << dst->nb[1] << " " << dst->nb[2] << " " << dst->nb[3] << std::endl;
 
     GGML_ASSERT(meta != NULL);
     // GGML_ASSERT(ggml_is_contiguous(dst));
@@ -491,10 +495,25 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
         stride *= dst_size[i];
     }
 
+    std::array transposed_src_size = src_size;
+    std::swap(transposed_src_size[0], transposed_src_size[1]);
+    std::array transposed_src_stride = src_stride;
+    std::swap(transposed_src_stride[0], transposed_src_stride[1]);
+    // std::cout << "Transposed src size: " << transposed_src_size[0] << " " << transposed_src_size[1] << " " << transposed_src_size[2] << " " << transposed_src_size[3] << std::endl;
+    // std::cout << "Transposed src stride: " << transposed_src_stride[0] << " " << transposed_src_stride[1] << " " << transposed_src_stride[2] << " " << transposed_src_stride[3] << std::endl;
+    // std::cout << "Transpose test 1: " << (memcmp(transposed_src_size.data(), dst_size.data(), GGML_MAX_DIMS * sizeof(long)) == 0) << std::endl;
+    // std::cout << "Transpose test 2: " << (memcmp(transposed_src_stride.data(), dst_stride.data(), GGML_MAX_DIMS * sizeof(long)) == 0) << std::endl;
     // Fast path when both tensors are contiguous and have the same shape
-    if(ggml_is_contiguous(src0) &&
-        memcmp(src_size.data(), dst_size.data(), GGML_MAX_DIMS * sizeof(size_t)) == 0 &&
-        memcmp(src_stride.data(), dst_stride.data(), GGML_MAX_DIMS * sizeof(size_t)) == 0) {
+    if((ggml_is_contiguous(src0) &&
+        memcmp(src_size.data(), dst_size.data(), GGML_MAX_DIMS * sizeof(long)) == 0 &&
+        memcmp(src_stride.data(), dst_stride.data(), GGML_MAX_DIMS * sizeof(long)) == 0)
+        // SRC is actually a transposed tensor. Which has been eagerly evaluated
+        || (ggml_is_contiguous(dst) &&
+            memcmp(src_size.data(), dst_size.data(), GGML_MAX_DIMS * sizeof(long)) == 0 && 
+            // FIXME: Don't know why must compare aganst the original dst->nb. The copied one failes
+            // XXX: I don't think we need it
+            true)
+            /*memcmp(transposed_src_stride.data(), dst->nb, GGML_MAX_DIMS * sizeof(long)) == 0)*/) {
         const auto& ref_tensor = resolve_from_ggml_tensor(src0, dst_meta->bufctx);
         tt::tt_metal::Tensor ret = tt::tt_metal::zeros_like(ref_tensor);
         ret.deepcopy(*meta->tensor);
@@ -818,8 +837,10 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     ggml_type ggtype = tensor->type;
     TensorWithMetadata * meta = (TensorWithMetadata *)tensor->extra;
 
-    if(size != ggml_nbytes(tensor)) {
-        fprintf(stderr, "Warning: Does not supprt writing to segmented tensor\n");
+    // Make sure we are not writing to a view tensor
+    if(size != ggml_nbytes(tensor) || (meta->tensor && ggml_tt_tensors_shape_equal(tensor, *meta->tensor) == false)
+        || tensor->view_src != NULL) {
+        // fprintf(stderr, "Warning: Metalium set_tensor() does not work with tensor views\n");
         return;
     }
 
@@ -903,9 +924,10 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
     tt::tt_metal::CommandQueue& queue = ctx->device->command_queue(0);
 
     // some sanity checks, Could remove them once TTNN is more stable
-    auto shape = meta->tensor->shape();
-    // std::cout << "GGML thinks shape: " << tensor->ne[0] << " " << tensor->ne[1] << " " << tensor->ne[2] << " " << tensor->ne[3] << std::endl;
-    // std::cout << "TTNN thinks shape: " << shape << std::endl;
+    // auto shape = meta->tensor->shape();
+    // std::cout << "get_tensor():\n";
+    // std::cout << "  GGML thinks shape: " << tensor->ne[0] << " " << tensor->ne[1] << " " << tensor->ne[2] << " " << tensor->ne[3] << std::endl;
+    // std::cout << "  TTNN thinks shape: " << shape << std::endl;
     GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, *meta->tensor));
     tt::tt_metal::Tensor* t = meta->tensor.get();
     tt::tt_metal::Tensor holder;

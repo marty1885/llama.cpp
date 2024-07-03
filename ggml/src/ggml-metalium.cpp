@@ -434,10 +434,6 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
     // std::cout << "  dst src0: " << src0 << std::endl;
     // std::cout << "  dst src1: " << tensor->src[1] << std::endl;
 
-    if(op == GGML_OP_CONT || op == GGML_OP_CPY) {
-        GGML_ASSERT(src0 != nullptr);
-        return realize_ggml_view(src0);
-    }
     // Do we really need to lazy evaluate this? Currently transpose is eagerly evaluated
     if(op == GGML_OP_TRANSPOSE) {
         auto patent = realize_ggml_view(src0);
@@ -459,14 +455,17 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
         std::array<uint32_t, GGML_MAX_DIMS> start;
         std::array<uint32_t, GGML_MAX_DIMS> end;
 
-        for(size_t i = 0; i < GGML_MAX_DIMS; i++) {
-            start[i] = 0; // TODO: How do I calculate the start?
-            end[i] = dst_size[i] + start[i] - 1; // end is inclusive (WTF?)
+        size_t remaining_offset = offset;
+        for(size_t i = GGML_MAX_DIMS - 1; i < GGML_MAX_DIMS; i--) {
+            start[i] = remaining_offset / src_stride[i];
+            end[i] = dst_size[i] + start[i] - 1;
+            remaining_offset = remaining_offset % src_stride[i];
         }
         std::reverse(start.begin(), start.end());
         std::reverse(end.begin(), end.end());
         tt::tt_metal::Tensor res;
-        if(dst_size[0] % tt::constants::TILE_WIDTH == 0 && dst_size[1] % tt::constants::TILE_HEIGHT == 0) {
+        if(dst_size[0] % tt::constants::TILE_WIDTH == 0 && dst_size[1] % tt::constants::TILE_HEIGHT == 0 &&
+            start[2] % tt::constants::TILE_WIDTH == 0 && start[3] % tt::constants::TILE_HEIGHT == 0) {
             res = tt::tt_metal::unpad(*parent, start, end);
         }
         else {
@@ -580,7 +579,7 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
 
     *dst_meta = {
         // TODO: Type cast to the appropriate type
-        .tensor = realize_ggml_view(dst),
+        .tensor = realize_ggml_view(dst->src[0]),
         .ggtype = dst->type,
         .bufctx = dst_meta->bufctx
     };
@@ -680,7 +679,6 @@ static void ggml_backend_metalium_bin_op(ggml_backend_metalium_context * ctx, st
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     TensorWithMetadata* meta0 = (TensorWithMetadata*)src0->extra;
-    TensorWithMetadata* meta1 = (TensorWithMetadata*)src1->extra;
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
 
     auto src_tensor0 = realize_ggml_view(src0);

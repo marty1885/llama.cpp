@@ -379,6 +379,13 @@ int main()
 
     tests.push_back(make_test([](ggml_context* ctx) {
         ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* view = ggml_view_2d(ctx, a, 32, 32, a->nb[1], ggml_type_size(GGML_TYPE_F32));
+        ggml_tensor* b = ggml_cont(ctx, view);
+        return b;
+    }, "View into 2D matrix with offset"));
+
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
         ggml_tensor* view = ggml_view_2d(ctx, a, 48, 1, a->nb[1], 0);
         ggml_tensor* b = ggml_cont(ctx, view);
         return b;
@@ -426,13 +433,11 @@ int main()
     tests.push_back(make_test([](ggml_context* ctx) {
         ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, 64, 4, 1);
         return ggml_reshape_4d(ctx, a, 32, 128, 4, 1);
-        
     }, "Reshape to tile aligned tensor"));
 
     tests.push_back(make_test([](ggml_context* ctx) {
         ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 32, 1, 1);
         return ggml_reshape_4d(ctx, a, 16, 32, 2, 1);
-        
     }, "Reshape to non tile aligned tensor"));
 
 

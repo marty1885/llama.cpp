@@ -8807,7 +8807,6 @@ static void ggml_compute_forward_dup_bytes(
     const int ith = params->ith; // thread index
     const int nth = params->nth; // number of threads
 
-
     // parallelize by rows
     const int nr = ne01;
     // number of rows per thread

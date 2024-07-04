@@ -471,12 +471,46 @@ int main()
         ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 38, 72);
         return ggml_mul_mat(ctx, a, b);
     }, "2D matrix multiplication (result non square, non tile aligned)"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 64, 10);
+        ggml_tensor* b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 64, 10);
+        return ggml_mul_mat(ctx, a, b);
+    }, "3D matrix multiplication"));
+    // TODO: TTNN seems to not support the style of broadcasting GGML wants
+    // tests.push_back(make_test([](ggml_context* ctx) {
+    //     ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 64, 20);
+    //     ggml_tensor* b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 64, 10);
+    //     return ggml_mul_mat(ctx, a, b);
+    // }, "3D matrix multiplication (broadcast)"));
 
     // Misc
     tests.push_back(make_test([](ggml_context* ctx) {
         ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 38, 64, 3, 26);
         return ggml_clamp(ctx, a, -0.1, 0.25);
     }, "Clamp"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 38, 64, 3, 26);
+        return ggml_scale(ctx, a, 2.0);
+    }, "Scale"));
+    // ???? This should not have worked since I haven't implemented inplace operations
+    // tests.push_back(make_test([](ggml_context* ctx) {
+    //     ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 38, 64, 3, 26);
+    //     return ggml_scale_inplace(ctx, a, 2.0);
+    // }, "Scale in place"));
+
+    // more complex tests
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 18);
+        ggml_tensor* w1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 64);
+        ggml_tensor* b1 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+        ggml_tensor* w2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 48);
+        ggml_tensor* b2 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 48);
+
+        ggml_tensor* h1 = ggml_relu(ctx, ggml_add(ctx, ggml_mul_mat(ctx, w1, x), b1));
+        ggml_tensor* h2 = ggml_relu(ctx, ggml_add(ctx, ggml_mul_mat(ctx, w2, h1), b2));
+
+        return h2;
+    }, "Multi layer perceptron"));
 
     size_t total_tests = 0;
     size_t passed_tests = 0;

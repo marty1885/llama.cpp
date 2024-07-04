@@ -2,6 +2,7 @@
 #include "common/constants.hpp"
 #include "device/tt_arch_types.h"
 #include "ggml-backend-impl.h"
+#include "ggml-backend.h"
 #include "ggml.h"
 #include "ggml-metalium.h"
 
@@ -106,6 +107,7 @@ static std::map<int, ttnn::Device*> g_device_map;
 static std::map<int, ggml_backend_t> g_backend_map;
 
 // Maintain all base addresses are unique
+// TODO: Do we still need this since we already removed the virtual address mapping hack?
 static size_t g_metalium_base_offset = 0;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -178,17 +180,6 @@ static tt::tt_metal::DataType ggml2tt_type(ggml_type ggtype, tt::ARCH arch)
 
 static bool is_ggml_type_supported_by_metalium(ggml_type ggtype, tt::ARCH arch) {
     return ggml2tt_type_internal(ggtype, arch) != tt::tt_metal::DataType::INVALID;
-}
-
-static size_t tttype_size(tt::tt_metal::DataType type) {
-    switch(type) {
-        case tt::tt_metal::DataType::BFLOAT16:
-            return sizeof(bfloat16);
-        case tt::tt_metal::DataType::FLOAT32:
-            return sizeof(float);
-        default:
-            GGML_ASSERT(false && "Unsupported data type");
-    }
 }
 
 template <typename SrcType, typename DstType>
@@ -809,6 +800,29 @@ static void ggml_backend_metalium_clamp(ggml_backend_metalium_context * ctx, str
     };
 }
 
+static void ggml_backend_metalium_scale(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
+{
+    GGML_UNUSED(ctx);
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+
+    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+
+    float scale;
+    memcpy(&scale, dst->op_params, sizeof(scale));
+
+    auto t = realize_ggml_view(dst->src[0]);
+    auto res = ttnn::multiply(*t, scale);
+    // TODO: Support in-place scaling
+    GGML_ASSERT(!is_view(dst->src[0]));
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(res)),
+        .ggtype = dst->type,
+        .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
+    };
+}
+
+
 // backend interface
 
 GGML_CALL static const char * ggml_backend_metalium_name(ggml_backend_t backend) {
@@ -973,10 +987,6 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
     GGML_ASSERT(tensor->extra != NULL);
     GGML_UNUSED(offset);
 
-    TensorWithMetadata * meta = (TensorWithMetadata *)tensor->extra;
-    GGML_ASSERT(meta->tensor != NULL);
-    GGML_ASSERT(meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || meta->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
-
     ggml_backend_metalium_buffer_context * ctx = (ggml_backend_metalium_buffer_context *)buffer->context;
 
     ggml_type dst_ggtype = tensor->type;
@@ -1026,6 +1036,15 @@ ggml_backend_metalium_buffer_init_tensor(ggml_backend_buffer_t buffer,
         .bufctx = bufctx
     }));
     tensor->extra = bufctx->metadata_to_free.back().get();
+    // HACK: Make KV cache work
+    if(std::string_view(tensor->name).find("cache") != std::string::npos) {
+        TensorWithMetadata* meta = (TensorWithMetadata*)tensor->extra;
+        std::vector<uint32_t> shape(tensor->ne, tensor->ne + GGML_MAX_DIMS);
+        std::reverse(shape.begin(), shape.end());
+        auto t = tt::tt_metal::zeros(tt::tt_metal::Shape(shape), ggml2tt_type(tensor->type, bufctx->device->arch()));
+        t = tt::tt_metal::tilize_with_zero_padding(t.to(bufctx->device));
+        meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(t));
+    }
     // std::cout << "Creating tensor with address: " << tensor->data << ", shape = " << tensor->ne[0] << " " << tensor->ne[1] << " " << tensor->ne[2] << " " << tensor->ne[3] << ", name " << tensor->name << std::endl;
     GGML_UNUSED(buffer);
 }
@@ -1198,6 +1217,10 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
             case GGML_OP_CLAMP:
                 ggml_backend_metalium_clamp(ctx, node);
                 break;
+            
+            case GGML_OP_SCALE:
+                ggml_backend_metalium_scale(ctx, node);
+                break;
 
             case GGML_OP_NONE:
                 break;
@@ -1253,24 +1276,13 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
     };
 
     // std::cout << "Checking if op is supported: " << ggml_op_desc(op) << std::endl;
-    // std::cout << "Output supported: " << output_supported(op, false) << std::endl;
-    // if(op->op == GGML_OP_CONT || op->op == GGML_OP_VIEW || op->op == GGML_OP_CPY || op->op == GGML_OP_TRANSPOSE) {
-    //     std::cout << "Output tensor details:\n"
-    //         << "  data: " << op->data << "\n"
-    //         << "  ne: " << op->ne[0] << " " << op->ne[1] << " " << op->ne[2] << " " << op->ne[3] << "\n"
-    //         << "  nb: " << op->nb[0] << " " << op->nb[1] << " " << op->nb[2] << " " << op->nb[3] << "\n"
-    //         << "  type: " << ggml_type_name(op->type) << "\n"
-    //         << "  view_src: " << op->view_src << "\n"
-    //         << "\n\n"
-    //         << "Source 0 tensor details:\n"
-    //         << "  data: " << src0->data << "\n"
-    //         << "  ne: " << src0->ne[0] << " " << src0->ne[1] << " " << src0->ne[2] << " " << src0->ne[3] << "\n"
-    //         << "  nb: " << src0->nb[0] << " " << src0->nb[1] << " " << src0->nb[2] << " " << src0->nb[3] << "\n"
-    //         << "  type: " << ggml_type_name(src0->type) << "\n"
-    //         << "  view_src: " << src0->view_src << "\n"
-    //         << "\n";
-    // }
-
+    // std::cout << "Output tensor details:\n"
+    //     << "  data: " << op->data << "\n"
+    //     << "  ne: " << op->ne[0] << " " << op->ne[1] << " " << op->ne[2] << " " << op->ne[3] << "\n"
+    //     << "  nb: " << op->nb[0] << " " << op->nb[1] << " " << op->nb[2] << " " << op->nb[3] << "\n"
+    //     << "  type: " << ggml_type_name(op->type) << "\n"
+    //     << "  view_src: " << op->view_src << "\n"
+    //     << "\n";
     GGML_ASSERT(op != NULL);
     if(!tensor_supported(op)) {
         return false;
@@ -1288,7 +1300,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
                 case GGML_UNARY_OP_ABS:
                 case GGML_UNARY_OP_SGN:
                 case GGML_UNARY_OP_NEG:
-                case GGML_UNARY_OP_TANH: // Not accurate enough on Grayskull to pass unit tests
+                case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_RELU:
                 case GGML_UNARY_OP_ELU:
                 case GGML_UNARY_OP_SIGMOID:
@@ -1310,6 +1322,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         case GGML_OP_RESHAPE:
         case GGML_OP_TRANSPOSE:
         case GGML_OP_CLAMP:
+        case GGML_OP_SCALE:
             return true;
 
         case GGML_OP_ADD:

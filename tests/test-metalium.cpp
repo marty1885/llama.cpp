@@ -441,6 +441,20 @@ int main()
         ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
         return ggml_dup_tensor(ctx, ggml_view_tensor(ctx, a));
     }, "Tensor duplication via view"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
+        ggml_tensor* view = ggml_view_tensor(ctx, a);
+        ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
+        ggml_cpy(ctx, view, b);
+        return b;
+    }, "Write via view"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
+        ggml_tensor* view = ggml_view_2d(ctx, a, 8, 12, a->nb[1], 1);
+        ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 12);
+        ggml_cpy(ctx, view, b);
+        return b;
+    }, "partial write via view"));
 
     // (Basics of) what we need to get KV cache working
     // TODO: Map GGML operations into TTNN nlp_kv_cache_load_slice and update_cache_multi_core
@@ -493,10 +507,11 @@ int main()
         return ggml_scale(ctx, a, 2.0);
     }, "Scale"));
     // ???? This should not have worked since I haven't implemented inplace operations
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 38, 64, 3, 26);
-    //     return ggml_scale_inplace(ctx, a, 2.0);
-    // }, "Scale in place"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 38, 64, 3, 26);
+        ggml_scale_inplace(ctx, a, 1.5);
+        return a;
+    }, "Scale in place"));
 
     // more complex tests
     tests.push_back(make_test([](ggml_context* ctx) {

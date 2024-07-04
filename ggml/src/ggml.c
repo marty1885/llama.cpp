@@ -8807,6 +8807,13 @@ static void ggml_compute_forward_dup_bytes(
     const int ith = params->ith; // thread index
     const int nth = params->nth; // number of threads
 
+    // printf("dst op: %s\n", ggml_op_name(dst->op));
+    // printf("src0 data: %p, extra=%p, name=%s, type=%s\n", src0->data, src0->extra, src0->name, ggml_type_name(src0->type));
+    // printf(" src0 shape: %ld %ld %ld %ld\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
+    // printf("dst data: %p, extra=%p, name=%s, type=%s\n", dst->data, dst->extra, dst->name, ggml_type_name(dst->type));
+    // printf(" dst shape: %ld %ld %ld %ld\n", dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
+    // printf("\n");
+
     // parallelize by rows
     const int nr = ne01;
     // number of rows per thread

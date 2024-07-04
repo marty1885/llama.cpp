@@ -35,6 +35,7 @@
 #include <tt_dnn/op_library/eltwise_unary/eltwise_unary_op.hpp>
 #include <tt_dnn/op_library/copy/copy_op.hpp>
 #include <tt_dnn/op_library/update_cache/update_cache_op.hpp>
+#include <tt_dnn/op_library/nlp_tms/nlp_tms.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
 #include <ttnn/operations/matmul.hpp>
 
@@ -822,6 +823,32 @@ static void ggml_backend_metalium_scale(ggml_backend_metalium_context * ctx, str
     };
 }
 
+static bool ggml_backend_metalium_can_get_row(const struct ggml_tensor * dst)
+{
+    const ggml_tensor *idxs = dst->src[1];
+    if(idxs->ne[0] != 1 || idxs->ne[1] != 1 || idxs->ne[2] != 1 || idxs->ne[3] != 1) {
+        return false;
+    }
+    return true;
+}
+
+static void ggml_backend_metalium_get_row(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
+{
+    GGML_UNUSED(ctx);
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+
+    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+    uint32_t idx = *(uint32_t*)dst->src[1]->data;
+
+    auto t = realize_ggml_view(dst->src[0]);
+    auto res = tt::tt_metal::nlp_kv_cache_load_slice(*t, idx, idx + 1);
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(res),
+        .ggtype = dst->type,
+        .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
+    };
+}
 
 // backend interface
 
@@ -1221,6 +1248,10 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
             case GGML_OP_SCALE:
                 ggml_backend_metalium_scale(ctx, node);
                 break;
+            
+            case GGML_OP_GET_ROWS:
+                ggml_backend_metalium_get_row(ctx, node);
+                break;
 
             case GGML_OP_NONE:
                 break;
@@ -1336,6 +1367,8 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
             return tensor_supported(src1) && ggml_backend_metalium_can_mul_mat(op);
         case GGML_OP_SET:
             return tensor_supported(src1) && ggml_backend_metalium_can_set(op);
+        case GGML_OP_GET_ROWS:
+            return tensor_supported(src1) && ggml_backend_metalium_can_get_row(op);
         default:
             return false;
     }

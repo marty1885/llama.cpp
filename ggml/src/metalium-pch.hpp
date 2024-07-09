@@ -34,7 +34,7 @@
 #include <tt_dnn/op_library/eltwise_unary/eltwise_unary_op.hpp>
 #include <tt_dnn/op_library/copy/copy_op.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
-#include <ttnn/operations/matmul.hpp>
+#include <ttnn/operations/matmul/matmul.hpp>
 
 
 #include <memory>

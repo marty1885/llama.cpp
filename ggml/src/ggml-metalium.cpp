@@ -37,7 +37,7 @@
 #include <tt_dnn/op_library/update_cache/update_cache_op.hpp>
 #include <tt_dnn/op_library/nlp_tms/nlp_tms.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
-#include <ttnn/operations/matmul.hpp>
+#include <ttnn/operations/matmul/matmul.hpp>
 
 
 #include <memory>

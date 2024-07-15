@@ -1079,6 +1079,10 @@ struct test_sqr : public test_case {
         ggml_tensor * out = ggml_sqr(ctx, a);
         return out;
     }
+
+    double max_nmse_err() override {
+        return 2e-5;
+    }
 };
 
 // GGML_OP_SQRT

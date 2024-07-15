@@ -497,7 +497,7 @@ int main()
         ggml_tensor* b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 64, 10);
         return ggml_mul_mat(ctx, a, b);
     }, "3D matrix multiplication"));
-    // TODO: TTNN seems to not support the style of broadcasting GGML wants
+    // TODO: TTNN does not support the style of broadcasting GGML wants
     // tests.push_back(make_test([](ggml_context* ctx) {
     //     ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 64, 20);
     //     ggml_tensor* b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 64, 10);

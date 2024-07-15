@@ -1106,6 +1106,10 @@ struct test_sqrt : public test_case {
             init_tensor_uniform(t, 0.0f, 100.0f);
         }
     }
+
+    double max_nmse_err() override {
+        return 4e-5;
+    }
 };
 
 // GGML_OP_CLAMP

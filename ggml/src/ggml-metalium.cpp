@@ -477,9 +477,13 @@ static bool ggml_backend_metalium_can_mul_mat(const struct ggml_tensor * dst)
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
-    // Does not support broadcasting for now
+    // TTNN only supports matmul of shape [B, 1, M, K] x [1, 1, K, N] (bcast_batch=True)
+    // or [B, 1, M, K] x [B, 1, K, N] (bcast_batch=False)
+    // For now we simply only allow those shapes. We transpose the shapes ourselves
+    // TODO: Detect when shape[1] can be removed and do that automagically
+
     return src0->ne[0] == src1->ne[0] && src0->ne[2] == src1->ne[2] &&
-        src0->ne[3] == src1->ne[3];
+        (src0->ne[3] == src1->ne[3] || src0->ne[3] == 1);
 }
 
 static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {

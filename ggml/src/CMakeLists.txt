@@ -765,11 +765,8 @@ if(GGML_METALIUM)
         # Metalium
         tt_metal
         yaml-cpp
-        c++abi
-        c++
 
         # TTNN
-        tt_eager
         Python::Python
         $ENV{TT_METAL_HOME}/build/lib/_ttnn.so
     )

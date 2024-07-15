@@ -13,7 +13,6 @@
 #include "tensor/host_buffer/types.hpp"
 #include "tensor/types.hpp"
 #include "tt_dnn/op_library/auto_format.hpp"
-#include "tt_dnn/op_library/unpad/unpad_op.hpp"
 #include "tt_dnn/op_library/composite/composite_ops.hpp"
 #include "tt_dnn/op_library/tilize/tilize_op.hpp"
 #include "tt_dnn/op_library/untilize/untilize_op.hpp"
@@ -408,7 +407,8 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
         tt::tt_metal::Tensor res;
         if(dst_size[0] % tt::constants::TILE_WIDTH == 0 && dst_size[1] % tt::constants::TILE_HEIGHT == 0 &&
             start[2] % tt::constants::TILE_WIDTH == 0 && start[3] % tt::constants::TILE_HEIGHT == 0) {
-            res = tt::tt_metal::unpad(*parent, start, end);
+            //res = tt::tt_metal::unpad(*parent, start, end);
+	    throw std::runtime_error("DEAL WTIH REMOVED METALIUM FUNCTION!!");
         }
         else {
             // THIS is EXTREMELY SLOW. But it works
@@ -526,8 +526,9 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     cm->tensor.reset();
     // TODO: Ask TT to support multiplication of pre-transposed tensors. Calling transpose here is inefficient
     // https://github.com/tenstorrent/tt-metal/issues/9709
+    tt::operations::primary::Matmul cfg = tt::operations::primary::Matmul{};
     *cm = {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::operations::matmul::matmul(b, aT, std::nullopt)),
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::operations::matmul::matmul(b, aT, std::nullopt, cfg)),
         .ggtype = dst->type,
         .bufctx = cm->bufctx
     };

@@ -879,6 +879,25 @@ static void ggml_backend_metalium_norm(ggml_backend_metalium_context * ctx, stru
     };
 }
 
+static void ggml_backend_metalium_add1(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
+{
+    GGML_UNUSED(ctx);
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+
+    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+
+    float esp = 0;
+    memcpy(&esp, dst->op_params, sizeof(esp));
+
+    auto t = realize_ggml_view(dst->src[0]);
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::add1(*t)),
+        .ggtype = dst->type,
+        .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
+    };
+}
+
 // backend interface
 
 GGML_CALL static const char * ggml_backend_metalium_name(ggml_backend_t backend) {
@@ -1289,6 +1308,10 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
             case GGML_OP_RMS_NORM:
                 ggml_backend_metalium_norm(ctx, node, true);
                 break;
+            
+            case GGML_OP_ADD1:
+                ggml_backend_metalium_add1(ctx, node);
+                break;
 
             case GGML_OP_NONE:
                 break;
@@ -1393,6 +1416,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         case GGML_OP_SCALE:
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
+        case GGML_OP_ADD1:
             return true;
 
         case GGML_OP_ADD:

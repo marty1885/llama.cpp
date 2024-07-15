@@ -37,6 +37,7 @@
 #include <tt_dnn/op_library/nlp_tms/nlp_tms.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
 #include <ttnn/operations/matmul/matmul.hpp>
+#include <ttnn/operations/data_movement/slice/slice.hpp>
 
 
 #include <memory>
@@ -407,8 +408,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
         tt::tt_metal::Tensor res;
         if(dst_size[0] % tt::constants::TILE_WIDTH == 0 && dst_size[1] % tt::constants::TILE_HEIGHT == 0 &&
             start[2] % tt::constants::TILE_WIDTH == 0 && start[3] % tt::constants::TILE_HEIGHT == 0) {
-            //res = tt::tt_metal::unpad(*parent, start, end);
-	    throw std::runtime_error("DEAL WTIH REMOVED METALIUM FUNCTION!!");
+            res = ttnn::slice(*parent, start, end);
         }
         else {
             // THIS is EXTREMELY SLOW. But it works

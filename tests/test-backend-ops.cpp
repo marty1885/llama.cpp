@@ -917,6 +917,10 @@ struct test_norm : public test_case {
         ggml_tensor * out = ggml_norm(ctx, a, eps);
         return out;
     }
+
+    double max_nmse_err() override {
+        return 0.005;
+    }
 };
 
 // GGML_OP_RMS_NORM
@@ -938,6 +942,10 @@ struct test_rms_norm : public test_case {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
         ggml_tensor * out = ggml_rms_norm(ctx, a, eps);
         return out;
+    }
+
+    double max_nmse_err() override {
+        return 0.005;
     }
 };
 

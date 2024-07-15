@@ -38,6 +38,7 @@
 #include <ttnn/operations/eltwise/binary/binary.hpp>
 #include <ttnn/operations/matmul/matmul.hpp>
 #include <ttnn/operations/data_movement/slice/slice.hpp>
+#include <ttnn/experimental/tt_dnn/op_library/layernorm/layernorm_op.hpp>
 
 
 #include <memory>
@@ -525,9 +526,6 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
 
     GGML_ASSERT(cm != NULL);
     auto aT = tt::tt_metal::transpose(a, -2, -1);
-    // HACK: Workaround data corruption in TTNN
-    // https://github.com/tenstorrent/tt-metal/issues/9849
-    cm->tensor.reset();
     // TODO: Ask TT to support multiplication of pre-transposed tensors. Calling transpose here is inefficient
     // https://github.com/tenstorrent/tt-metal/issues/9709
     tt::operations::primary::Matmul cfg = tt::operations::primary::Matmul{};
@@ -850,6 +848,32 @@ static void ggml_backend_metalium_get_row(ggml_backend_metalium_context * ctx, s
     auto res = tt::tt_metal::nlp_kv_cache_load_slice(*t, idx, idx + 1);
     *dst_meta = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(res),
+        .ggtype = dst->type,
+        .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
+    };
+}
+
+static void ggml_backend_metalium_norm(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst, bool rms)
+{
+    GGML_UNUSED(ctx);
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+
+    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+
+    float esp = 0;
+    memcpy(&esp, dst->op_params, sizeof(esp));
+
+    auto t = realize_ggml_view(dst->src[0]);
+    tt::tt_metal::Tensor res;
+    if(rms) {
+        res = tt::tt_metal::rmsnorm(*t, esp);
+    }
+    else {
+        res = tt::tt_metal::layernorm(*t, esp);
+    }
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(res)),
         .ggtype = dst->type,
         .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
     };
@@ -1257,6 +1281,14 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
             case GGML_OP_GET_ROWS:
                 ggml_backend_metalium_get_row(ctx, node);
                 break;
+            
+            case GGML_OP_NORM:
+                ggml_backend_metalium_norm(ctx, node, false);
+                break;
+            
+            case GGML_OP_RMS_NORM:
+                ggml_backend_metalium_norm(ctx, node, true);
+                break;
 
             case GGML_OP_NONE:
                 break;
@@ -1359,6 +1391,8 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         case GGML_OP_TRANSPOSE:
         case GGML_OP_CLAMP:
         case GGML_OP_SCALE:
+        case GGML_OP_NORM:
+        case GGML_OP_RMS_NORM:
             return true;
 
         case GGML_OP_ADD:

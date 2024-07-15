@@ -1,3 +1,4 @@
+#include <unistd.h>
 #ifdef __cplusplus
 #include "common/bfloat16.hpp"
 #include "common/constants.hpp"

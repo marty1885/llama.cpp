@@ -357,6 +357,24 @@ static bool is_view(const ggml_tensor* tensor)
         tensor->op == GGML_OP_PERMUTE;
 }
 
+static tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tensor& tensor, const struct ggml_tensor * node)
+{
+    std::vector<uint32_t> target_shape(GGML_MAX_DIMS, 1);
+    for(int i = 0; i < GGML_MAX_DIMS; i++) {
+        target_shape[i] = node->ne[GGML_MAX_DIMS - i - 1];
+    }
+
+    if(node->ne[0] % tt::constants::TILE_WIDTH != 0 || node->ne[1] % tt::constants::TILE_HEIGHT != 0) {
+        // This path is SLOW. Reshape on a tilized tensor only works when the last two dimensions are tile aligned
+        tt::tt_metal::Tensor row_major_tensor = tt::tt_metal::untilize(tensor);
+        tt::tt_metal::Tensor reshaped = row_major_tensor.reshape(target_shape);
+        tt::tt_metal::Tensor ret = tt::tt_metal::tilize_with_zero_padding(reshaped);
+        return ret;
+    }
+
+    return tensor.reshape(target_shape);
+}
+
 static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tensor)
 {
     // Since TTNN does not support the traditional view operation, we had to support it ourselves
@@ -424,22 +442,8 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
         return std::make_shared<tt::tt_metal::Tensor>(res);
     }
     if(op == GGML_OP_RESHAPE) {
-        std::vector<uint32_t> target_shape(GGML_MAX_DIMS, 1);
-        for(int i = 0; i < GGML_MAX_DIMS; i++) {
-            target_shape[i] = tensor->ne[GGML_MAX_DIMS - i - 1];
-        }
         auto t = realize_ggml_view(src0);
-
-        if(tensor->ne[0] % tt::constants::TILE_WIDTH != 0 || tensor->ne[1] % tt::constants::TILE_HEIGHT != 0) {
-            // This path is SLOW. Reshape on a tilized tensor only works when the last two dimensions are tile aligned
-            tt::tt_metal::Tensor row_major_tensor = tt::tt_metal::untilize(*t);
-            tt::tt_metal::Tensor reshaped = row_major_tensor.reshape(target_shape);
-            tt::tt_metal::Tensor ret = tt::tt_metal::tilize_with_zero_padding(reshaped);
-            return std::make_shared<tt::tt_metal::Tensor>(ret);
-        }
-
-        // Fast path if the tensor is already tile aligned
-        return std::make_shared<tt::tt_metal::Tensor>(t->reshape(target_shape));
+        return std::make_shared<tt::tt_metal::Tensor>(reshape_tt_tensor_into_ggml(*t, tensor));
     }
     if(op == GGML_OP_PERMUTE) {
         int ndiff = 0;
@@ -566,24 +570,6 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     };
     GGML_ASSERT(cm->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || cm->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
     GGML_UNUSED(ctx);
-}
-
-static tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tensor& tensor, struct ggml_tensor * node)
-{
-    std::vector<uint32_t> target_shape(GGML_MAX_DIMS, 1);
-    for(int i = 0; i < GGML_MAX_DIMS; i++) {
-        target_shape[i] = node->ne[GGML_MAX_DIMS - i - 1];
-    }
-
-    if(node->ne[0] % tt::constants::TILE_WIDTH != 0 || node->ne[1] % tt::constants::TILE_HEIGHT != 0) {
-        // This path is SLOW. Reshape on a tilized tensor only works when the last two dimensions are tile aligned
-        tt::tt_metal::Tensor row_major_tensor = tt::tt_metal::untilize(tensor);
-        tt::tt_metal::Tensor reshaped = row_major_tensor.reshape(target_shape);
-        tt::tt_metal::Tensor ret = tt::tt_metal::tilize_with_zero_padding(reshaped);
-        return ret;
-    }
-
-    return tensor.reshape(target_shape);
 }
 
 static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {

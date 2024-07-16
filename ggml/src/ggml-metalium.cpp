@@ -17,6 +17,7 @@
 #include "tt_dnn/op_library/tilize/tilize_op.hpp"
 #include "tt_dnn/op_library/untilize/untilize_op.hpp"
 #include "ttnn/operations/creation.hpp"
+#include "ttnn/operations/eltwise/unary/unary.hpp"
 #include "ttnn/operations/normalization/softmax/device/softmax_op.hpp"
 #include <algorithm>
 #include <array>
@@ -982,6 +983,16 @@ static void ggml_backend_metalium_concat(ggml_backend_metalium_context * ctx, st
     };
 }
 
+static bool ggml_backend_metalium_can_softmax(const struct ggml_tensor * dst)
+{
+    float arr[2];
+    memcpy(arr, dst->op_params, sizeof(arr));
+    if(dst->src[1] != nullptr && arr[1] != 0.f) {
+        return false;
+    }
+    return true;
+}
+
 static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
 {
     GGML_UNUSED(ctx);
@@ -1003,13 +1014,37 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
     //     auto mask = realize_ggml_view(src1);
     //     x = ttnn::operations::normalization::scale_mask_softmax(*t, scale, *mask);
     // }
-    // TODO: Support max_bias
     if(scale != 1.f) {
         x = tt::tt_metal::mul_unary(*t, scale);
     }
+
     if(src1 != nullptr) {
         auto mask = realize_ggml_view(src1);
-        x = ttnn::add(x, *mask);
+        if(max_bias == 0.f) {
+            x = ttnn::add(x, *mask);
+        }
+        else {
+            // This path is not used due to accuracy issues and bug in TTNN.
+            // TODO: Revive it later
+            const uint32_t n_head = t->shape()[1];
+            const uint32_t n_head_log2 = 1u << (uint32_t) std::ceil(std::log2(n_head));
+            const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+            // const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+            auto make_tile = [](const tt::tt_metal::Tensor& t, tt::tt_metal::Device* dev) {
+                return tt::tt_metal::tilize_with_zero_padding(t).to(dev);
+            };
+
+            // const float slope = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
+            auto *dev = t->device();
+            auto slope = make_tile(tt::tt_metal::arange(1, n_head+1), dev);
+            auto lim = make_tile(tt::tt_metal::full(slope.legacy_shape(), n_head_log2), dev);
+            // BUG: Results in the wrong shape
+            // slope = tt::tt_metal::max(slope, lim);
+            slope = tt::tt_metal::rpow(ttnn::add(slope, 1.f), m0);
+
+
+            x = ttnn::add(x, ttnn::multiply(*mask, slope));
+        }
     }
     x = ttnn::operations::normalization::softmax(x);
     *dst_meta = {
@@ -1557,7 +1592,6 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         case GGML_OP_ADD1:
         case GGML_OP_SQRT:
         case GGML_OP_SQR:
-        case GGML_OP_SOFT_MAX:
             return true;
 
         case GGML_OP_ADD:
@@ -1575,6 +1609,8 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
             return tensor_supported(src1) && ggml_backend_metalium_can_get_row(op);
         case GGML_OP_CONCAT:
             return tensor_supported(src1) && ggml_backend_metalium_can_concat(op);
+        case GGML_OP_SOFT_MAX:
+            return ggml_backend_metalium_can_softmax(op);
         default:
             return false;
     }

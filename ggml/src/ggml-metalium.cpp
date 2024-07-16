@@ -17,6 +17,7 @@
 #include "tt_dnn/op_library/tilize/tilize_op.hpp"
 #include "tt_dnn/op_library/untilize/untilize_op.hpp"
 #include "ttnn/operations/creation.hpp"
+#include "ttnn/operations/normalization/softmax/device/softmax_op.hpp"
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -40,6 +41,7 @@
 #include <ttnn/operations/data_movement/slice/slice.hpp>
 #include <ttnn/experimental/tt_dnn/op_library/layernorm/layernorm_op.hpp>
 #include <tt_dnn/op_library/concat/concat_op.hpp>
+#include <ttnn/operations/normalization/softmax/softmax.hpp>
 
 
 #include <memory>
@@ -980,6 +982,43 @@ static void ggml_backend_metalium_concat(ggml_backend_metalium_context * ctx, st
     };
 }
 
+static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
+{
+    GGML_UNUSED(ctx);
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+
+    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+
+    std::array<float, 2> params;
+    memcpy(&params, dst->op_params, sizeof(params));
+    auto [scale, max_bias] = params;
+
+    const ggml_tensor *src1 = dst->src[1];
+
+    auto t = realize_ggml_view(dst->src[0]);
+    tt::tt_metal::Tensor x = *t;
+    // TODO: use the operimzied op if we can. It only works in certain conidtions
+    // if(src1 != nullptr) {
+    //     auto mask = realize_ggml_view(src1);
+    //     x = ttnn::operations::normalization::scale_mask_softmax(*t, scale, *mask);
+    // }
+    // TODO: Support max_bias
+    if(scale != 1.f) {
+        x = tt::tt_metal::mul_unary(*t, scale);
+    }
+    if(src1 != nullptr) {
+        auto mask = realize_ggml_view(src1);
+        x = ttnn::add(x, *mask);
+    }
+    x = ttnn::operations::normalization::softmax(x);
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(x)),
+        .ggtype = dst->type,
+        .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
+    };
+}
+
 
 // backend interface
 
@@ -1407,6 +1446,10 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
             case GGML_OP_CONCAT:
                 ggml_backend_metalium_concat(ctx, node);
                 break;
+            
+            case GGML_OP_SOFT_MAX:
+                ggml_backend_metalium_softmax(ctx, node);
+                break;
 
             case GGML_OP_NONE:
                 break;
@@ -1514,6 +1557,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         case GGML_OP_ADD1:
         case GGML_OP_SQRT:
         case GGML_OP_SQR:
+        case GGML_OP_SOFT_MAX:
             return true;
 
         case GGML_OP_ADD:

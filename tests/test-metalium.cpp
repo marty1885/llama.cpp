@@ -166,6 +166,10 @@ struct test_case
         ggml_tensor * out = build_graph(ctx);
 
         printf("  %s (%s): ", name.c_str(), ggml_op_desc(out));
+        if(out->op == GGML_OP_NONE) {
+            printf("\033[1;31mTEST_ERROR\033[0m operator should not be NONE. Test is buggy\n");
+            return TestResult::FAIL;
+        }
         fflush(stdout);
 
         // check if the backends support the ops
@@ -421,14 +425,12 @@ int main()
     tests.push_back(make_test([](ggml_context* ctx) {
         ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 4, 4, 4);
         ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_BF16, 256, 4, 4, 4);
-        ggml_cpy(ctx, a, b);
-        return b;
+        return ggml_cpy(ctx, a, b);
     }, "4D tensor copy"));
     tests.push_back(make_test([](ggml_context* ctx) {
         ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 4, 4, 4);
         ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 16, 1, 4);
-        ggml_cpy(ctx, a, b);
-        return b;
+        return ggml_cpy(ctx, a, b);
     }, "Copy tensor into tensor of different shape"));
 
     tests.push_back(make_test([](ggml_context* ctx) {
@@ -448,25 +450,23 @@ int main()
 
     tests.push_back(make_test([](ggml_context* ctx) {
         ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
-        return ggml_dup_tensor(ctx, a);
+        return ggml_dup(ctx, a);
     }, "Tensor duplication"));
     tests.push_back(make_test([](ggml_context* ctx) {
         ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
-        return ggml_dup_tensor(ctx, ggml_view_tensor(ctx, a));
+        return ggml_dup(ctx, ggml_view_tensor(ctx, a));
     }, "Tensor duplication via view"));
     tests.push_back(make_test([](ggml_context* ctx) {
         ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
         ggml_tensor* view = ggml_view_tensor(ctx, a);
         ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
-        ggml_cpy(ctx, view, b);
-        return b;
+        return ggml_cpy(ctx, view, b);
     }, "Write via view"));
     tests.push_back(make_test([](ggml_context* ctx) {
         ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
         ggml_tensor* view = ggml_view_2d(ctx, a, 8, 12, a->nb[1], 1);
         ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 12);
-        ggml_cpy(ctx, view, b);
-        return b;
+        return ggml_cpy(ctx, view, b);
     }, "partial write via view"));
     // TODO: Expend this to attempt all permutations possible
     for(int dim=0;dim<GGML_MAX_DIMS;dim++) {
@@ -534,8 +534,7 @@ int main()
     // ???? This should not have worked since I haven't implemented inplace operations
     tests.push_back(make_test([](ggml_context* ctx) {
         ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 38, 64, 3, 26);
-        ggml_scale_inplace(ctx, a, 1.5);
-        return a;
+        return ggml_scale_inplace(ctx, a, 1.5);
     }, "Scale in place"));
 
     // more complex tests

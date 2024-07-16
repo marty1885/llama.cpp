@@ -462,6 +462,18 @@ int main()
         ggml_cpy(ctx, view, b);
         return b;
     }, "partial write via view"));
+    // TODO: Expend this to attempt all permutations possible
+    for(int dim=0;dim<GGML_MAX_DIMS;dim++) {
+        tests.push_back(make_test([dim](ggml_context* ctx) {
+            ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 64, 128, 16);
+            std::array<int, GGML_MAX_DIMS> axis;
+            for(int i = 0;i<GGML_MAX_DIMS;i++) {
+                axis[i] = i;
+            }
+            std::swap(axis[dim], axis[dim+1]);
+            return ggml_permute(ctx, a, 0, 1, 3, 2);
+        }, "Permute of axis " + std::to_string(dim) + " and N+1"));
+    }
 
     // (Basics of) what we need to get KV cache working
     // TODO: Map GGML operations into TTNN nlp_kv_cache_load_slice and update_cache_multi_core

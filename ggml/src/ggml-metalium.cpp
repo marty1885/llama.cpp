@@ -353,7 +353,8 @@ static bool is_view(const ggml_tensor* tensor)
     return tensor->view_src != nullptr ||
         tensor->op == GGML_OP_VIEW ||
         tensor->op == GGML_OP_RESHAPE ||
-        tensor->op == GGML_OP_TRANSPOSE;
+        tensor->op == GGML_OP_TRANSPOSE ||
+        tensor->op == GGML_OP_PERMUTE;
 }
 
 static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tensor)
@@ -439,6 +440,31 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
 
         // Fast path if the tensor is already tile aligned
         return std::make_shared<tt::tt_metal::Tensor>(t->reshape(target_shape));
+    }
+    if(op == GGML_OP_PERMUTE) {
+        int ndiff = 0;
+        for(int i=0;i<GGML_MAX_DIMS;i++) {
+            ndiff += tensor->nb[i] != src0->nb[i];
+        }
+        GGML_ASSERT(ndiff != 1);
+        auto t = realize_ggml_view(src0);
+
+        if(ndiff == 0) {
+            return t;
+        }
+
+        // TODO: Only support the 2-axis special case for now
+        GGML_ASSERT(ndiff == 2);
+        std::array<int, 2> swapaxis;
+        int count = 0;
+        for(int i=0;i<GGML_MAX_DIMS;i++) {
+            if(tensor->nb[i] == src0->nb[i]) {
+                continue;
+            }
+            swapaxis[count++] = GGML_MAX_DIMS - i -1;
+        }
+
+        return std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::transpose(*t,swapaxis[0], swapaxis[1]));
     }
 
     if(TensorWithMetadata* meta = (TensorWithMetadata*)tensor->extra; meta != nullptr && meta->tensor != nullptr) {
@@ -1395,7 +1421,7 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
         //     << "  src1 addr: " << (void*)(node->src[1] ? node->src[1]->data : 0) << "\n";
 
         // Bypass post conition checks for these ops because they are evaluated lazily
-        if(node->op == GGML_OP_VIEW || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_RESHAPE) {
+        if(node->op == GGML_OP_VIEW || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE) {
             continue;
         }
 
@@ -1592,6 +1618,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         case GGML_OP_ADD1:
         case GGML_OP_SQRT:
         case GGML_OP_SQR:
+        case GGML_OP_PERMUTE:
             return true;
 
         case GGML_OP_ADD:

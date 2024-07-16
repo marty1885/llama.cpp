@@ -424,6 +424,12 @@ int main()
         ggml_cpy(ctx, a, b);
         return b;
     }, "4D tensor copy"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 4, 4, 4);
+        ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 16, 1, 4);
+        ggml_cpy(ctx, a, b);
+        return b;
+    }, "Copy tensor into tensor of different shape"));
 
     tests.push_back(make_test([](ggml_context* ctx) {
         ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 4, 4, 4);

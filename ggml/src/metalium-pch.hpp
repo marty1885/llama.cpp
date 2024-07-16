@@ -4,6 +4,7 @@
 #include "common/constants.hpp"
 #include "device/tt_arch_types.h"
 #include "ggml-backend-impl.h"
+#include "ggml-backend.h"
 #include "ggml.h"
 #include "ggml-metalium.h"
 
@@ -17,6 +18,9 @@
 #include "tt_dnn/op_library/composite/composite_ops.hpp"
 #include "tt_dnn/op_library/tilize/tilize_op.hpp"
 #include "tt_dnn/op_library/untilize/untilize_op.hpp"
+#include "ttnn/operations/creation.hpp"
+#include "ttnn/operations/eltwise/unary/unary.hpp"
+#include "ttnn/operations/normalization/softmax/device/softmax_op.hpp"
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -33,13 +37,18 @@
 #include <tt_dnn/op_library/fully_connected/fully_connected_op.hpp>
 #include <tt_dnn/op_library/eltwise_unary/eltwise_unary_op.hpp>
 #include <tt_dnn/op_library/copy/copy_op.hpp>
+#include <tt_dnn/op_library/update_cache/update_cache_op.hpp>
+#include <tt_dnn/op_library/nlp_tms/nlp_tms.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
 #include <ttnn/operations/matmul/matmul.hpp>
+#include <ttnn/operations/data_movement/slice/slice.hpp>
+#include <ttnn/experimental/tt_dnn/op_library/layernorm/layernorm_op.hpp>
+#include <tt_dnn/op_library/concat/concat_op.hpp>
+#include <ttnn/operations/normalization/softmax/softmax.hpp>
 
 
 #include <memory>
 #include <type_traits>
 #include <unordered_map>
 #include <variant>
-
 #endif

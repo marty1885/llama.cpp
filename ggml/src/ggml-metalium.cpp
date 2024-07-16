@@ -568,14 +568,38 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     GGML_UNUSED(ctx);
 }
 
+static tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tensor& tensor, struct ggml_tensor * node)
+{
+    std::vector<uint32_t> target_shape(GGML_MAX_DIMS, 1);
+    for(int i = 0; i < GGML_MAX_DIMS; i++) {
+        target_shape[i] = node->ne[GGML_MAX_DIMS - i - 1];
+    }
+
+    if(node->ne[0] % tt::constants::TILE_WIDTH != 0 || node->ne[1] % tt::constants::TILE_HEIGHT != 0) {
+        // This path is SLOW. Reshape on a tilized tensor only works when the last two dimensions are tile aligned
+        tt::tt_metal::Tensor row_major_tensor = tt::tt_metal::untilize(tensor);
+        tt::tt_metal::Tensor reshaped = row_major_tensor.reshape(target_shape);
+        tt::tt_metal::Tensor ret = tt::tt_metal::tilize_with_zero_padding(reshaped);
+        return ret;
+    }
+
+    return tensor.reshape(target_shape);
+}
+
 static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
     GGML_UNUSED(ctx);
     GGML_METALIUM_OP_SANITY_CHECK(dst);
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
 
+    // TODO: Check we are not writing into a view
+    auto res = realize_ggml_view(dst->src[0]);
+    if(!ggml_tt_tensors_shape_equal(dst, *res)) {
+        res = std::make_shared<tt::tt_metal::Tensor>(reshape_tt_tensor_into_ggml(*res, dst));
+    }
+
     *dst_meta = {
         // TODO: Type cast to the appropriate type
-        .tensor = realize_ggml_view(dst->src[0]),
+        .tensor = res,
         .ggtype = dst->type,
         .bufctx = dst_meta->bufctx
     };
@@ -702,42 +726,6 @@ static void ggml_backend_metalium_bin_op(ggml_backend_metalium_context * ctx, st
         .ggtype = dst->type,
         .bufctx = meta0->bufctx
     };
-}
-
-static void ggml_backend_metalium_reshape(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
-{
-    GGML_UNUSED(ctx);
-    GGML_METALIUM_OP_SANITY_CHECK(dst);
-    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
-
-    tt::tt_metal::Tensor& t = *((TensorWithMetadata*)dst->src[0]->extra)->tensor;
-    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
-
-    std::vector<uint32_t> target_shape(GGML_MAX_DIMS, 1);
-    for(int i = 0; i < GGML_MAX_DIMS; i++) {
-        target_shape[i] = dst->ne[GGML_MAX_DIMS - i - 1];
-    }
-
-    if(dst->ne[0] % tt::constants::TILE_WIDTH != 0 || dst->ne[1] % tt::constants::TILE_HEIGHT != 0) {
-        // This path is SLOW. Reshape on a tilized tensor only works when the last two dimensions are tile aligned
-        tt::tt_metal::Tensor row_major_tensor = tt::tt_metal::untilize(t);
-        tt::tt_metal::Tensor reshaped = row_major_tensor.reshape(target_shape);
-        tt::tt_metal::Tensor ret = tt::tt_metal::tilize_with_zero_padding(reshaped);
-        *dst_meta = {
-            .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(ret)),
-            .ggtype = dst->type,
-            .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
-        };
-        return;
-    }
-
-
-    *dst_meta = {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(t.reshape(target_shape)),
-        .ggtype = dst->type,
-        .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
-    };
-
 }
 
 static void ggml_backend_metalium_transpose(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)

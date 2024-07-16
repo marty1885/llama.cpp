@@ -39,6 +39,7 @@
 #include <ttnn/operations/matmul/matmul.hpp>
 #include <ttnn/operations/data_movement/slice/slice.hpp>
 #include <ttnn/experimental/tt_dnn/op_library/layernorm/layernorm_op.hpp>
+#include <tt_dnn/op_library/concat/concat_op.hpp>
 
 
 #include <memory>
@@ -936,6 +937,49 @@ static void ggml_backend_metalium_sqr(ggml_backend_metalium_context * ctx, struc
     };
 }
 
+static bool ggml_backend_metalium_can_concat(const struct ggml_tensor * dst)
+{
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(dst->op_params != NULL);
+
+    int32_t dim = 0;
+    memcpy(&dim, dst->op_params, sizeof(dim));
+
+    // TTNN requires tensors to be tile aligned if concat on the last 2 dimensions 
+    if(dim == 0 || dim == 1) {
+        return src0->ne[dim] % 32 == 0 && src1->ne[dim] % 32 == 0;
+    }
+    return true;
+}
+
+static void ggml_backend_metalium_concat(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
+{
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC1_SANITY_CHECK(dst);
+    GGML_UNUSED(ctx);
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+
+    auto src_tensor0 = realize_ggml_view(src0);
+    auto src_tensor1 = realize_ggml_view(src1);
+
+    int32_t axis = 0;
+    memcpy(&axis, dst->op_params, sizeof(axis));
+    axis = GGML_MAX_DIMS - axis - 1;
+
+    std::vector<tt::tt_metal::Tensor> targets = {*src_tensor0, *src_tensor1};
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::concat(targets, axis)),
+        .ggtype = dst->type,
+        .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
+    };
+}
+
 
 // backend interface
 
@@ -1359,6 +1403,10 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
             case GGML_OP_SQR:
                 ggml_backend_metalium_sqr(ctx, node);
                 break;
+            
+            case GGML_OP_CONCAT:
+                ggml_backend_metalium_concat(ctx, node);
+                break;
 
             case GGML_OP_NONE:
                 break;
@@ -1481,6 +1529,8 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
             return tensor_supported(src1) && ggml_backend_metalium_can_set(op);
         case GGML_OP_GET_ROWS:
             return tensor_supported(src1) && ggml_backend_metalium_can_get_row(op);
+        case GGML_OP_CONCAT:
+            return tensor_supported(src1) && ggml_backend_metalium_can_concat(op);
         default:
             return false;
     }

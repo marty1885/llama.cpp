@@ -411,6 +411,10 @@ int main()
         ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 28);
         return ggml_transpose(ctx, a);
     }, "transpose 2D rectangular matrix"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 2);
+        return ggml_transpose(ctx, a);
+    }, "transpose 2D small matrix"));
 
     tests.push_back(make_test([](ggml_context* ctx) {
         ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 64, 64);

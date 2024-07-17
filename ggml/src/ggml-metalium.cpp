@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <tt_eager/tensor/tensor.hpp>
 #include <ttnn/core.hpp>
@@ -41,6 +42,7 @@
 #include <ttnn/operations/matmul/matmul.hpp>
 #include <ttnn/operations/data_movement/slice/slice.hpp>
 #include <ttnn/experimental/tt_dnn/op_library/layernorm/layernorm_op.hpp>
+#include <tt_metal/detail/persistent_kernel_cache.hpp>
 #include <tt_dnn/op_library/concat/concat_op.hpp>
 #include <ttnn/operations/normalization/softmax/softmax.hpp>
 
@@ -1663,6 +1665,10 @@ static ggml_guid_t ggml_backend_metalium_guid(void) {
 ggml_backend_t ggml_backend_metalium_init(void) {
     // TODO: Support multiple devices (do we even need to? TT supports merging diverse devices into a single device, at least the API suggests that)
     const int device_id = 0;
+    static std::once_flag once;
+    std::call_once(once, [](){
+        tt::tt_metal::detail::EnablePersistentKernelCache();
+    });
 
     auto it = g_backend_map.find(device_id);
     if (it != g_backend_map.end()) {

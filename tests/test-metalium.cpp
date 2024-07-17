@@ -575,11 +575,13 @@ int main()
         << "  Failed: " << total_tests - passed_tests << " (" << (1.0 - passed_ratio) * 100 << "%)\n"
         << "  Not supported: " << not_supported << "\n";
     
-    if(total_tests != passed_tests) {
+    bool failed = total_tests != passed_tests;
+    if(failed) {
         std::cout << "Some tests failed\n";
-        return 1;
     }
 
     ggml_backend_free(metalium);
     ggml_backend_free(cpu);
+
+    return (int)failed;
 }

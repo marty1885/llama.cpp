@@ -7,16 +7,13 @@
 #include "ggml-metalium.h"
 
 #include "host_api.hpp"
-#include "hostdevcommon/kernel_structs.h"
 #include "impl/dispatch/command_queue.hpp"
 #include "tensor/host_buffer/functions.hpp"
 #include "tensor/host_buffer/types.hpp"
 #include "tensor/types.hpp"
 #include "tt_dnn/op_library/auto_format.hpp"
 #include "tt_dnn/op_library/composite/composite_ops.hpp"
-#include "tt_dnn/op_library/tilize/tilize_op.hpp"
 #include "tt_dnn/op_library/untilize/untilize_op.hpp"
-#include "ttnn/operations/creation.hpp"
 #include "ttnn/operations/eltwise/unary/unary.hpp"
 #include "ttnn/operations/normalization/softmax/device/softmax_op.hpp"
 #include <algorithm>
@@ -25,23 +22,22 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <functional>
 #include <mutex>
 #include <optional>
 #include <tt_eager/tensor/tensor.hpp>
 #include <ttnn/core.hpp>
-#include <ttnn/operations/eltwise/binary/binary.hpp>
 #include <tt_eager/tt_dnn/op_library/transpose/transpose_op.hpp>
 #include <ttnn/device.hpp>
-#include <tt_dnn/op_library/fully_connected/fully_connected_op.hpp>
-#include <tt_dnn/op_library/eltwise_unary/eltwise_unary_op.hpp>
 #include <tt_dnn/op_library/copy/copy_op.hpp>
 #include <tt_dnn/op_library/update_cache/update_cache_op.hpp>
 #include <tt_dnn/op_library/nlp_tms/nlp_tms.hpp>
+#include <tt_dnn/op_library/work_split_tilize.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
+#include <ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp>
 #include <ttnn/operations/matmul/matmul.hpp>
 #include <ttnn/operations/data_movement/slice/slice.hpp>
-#include <ttnn/experimental/tt_dnn/op_library/layernorm/layernorm_op.hpp>
+#include <ttnn/operations/normalization/layernorm/layernorm.hpp>
+#include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
 #include <tt_metal/detail/persistent_kernel_cache.hpp>
 #include <tt_dnn/op_library/concat/concat_op.hpp>
 #include <ttnn/operations/normalization/softmax/softmax.hpp>
@@ -49,7 +45,6 @@
 
 #include <memory>
 #include <type_traits>
-#include <unordered_map>
 #include <variant>
 
 struct ggml_backend_metalium_context {
@@ -373,7 +368,7 @@ static tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tens
         // This path is SLOW. Reshape on a tilized tensor only works when the last two dimensions are tile aligned
         tt::tt_metal::Tensor row_major_tensor = tt::tt_metal::untilize(tensor);
         tt::tt_metal::Tensor reshaped = row_major_tensor.reshape(target_shape);
-        tt::tt_metal::Tensor ret = tt::tt_metal::tilize_with_zero_padding(reshaped);
+        tt::tt_metal::Tensor ret = ttnn::tilize_with_zero_padding(reshaped);
         return ret;
     }
 
@@ -442,7 +437,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
         else {
             // THIS is EXTREMELY SLOW. But it works
             tt::tt_metal::Tensor tmp = parent->cpu().to(tt::tt_metal::Layout::ROW_MAJOR).unpad(start, end);
-            res = tt::tt_metal::tilize_with_zero_padding(tmp.to(bufctx->device));
+            res = ttnn::tilize_with_zero_padding(tmp.to(bufctx->device));
         }
         return std::make_shared<tt::tt_metal::Tensor>(res);
     }
@@ -610,13 +605,13 @@ static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ct
     tt::tt_metal::Tensor ret;
     switch (op) {
         case GGML_UNARY_OP_ABS:
-            ret = tt::tt_metal::abs(*src_tensor);
+            ret = ttnn::abs(*src_tensor);
             break;
         case GGML_UNARY_OP_SGN:
-            ret = tt::tt_metal::sign(*src_tensor);
+            ret = ttnn::sign(*src_tensor);
             break;
         case GGML_UNARY_OP_NEG:
-            ret = tt::tt_metal::neg(*src_tensor);
+            ret = ttnn::neg(*src_tensor);
             break;
         // Not supported in TTNN
         // case GGML_UNARY_OP_STEP:
@@ -624,26 +619,26 @@ static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ct
         //     break;
         // Not accurate enough to pass unit tests
         case GGML_UNARY_OP_TANH:
-            ret = tt::tt_metal::tanh(*src_tensor);
+            ret = ttnn::tanh(*src_tensor);
             break;
         case GGML_UNARY_OP_ELU:
-            ret = tt::tt_metal::elu(*src_tensor, 1.0f);
+            ret = ttnn::elu(*src_tensor, 1.0f);
             break;
         case GGML_UNARY_OP_RELU:
-            ret = tt::tt_metal::relu(*src_tensor);
+            ret = ttnn::relu(*src_tensor);
             break;
         // Not accurate enough to pass unit tests
         case GGML_UNARY_OP_SIGMOID:
-            ret = tt::tt_metal::sigmoid(*src_tensor);
+            ret = ttnn::sigmoid(*src_tensor);
             break;
         case GGML_UNARY_OP_GELU:
-            ret = tt::tt_metal::gelu(*src_tensor, false);
+            ret = ttnn::gelu(*src_tensor, false);
             break;
         case GGML_UNARY_OP_GELU_QUICK:
-            ret = tt::tt_metal::gelu(*src_tensor);
+            ret = ttnn::gelu(*src_tensor);
             break;
         case GGML_UNARY_OP_SILU:
-            ret = tt::tt_metal::silu(*src_tensor);
+            ret = ttnn::silu(*src_tensor);
             break;
         case GGML_UNARY_OP_HARDSWISH:
             ret = tt::tt_metal::hardswish(*src_tensor);
@@ -676,7 +671,7 @@ static void ggml_backend_metalium_leaky_relu(ggml_backend_metalium_context * ctx
     memcpy(&negative_slope, dst->op_params, sizeof(float));
 
     *dst_meta = {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::leaky_relu(*src_tensor, negative_slope)),
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::leaky_relu(*src_tensor, negative_slope)),
         .ggtype = dst->type,
         .bufctx = meta->bufctx
     };
@@ -876,10 +871,10 @@ static void ggml_backend_metalium_norm(ggml_backend_metalium_context * ctx, stru
     auto t = realize_ggml_view(dst->src[0]);
     tt::tt_metal::Tensor res;
     if(rms) {
-        res = tt::tt_metal::rmsnorm(*t, esp);
+        res = ttnn::rms_norm(*t, esp);
     }
     else {
-        res = tt::tt_metal::layernorm(*t, esp);
+        res = ttnn::layer_norm(*t, esp);
     }
     *dst_meta = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(res)),
@@ -901,7 +896,7 @@ static void ggml_backend_metalium_add1(ggml_backend_metalium_context * ctx, stru
 
     auto t = realize_ggml_view(dst->src[0]);
     *dst_meta = {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::add1(*t)),
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::add(*t, 1.f)),
         .ggtype = dst->type,
         .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
     };
@@ -920,7 +915,7 @@ static void ggml_backend_metalium_sqrt(ggml_backend_metalium_context * ctx, stru
 
     auto t = realize_ggml_view(dst->src[0]);
     *dst_meta = {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::sqrt(*t)),
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::sqrt(*t)),
         .ggtype = dst->type,
         .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
     };
@@ -939,7 +934,7 @@ static void ggml_backend_metalium_sqr(ggml_backend_metalium_context * ctx, struc
 
     auto t = realize_ggml_view(dst->src[0]);
     *dst_meta = {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::square(*t)),
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::square(*t)),
         .ggtype = dst->type,
         .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
     };
@@ -1020,7 +1015,7 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
     //     x = ttnn::operations::normalization::scale_mask_softmax(*t, scale, *mask);
     // }
     if(scale != 1.f) {
-        x = tt::tt_metal::mul_unary(*t, scale);
+        x = ttnn::multiply(*t, scale);
     }
 
     if(src1 != nullptr) {
@@ -1036,7 +1031,7 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
             const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
             // const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
             auto make_tile = [](const tt::tt_metal::Tensor& t, tt::tt_metal::Device* dev) {
-                return tt::tt_metal::tilize_with_zero_padding(t).to(dev);
+                return ttnn::tilize_with_zero_padding(t).to(dev);
             };
 
             // const float slope = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
@@ -1196,7 +1191,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     // GGML_ASSERT(!bufctx->tensors.contains(offset));
 
     // TODO: Make sure this is the correct tilize we want to use
-    t = tt::tt_metal::tilize_with_zero_padding(t.to(bufctx->device));
+    t = ttnn::tilize_with_zero_padding(t.to(bufctx->device));
     tt::tt_metal::DataType final_type = ggml2tt_type(ggtype, processor_class);
     if(final_type != t.dtype()) {
         t = typecast(t, final_type);
@@ -1279,7 +1274,7 @@ ggml_backend_metalium_buffer_init_tensor(ggml_backend_buffer_t buffer,
         std::vector<uint32_t> shape(tensor->ne, tensor->ne + GGML_MAX_DIMS);
         std::reverse(shape.begin(), shape.end());
         auto t = tt::tt_metal::zeros(tt::tt_metal::Shape(shape), ggml2tt_type(tensor->type, bufctx->device->arch()));
-        t = tt::tt_metal::tilize_with_zero_padding(t.to(bufctx->device));
+        t = ttnn::tilize_with_zero_padding(t.to(bufctx->device));
         meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(t));
     }
     // std::cout << "Creating tensor with address: " << tensor->data << ", shape = " << tensor->ne[0] << " " << tensor->ne[1] << " " << tensor->ne[2] << " " << tensor->ne[3] << ", name " << tensor->name << std::endl;
@@ -1517,8 +1512,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
     ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
 
     // The metalium backend has seperated internal data types from the GGML data types. We really only care about
-    // what we can convert to and from. For now we only support F32, F16, and BF16. Quantized data types will be
-    // supported in the future
+    // what we can convert to and from.
     auto tensor_supported = [&](const struct ggml_tensor * tensor) {
         if(tensor == NULL || !is_ggml_type_supported_by_metalium(tensor->type, ctx->device->arch())) {
             return false;

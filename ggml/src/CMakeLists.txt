@@ -782,6 +782,7 @@ if(GGML_METALIUM)
 
         # TTNN
         $ENV{TT_METAL_HOME}/ttnn/cpp
+        $ENV{TT_METAL_HOME}/ttnn/cpp/ttnn/experimental/
         $ENV{TT_METAL_HOME}/tt_eager
         $ENV{TT_METAL_HOME}/tt_metal/third_party/magic_enum
     )

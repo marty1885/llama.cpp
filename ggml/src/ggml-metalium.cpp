@@ -8,12 +8,6 @@
 
 #include "host_api.hpp"
 #include "impl/dispatch/command_queue.hpp"
-#include "tensor/host_buffer/functions.hpp"
-#include "tensor/host_buffer/types.hpp"
-#include "tensor/types.hpp"
-#include "tt_dnn/op_library/auto_format.hpp"
-#include "tt_dnn/op_library/composite/composite_ops.hpp"
-#include "tt_dnn/op_library/untilize/untilize_op.hpp"
 #include "ttnn/operations/eltwise/unary/unary.hpp"
 #include "ttnn/operations/normalization/softmax/device/softmax_op.hpp"
 #include <algorithm>
@@ -24,20 +18,19 @@
 #include <cstring>
 #include <mutex>
 #include <optional>
-#include <tt_eager/tensor/tensor.hpp>
 #include <ttnn/core.hpp>
-#include <tt_eager/tt_dnn/op_library/transpose/transpose_op.hpp>
 #include <ttnn/device.hpp>
-#include <tt_dnn/op_library/copy/copy_op.hpp>
-#include <tt_dnn/op_library/update_cache/update_cache_op.hpp>
-#include <tt_dnn/op_library/nlp_tms/nlp_tms.hpp>
-#include <tt_dnn/op_library/work_split_tilize.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
 #include <ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp>
 #include <ttnn/operations/matmul/matmul.hpp>
+#include <ttnn/operations/kv_cache.hpp>
 #include <ttnn/operations/data_movement/slice/slice.hpp>
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
+#include <ttnn/experimental/tt_dnn/op_library/untilize/untilize_op.hpp>
+#include <ttnn/experimental/tt_dnn/op_library/transpose/transpose_op.hpp>
+#include <ttnn/experimental/tt_dnn/op_library/nlp_tms/nlp_tms.hpp>
+#include <ttnn/experimental/tt_dnn/op_library/composite/composite_ops.hpp>
 #include <tt_metal/detail/persistent_kernel_cache.hpp>
 #include <tt_dnn/op_library/concat/concat_op.hpp>
 #include <ttnn/operations/normalization/softmax/softmax.hpp>
@@ -645,6 +638,10 @@ static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ct
             break;
         case GGML_UNARY_OP_HARDSIGMOID:
             ret = tt::tt_metal::hardsigmoid(*src_tensor);
+            break;
+        case GGML_UNARY_OP_STEP:
+            // TODO: Make sure the resulting data type matches the input
+            ret = tt::tt_metal::where(ttnn::gtz(*src_tensor), 1.f, 0.f);
             break;
         default:
             return false;
@@ -1416,6 +1413,7 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
                 case GGML_UNARY_OP_SILU:
                 case GGML_UNARY_OP_HARDSWISH:
                 case GGML_UNARY_OP_HARDSIGMOID:
+                case GGML_UNARY_OP_STEP:
                     ok = ggml_backend_metalium_activations(ctx, node, unary_op);
                     break;
                 default:
@@ -1572,6 +1570,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
                 case GGML_UNARY_OP_SILU:
                 case GGML_UNARY_OP_HARDSWISH:
                 case GGML_UNARY_OP_HARDSIGMOID:
+                case GGML_UNARY_OP_STEP:
                     return true;
                 default:
                     return false;

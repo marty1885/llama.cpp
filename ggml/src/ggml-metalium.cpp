@@ -606,10 +606,6 @@ static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ct
         case GGML_UNARY_OP_NEG:
             ret = ttnn::neg(*src_tensor);
             break;
-        // Not supported in TTNN
-        // case GGML_UNARY_OP_STEP:
-        //     ret = tt::tt_metal::step(*src_tensor);
-        //     break;
         // Not accurate enough to pass unit tests
         case GGML_UNARY_OP_TANH:
             ret = ttnn::tanh(*src_tensor);

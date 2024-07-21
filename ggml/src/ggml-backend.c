@@ -135,6 +135,10 @@ void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backe
     }
 }
 
+enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage(ggml_backend_buffer_t buffer) {
+    return buffer->usage;
+}
+
 ggml_backend_buffer_type_t ggml_backend_buffer_get_type(ggml_backend_buffer_t buffer) {
     return buffer->buft;
 }
@@ -451,6 +455,11 @@ GGML_CALL static void ggml_backend_registry_init(void) {
     extern GGML_CALL ggml_backend_t ggml_backend_reg_metalium_init(const char * params, void * user_data);
     extern GGML_CALL ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(void);
     ggml_backend_register("Metalium", ggml_backend_reg_metalium_init, ggml_backend_cpu_buffer_type(), NULL);
+#endif
+
+#ifdef GGML_USE_CANN
+    extern GGML_CALL int ggml_backend_cann_reg_devices(void);
+    ggml_backend_cann_reg_devices();
 #endif
 }
 

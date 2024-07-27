@@ -27,10 +27,11 @@
 #include <ttnn/operations/data_movement/slice/slice.hpp>
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
-#include <ttnn/experimental/tt_dnn/op_library/untilize/untilize_op.hpp>
-#include <ttnn/experimental/tt_dnn/op_library/transpose/transpose_op.hpp>
-#include <ttnn/experimental/tt_dnn/op_library/nlp_tms/nlp_tms.hpp>
-#include <ttnn/experimental/tt_dnn/op_library/composite/composite_ops.hpp>
+#include <ttnn/deprecated/tt_dnn/op_library/untilize/untilize_op.hpp>
+#include <ttnn/deprecated/tt_dnn/op_library/transpose/transpose_op.hpp>
+#include <ttnn/deprecated/tt_dnn/op_library/nlp_tms/nlp_tms.hpp>
+#include <ttnn/deprecated/tt_dnn/op_library/composite/composite_ops.hpp>
+#include <ttnn/operations/eltwise/unary/unary_composite.hpp>
 #include <tt_metal/detail/persistent_kernel_cache.hpp>
 #include <tt_dnn/op_library/concat/concat_op.hpp>
 #include <ttnn/operations/normalization/softmax/softmax.hpp>
@@ -630,10 +631,10 @@ static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ct
             ret = ttnn::silu(*src_tensor);
             break;
         case GGML_UNARY_OP_HARDSWISH:
-            ret = tt::tt_metal::hardswish(*src_tensor);
+            ret = ttnn::hardswish(*src_tensor, 1.f, 0.f);
             break;
         case GGML_UNARY_OP_HARDSIGMOID:
-            ret = tt::tt_metal::hardsigmoid(*src_tensor);
+            ret = ttnn::hardsigmoid(*src_tensor, 0.f, 1.f);
             break;
         case GGML_UNARY_OP_STEP:
             // TODO: Make sure the resulting data type matches the input

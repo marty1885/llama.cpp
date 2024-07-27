@@ -29,10 +29,10 @@
 #include <ttnn/operations/data_movement/slice/slice.hpp>
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
-#include <ttnn/experimental/tt_dnn/op_library/untilize/untilize_op.hpp>
-#include <ttnn/experimental/tt_dnn/op_library/transpose/transpose_op.hpp>
-#include <ttnn/experimental/tt_dnn/op_library/nlp_tms/nlp_tms.hpp>
-#include <ttnn/experimental/tt_dnn/op_library/composite/composite_ops.hpp>
+#include <ttnn/deprecated/tt_dnn/op_library/untilize/untilize_op.hpp>
+#include <ttnn/deprecated/tt_dnn/op_library/transpose/transpose_op.hpp>
+#include <ttnn/deprecated/tt_dnn/op_library/nlp_tms/nlp_tms.hpp>
+#include <ttnn/deprecated/tt_dnn/op_library/composite/composite_ops.hpp>
 #include <tt_metal/detail/persistent_kernel_cache.hpp>
 #include <tt_dnn/op_library/concat/concat_op.hpp>
 #include <ttnn/operations/normalization/softmax/softmax.hpp>

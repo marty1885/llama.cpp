@@ -782,7 +782,7 @@ if(GGML_METALIUM)
 
         # TTNN
         $ENV{TT_METAL_HOME}/ttnn/cpp
-        $ENV{TT_METAL_HOME}/ttnn/cpp/ttnn/experimental/
+        $ENV{TT_METAL_HOME}/ttnn/cpp/ttnn/deprecated/
         $ENV{TT_METAL_HOME}/tt_eager
         $ENV{TT_METAL_HOME}/tt_metal/third_party/magic_enum
     )
@@ -1328,6 +1328,9 @@ target_compile_features   (ggml PRIVATE c_std_11) # don't bump
 # HACK: Metalium needs PCH else takes forever to compile
 if (GGML_METALIUM)
     target_precompile_headers(ggml PRIVATE metalium-pch.hpp)
+    # FIXME: Metalium shoud should only require C++20 but needs C++23 on GCC
+    # see: https://github.com/tenstorrent/tt-metal/issues/10652
+    target_compile_features(ggml PRIVATE cxx_std_23)
 endif ()
 
 target_link_libraries(ggml PRIVATE Threads::Threads ${GGML_EXTRA_LIBS})

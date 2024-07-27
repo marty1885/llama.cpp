@@ -239,6 +239,10 @@ class Model:
             self.gguf_writer.add_expert_used_count(n_experts_used)
             logger.info(f"gguf: experts used count = {n_experts_used}")
 
+        if (head_dim := self.hparams.get("head_dim")) is not None:
+            self.gguf_writer.add_key_length(head_dim)
+            self.gguf_writer.add_value_length(head_dim)
+
         self.gguf_writer.add_file_type(self.ftype)
         logger.info(f"gguf: file type = {self.ftype}")
 
@@ -590,9 +594,15 @@ class Model:
         if chkhsh == "b53802fb28e26d645c3a310b34bfe07da813026ec7c7716883404d5e0f8b1901":
             # ref: https://huggingface.co/core42/jais-13b
             res = "jais"
+        if chkhsh == "7b3e7548e4308f52a76e8229e4e6cc831195d0d1df43aed21ac6c93da05fec5f":
+            # ref: https://huggingface.co/WisdomShell/CodeShell-7B
+            res = "codeshell"
         if chkhsh == "63b97e4253352e6f357cc59ea5b583e3a680eaeaf2632188c2b952de2588485e":
             # ref: https://huggingface.co/mistralai/Mistral-Nemo-Base-2407
             res = "tekken"
+        if chkhsh == "855059429035d75a914d1eda9f10a876752e281a054a7a3d421ef0533e5b6249":
+            # ref: https://huggingface.co/HuggingFaceTB/SmolLM-135M
+            res = "smollm"
 
         if res is None:
             logger.warning("\n")
@@ -733,7 +743,7 @@ class Model:
                 added_tokens_json = json.load(f)
                 for key in added_tokens_json:
                     token_id = added_tokens_json[key]
-                    if (token_id >= vocab_size):
+                    if token_id >= vocab_size:
                         logger.warning(f'ignore token {token_id}: id is out of range, max={vocab_size - 1}')
                         continue
 
@@ -1481,7 +1491,12 @@ class LlamaModel(Model):
         super().set_gguf_parameters()
         hparams = self.hparams
         self.gguf_writer.add_vocab_size(hparams["vocab_size"])
-        self.gguf_writer.add_rope_dimension_count(hparams["hidden_size"] // hparams["num_attention_heads"])
+
+        if "head_dim" in hparams:
+            rope_dim = hparams["head_dim"]
+        else:
+            rope_dim = hparams["hidden_size"] // hparams["num_attention_heads"]
+        self.gguf_writer.add_rope_dimension_count(rope_dim)
 
         if self.hparams.get("rope_scaling") is not None and "factor" in self.hparams["rope_scaling"]:
             if self.hparams["rope_scaling"].get("type") == "linear":
@@ -1555,6 +1570,34 @@ class LlamaModel(Model):
         return [(self.map_tensor_name(name), data_torch)]
 
     def prepare_tensors(self):
+        if rope_scaling := self.find_hparam(["rope_scaling"], optional=True):
+            if rope_scaling.get("rope_type", '').lower() == "llama3":
+                base = self.hparams.get("rope_theta", 10000.0)
+                dim = self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
+                freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+
+                factor = rope_scaling.get("factor", 8.0)
+                low_freq_factor = rope_scaling.get("low_freq_factor", 1.0)
+                high_freq_factor = rope_scaling.get("high_freq_factor", 4.0)
+                old_context_len = self.hparams.get("original_max_position_embeddings", 8192)
+
+                low_freq_wavelen = old_context_len / low_freq_factor
+                high_freq_wavelen = old_context_len / high_freq_factor
+                assert low_freq_wavelen != high_freq_wavelen
+
+                rope_factors = []
+                for freq in freqs:
+                    wavelen = 2 * math.pi / freq
+                    if wavelen < high_freq_wavelen:
+                        rope_factors.append(1)
+                    elif wavelen > low_freq_wavelen:
+                        rope_factors.append(factor)
+                    else:
+                        smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+                        rope_factors.append(1 / ((1 - smooth) / factor + smooth))
+
+                self.gguf_writer.add_tensor(self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FREQS), np.array(rope_factors, dtype=np.float32))
+
         super().prepare_tensors()
 
         if self._experts is not None:
@@ -1996,7 +2039,7 @@ class Phi3MiniModel(Model):
 
                 for key in added_tokens_json:
                     token_id = added_tokens_json[key]
-                    if (token_id >= vocab_size):
+                    if token_id >= vocab_size:
                         logger.debug(f'ignore token {token_id}: id is out of range, max={vocab_size - 1}')
                         continue
 
@@ -2069,10 +2112,11 @@ class Phi3MiniModel(Model):
         self.gguf_writer.add_rope_dimension_count(rope_dims)
         self.gguf_writer.add_rope_freq_base(self.find_hparam(["rope_theta"]))
         self.gguf_writer.add_file_type(self.ftype)
+        self.gguf_writer.add_sliding_window(self.find_hparam(["sliding_window"]))
 
         # write rope scaling for long context (128k) model
         rope_scaling = self.find_hparam(['rope_scaling'], True)
-        if (rope_scaling is None):
+        if rope_scaling is None:
             return
 
         scale = max_pos_embds / orig_max_pos_embds
@@ -2719,7 +2763,7 @@ class JinaBertV2Model(BertModel):
 
             yield name, data
 
-    def set_vocab(self, *args, **kwargs):
+    def set_vocab(self):
         tokenizer_class = 'BertTokenizer'
         with open(self.dir_model / "tokenizer_config.json", "r", encoding="utf-8") as f:
             tokenizer_class = json.load(f)['tokenizer_class']
@@ -2867,7 +2911,7 @@ class ArcticModel(Model):
                     added_tokens_decoder = tokenizer_config_json["added_tokens_decoder"]
                     for token_id, token_json in added_tokens_decoder.items():
                         token_id = int(token_id)
-                        if (token_id >= vocab_size):
+                        if token_id >= vocab_size:
                             logger.debug(f'ignore token {token_id}: id is out of range, max={vocab_size - 1}')
                             continue
 
@@ -3116,7 +3160,7 @@ class T5Model(Model):
                 added_tokens_json = json.load(f)
                 for key in added_tokens_json:
                     token_id = added_tokens_json[key]
-                    if (token_id >= vocab_size):
+                    if token_id >= vocab_size:
                         logger.warning(f'ignore token {token_id}: id is out of range, max={vocab_size - 1}')
                         continue
 

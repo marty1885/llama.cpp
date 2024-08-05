@@ -244,10 +244,11 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, [[maybe_unused]]
     // Converts TT tensors to GGML types
     // TODO: Support reading quantized data
     ttnn::Shape shape = tensor.shape();
+    ttnn::Shape padded_shape = tensor.shape().with_tile_padding();
     static_assert(std::is_same_v<SrcType, float> || std::is_same_v<SrcType, bfloat16>);
 
     tt::tt_metal::Tensor row_major_tensor = tensor.cpu().to(tt::tt_metal::Layout::ROW_MAJOR);
-    std::vector<SrcType> buf(shape.volume()); // .volume() returns the underlying volume of the tensor not the logical one (TT enforces 32x32 tiles)
+    std::vector<SrcType> buf(padded_shape.volume()); // .volume() returns the underlying volume of the tensor not the logical one (TT enforces 32x32 tiles)
     GGML_ASSERT(row_major_tensor.storage_type() == StorageType::OWNED or row_major_tensor.storage_type() == StorageType::BORROWED);
     GGML_ASSERT(std::holds_alternative<OwnedStorage>(row_major_tensor.storage()) || std::holds_alternative<BorrowedStorage>(row_major_tensor.storage()));
     if(std::holds_alternative<OwnedStorage>(row_major_tensor.storage())) {
@@ -307,10 +308,9 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, [[maybe_unused]]
     // TODO: Make sure this is correct. As of now not tested for large (>32x32) tensors
     // TODO: There's a lot of optimization that can be done here
     // TODO: Chunk this loop to avoid cache misses
-    ttnn::Shape tt_underlying_shape = row_major_tensor.shape().with_tile_padding();
-    const std::array<size_t, 4> stride = {tt_underlying_shape[1] * tt_underlying_shape[2] * tt_underlying_shape[3],
-                                    tt_underlying_shape[2] * tt_underlying_shape[3],
-                                    tt_underlying_shape[3],
+    const std::array<size_t, 4> stride = {padded_shape[1] * padded_shape[2] * padded_shape[3],
+                                    padded_shape[2] * padded_shape[3],
+                                    padded_shape[3],
                                     1};
     static_assert(GGML_MAX_DIMS == 4, "Looping depth is hardcoded to 4");
     size_t idx = 0;
@@ -326,6 +326,7 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, [[maybe_unused]]
                 else {
                     for(size_t x = 0; x < shape[3]; x++) {
                         const size_t src_idx = w * stride[0] + z * stride[1] + y * stride[2] + x * stride[3];
+                        GGML_ASSERT(src_idx < buf.size());
                         float val = src_adaptor(buf[src_idx]);
                         ((float*)intermid)[idx] = val;
                         idx++;
@@ -1221,12 +1222,11 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
     ggml_type dst_ggtype = tensor->type;
     tt::tt_metal::CommandQueue& queue = ctx->device->command_queue(0);
 
-    // some sanity checks, Could remove them once TTNN is more stable
-    auto *meta = (TensorWithMetadata*)tensor->extra;
-    auto shape = meta->tensor->shape();
-    std::cout << "get_tensor():\n";
-    std::cout << "  GGML thinks shape: " << tensor->ne[0] << " " << tensor->ne[1] << " " << tensor->ne[2] << " " << tensor->ne[3] << std::endl;
-    std::cout << "  TTNN thinks shape: " << shape << std::endl;
+    // auto *meta = (TensorWithMetadata*)tensor->extra;
+    // auto shape = meta->tensor->shape();
+    // std::cout << "get_tensor():\n";
+    // std::cout << "  GGML thinks shape: " << tensor->ne[0] << " " << tensor->ne[1] << " " << tensor->ne[2] << " " << tensor->ne[3] << std::endl;
+    // std::cout << "  TTNN thinks shape: " << shape << std::endl;
     std::shared_ptr<tt::tt_metal::Tensor> t = realize_ggml_view(tensor);
     GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, *t));
     tt::tt_metal::Tensor holder;

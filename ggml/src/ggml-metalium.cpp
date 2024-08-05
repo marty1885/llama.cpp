@@ -10,6 +10,7 @@
 #include "impl/dispatch/command_queue.hpp"
 #include "ttnn/operations/eltwise/unary/unary.hpp"
 #include "ttnn/operations/normalization/softmax/device/softmax_op.hpp"
+#include "ttnn/tensor/types.hpp"
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -28,12 +29,14 @@
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
 #include <ttnn/deprecated/tt_dnn/op_library/untilize/untilize_op.hpp>
-#include <ttnn/deprecated/tt_dnn/op_library/transpose/transpose_op.hpp>
 #include <ttnn/deprecated/tt_dnn/op_library/nlp_tms/nlp_tms.hpp>
-#include <ttnn/deprecated/tt_dnn/op_library/composite/composite_ops.hpp>
+#include <ttnn/deprecated/tt_numpy/functions.hpp>
+#include <ttnn/operations/eltwise/unary/unary_composite.hpp>
+#include <ttnn/operations/data_movement/transpose/transpose.hpp>
+#include <ttnn/operations/data_movement/concat/concat.hpp>
+#include <ttnn/operations/eltwise/unary/unary.hpp>
 #include <ttnn/operations/eltwise/unary/unary_composite.hpp>
 #include <tt_metal/detail/persistent_kernel_cache.hpp>
-#include <tt_dnn/op_library/concat/concat_op.hpp>
 #include <ttnn/operations/normalization/softmax/softmax.hpp>
 
 
@@ -397,7 +400,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
     // Do we really need to lazy evaluate this? Currently transpose is eagerly evaluated
     if(op == GGML_OP_TRANSPOSE) {
         auto patent = realize_ggml_view(src0);
-        return std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::transpose(*patent, -2, -1));
+        return std::make_shared<tt::tt_metal::Tensor>(ttnn::transpose(*patent, -2, -1));
     }
     if(op == GGML_OP_VIEW) {
         std::shared_ptr<tt::tt_metal::Tensor> parent = realize_ggml_view(tensor->view_src);
@@ -462,7 +465,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
             swapaxis[count++] = GGML_MAX_DIMS - i -1;
         }
 
-        return std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::transpose(*t,swapaxis[0], swapaxis[1]));
+        return std::make_shared<tt::tt_metal::Tensor>(ttnn::transpose(*t,swapaxis[0], swapaxis[1]));
     }
 
     if(TensorWithMetadata* meta = (TensorWithMetadata*)tensor->extra; meta != nullptr && meta->tensor != nullptr) {
@@ -553,7 +556,7 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     TensorWithMetadata* cm = (TensorWithMetadata*)dst->extra;
 
     GGML_ASSERT(cm != NULL);
-    auto aT = tt::tt_metal::transpose(a, -2, -1);
+    auto aT = ttnn::transpose(a, -2, -1);
     // TODO: Ask TT to support multiplication of pre-transposed tensors. Calling transpose here is inefficient
     // https://github.com/tenstorrent/tt-metal/issues/9709
     tt::operations::primary::Matmul cfg = tt::operations::primary::Matmul{};
@@ -638,7 +641,7 @@ static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ct
             break;
         case GGML_UNARY_OP_STEP:
             // TODO: Make sure the resulting data type matches the input
-            ret = tt::tt_metal::where(ttnn::gtz(*src_tensor), 1.f, 0.f);
+            ret = ttnn::where(ttnn::gtz(*src_tensor), 1.f, 0.f);
             break;
         default:
             return false;
@@ -720,7 +723,7 @@ static void ggml_backend_metalium_transpose(ggml_backend_metalium_context * ctx,
     // std::cout << "GGML wants reshape to: " << dst->ne[0] << " " << dst->ne[1] << " " << dst->ne[2] << " " << dst->ne[3] << std::endl;
 
     *dst_meta = {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::transpose(*t, -2, -1)),
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::transpose(*t, -2, -1)),
         .ggtype = dst->type,
         .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
     };
@@ -796,7 +799,7 @@ static void ggml_backend_metalium_clamp(ggml_backend_metalium_context * ctx, str
 
     auto t = realize_ggml_view(dst->src[0]);
     *dst_meta = {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::clamp(*t, min, max)),
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::clamp(*t, min, max)),
         .ggtype = dst->type,
         .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
     };
@@ -971,7 +974,7 @@ static void ggml_backend_metalium_concat(ggml_backend_metalium_context * ctx, st
 
     std::vector<tt::tt_metal::Tensor> targets = {*src_tensor0, *src_tensor1};
     *dst_meta = {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(tt::tt_metal::concat(targets, axis)),
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::concat(targets, axis)),
         .ggtype = dst->type,
         .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
     };
@@ -1030,11 +1033,11 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
 
             // const float slope = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
             auto *dev = t->device();
-            auto slope = make_tile(tt::tt_metal::arange(1, n_head+1), dev);
-            auto lim = make_tile(tt::tt_metal::full(slope.legacy_shape(), n_head_log2), dev);
+            auto slope = make_tile(tt::numpy::arange<float>(1, n_head+1, 1), dev);
+            auto lim = make_tile(tt::numpy::full(slope.legacy_shape(), (float)n_head_log2, tt::tt_metal::DataType::BFLOAT16), dev);
             // BUG: Results in the wrong shape
             // slope = tt::tt_metal::max(slope, lim);
-            slope = tt::tt_metal::rpow(ttnn::add(slope, 1.f), m0);
+            slope = ttnn::rpow(ttnn::add(slope, 1.f), m0);
 
 
             x = ttnn::add(x, ttnn::multiply(*mask, slope));
@@ -1219,10 +1222,11 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
     tt::tt_metal::CommandQueue& queue = ctx->device->command_queue(0);
 
     // some sanity checks, Could remove them once TTNN is more stable
-    // auto shape = meta->tensor->shape();
-    // std::cout << "get_tensor():\n";
-    // std::cout << "  GGML thinks shape: " << tensor->ne[0] << " " << tensor->ne[1] << " " << tensor->ne[2] << " " << tensor->ne[3] << std::endl;
-    // std::cout << "  TTNN thinks shape: " << shape << std::endl;
+    auto *meta = (TensorWithMetadata*)tensor->extra;
+    auto shape = meta->tensor->shape();
+    std::cout << "get_tensor():\n";
+    std::cout << "  GGML thinks shape: " << tensor->ne[0] << " " << tensor->ne[1] << " " << tensor->ne[2] << " " << tensor->ne[3] << std::endl;
+    std::cout << "  TTNN thinks shape: " << shape << std::endl;
     std::shared_ptr<tt::tt_metal::Tensor> t = realize_ggml_view(tensor);
     GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, *t));
     tt::tt_metal::Tensor holder;
@@ -1267,7 +1271,7 @@ ggml_backend_metalium_buffer_init_tensor(ggml_backend_buffer_t buffer,
         TensorWithMetadata* meta = (TensorWithMetadata*)tensor->extra;
         std::vector<uint32_t> shape(tensor->ne, tensor->ne + GGML_MAX_DIMS);
         std::reverse(shape.begin(), shape.end());
-        auto t = tt::tt_metal::zeros(tt::tt_metal::Shape(shape), ggml2tt_type(tensor->type, bufctx->device->arch()));
+        auto t = tt::numpy::zeros(tt::numpy::Shape(shape), ggml2tt_type(tensor->type, bufctx->device->arch()));
         t = ttnn::tilize_with_zero_padding(t.to(bufctx->device));
         meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(t));
     }
@@ -1298,7 +1302,7 @@ ggml_backend_metalium_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
 
     tt::tt_metal::Tensor& src_tensor = *src_meta->tensor;
 
-    tt::tt_metal::Tensor ret = tt::tt_metal::zeros_like(src_tensor);
+    tt::tt_metal::Tensor ret = tt::numpy::zeros_like(src_tensor);
     ret.deepcopy(src_tensor);
     GGML_ASSERT(ret.storage_type() == tt::tt_metal::StorageType::DEVICE || ret.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
     dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(ret));

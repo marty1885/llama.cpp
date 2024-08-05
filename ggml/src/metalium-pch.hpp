@@ -12,6 +12,7 @@
 #include "impl/dispatch/command_queue.hpp"
 #include "ttnn/operations/eltwise/unary/unary.hpp"
 #include "ttnn/operations/normalization/softmax/device/softmax_op.hpp"
+#include "ttnn/tensor/types.hpp"
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -30,16 +31,14 @@
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
 #include <ttnn/deprecated/tt_dnn/op_library/untilize/untilize_op.hpp>
-#include <ttnn/deprecated/tt_dnn/op_library/transpose/transpose_op.hpp>
 #include <ttnn/deprecated/tt_dnn/op_library/nlp_tms/nlp_tms.hpp>
-#include <ttnn/deprecated/tt_dnn/op_library/composite/composite_ops.hpp>
+#include <ttnn/deprecated/tt_numpy/functions.hpp>
+#include <ttnn/operations/eltwise/unary/unary_composite.hpp>
+#include <ttnn/operations/data_movement/transpose/transpose.hpp>
+#include <ttnn/operations/data_movement/concat/concat.hpp>
+#include <ttnn/operations/eltwise/unary/unary.hpp>
+#include <ttnn/operations/eltwise/unary/unary_composite.hpp>
 #include <tt_metal/detail/persistent_kernel_cache.hpp>
-#include <tt_dnn/op_library/concat/concat_op.hpp>
 #include <ttnn/operations/normalization/softmax/softmax.hpp>
-
-
-#include <memory>
-#include <type_traits>
-#include <variant>
 
 #endif

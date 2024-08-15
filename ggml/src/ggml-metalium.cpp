@@ -28,8 +28,8 @@
 #include <ttnn/operations/data_movement/slice/slice.hpp>
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
-#include <ttnn/deprecated/tt_dnn/op_library/untilize/untilize_op.hpp>
-#include <ttnn/deprecated/tt_dnn/op_library/nlp_tms/nlp_tms.hpp>
+#include <ttnn/operations/data_movement/untilize/untilize.hpp>
+#include <ttnn/operations/experimental/transformer/nlp_kv_cache_load_slice/nlp_kv_cache_load_slice.hpp>
 #include <ttnn/deprecated/tt_numpy/functions.hpp>
 #include <ttnn/operations/eltwise/unary/unary_composite.hpp>
 #include <ttnn/operations/data_movement/transpose/transpose.hpp>
@@ -55,7 +55,7 @@ struct TensorWithMetadata;
 static std::string dump_tt_tensor(const tt::tt_metal::Tensor& tensor)
 {
     std::stringstream ss;
-    auto tmp = tt::tt_metal::untilize(tensor);
+    auto tmp = ttnn::untilize(tensor);
     std::vector<bfloat16> vec(tmp.shape().volume());
     memcpy(vec.data(), tmp);
     for(size_t i = 0; i < vec.size(); i++) {
@@ -263,7 +263,7 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, [[maybe_unused]]
     }
     // TODO: Measure the performance of the following code. This is much simpeer and does untiling on the device
     // But does not work for large tensors
-    // row_major_tensor = tt::tt_metal::untilize(tensor);
+    // row_major_tensor = ttnn::untilize(tensor);
     // GGML_ASSERT(row_major_tensor.layout() == tt::tt_metal::Layout::ROW_MAJOR);
     // tt::tt_metal::memcpy(queue, buf.data(), row_major_tensor);
     // tt::tt_metal::Finish(queue);
@@ -364,7 +364,7 @@ static tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tens
 
     if(node->ne[0] % tt::constants::TILE_WIDTH != 0 || node->ne[1] % tt::constants::TILE_HEIGHT != 0) {
         // This path is SLOW. Reshape on a tilized tensor only works when the last two dimensions are tile aligned
-        tt::tt_metal::Tensor row_major_tensor = tt::tt_metal::untilize(tensor);
+        tt::tt_metal::Tensor row_major_tensor = ttnn::untilize(tensor);
         tt::tt_metal::Tensor reshaped = row_major_tensor.reshape(target_shape);
         tt::tt_metal::Tensor ret = ttnn::tilize_with_zero_padding(reshaped);
         return ret;
@@ -401,7 +401,9 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
     // Do we really need to lazy evaluate this? Currently transpose is eagerly evaluated
     if(op == GGML_OP_TRANSPOSE) {
         auto patent = realize_ggml_view(src0);
-        return std::make_shared<tt::tt_metal::Tensor>(ttnn::transpose(*patent, -2, -1));
+        auto res = ttnn::transpose(*patent, -2, -1);
+        GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, res));
+        return std::make_shared<tt::tt_metal::Tensor>(res);
     }
     if(op == GGML_OP_VIEW) {
         std::shared_ptr<tt::tt_metal::Tensor> parent = realize_ggml_view(tensor->view_src);
@@ -428,6 +430,9 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
         std::reverse(start.begin(), start.end());
         std::reverse(end.begin(), end.end());
         tt::tt_metal::Tensor res;
+        std::cout << "Parent shape: " << parent->shape() << "\n";
+        std::cout << "Start: " << start << "\n";
+        std::cout << "End: " << end << "\n";
         if(dst_size[0] % tt::constants::TILE_WIDTH == 0 && dst_size[1] % tt::constants::TILE_HEIGHT == 0 &&
             start[2] % tt::constants::TILE_WIDTH == 0 && start[3] % tt::constants::TILE_HEIGHT == 0) {
             res = ttnn::slice(*parent, start, end);
@@ -435,12 +440,18 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
         else {
             // THIS is EXTREMELY SLOW. But it works
             tt::tt_metal::Tensor tmp = parent->cpu().to(tt::tt_metal::Layout::ROW_MAJOR).unpad(start, end);
+            std::cout << "TMP shape: " << tmp.shape() << std::endl;
             res = ttnn::tilize_with_zero_padding(tmp.to(bufctx->device));
         }
+
+        std::cout << "TT shape: " << res.shape() << std::endl;
+        std::cout << "GGML expecting: " << tensor->ne[3] << " " << tensor->ne[2] << " " << tensor->ne[1] << " " << tensor->ne[0] << "\n";
+        GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, res));
         return std::make_shared<tt::tt_metal::Tensor>(res);
     }
     if(op == GGML_OP_RESHAPE) {
         auto t = realize_ggml_view(src0);
+        GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, *t));
         return std::make_shared<tt::tt_metal::Tensor>(reshape_tt_tensor_into_ggml(*t, tensor));
     }
     if(op == GGML_OP_PERMUTE) {
@@ -466,7 +477,9 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
             swapaxis[count++] = GGML_MAX_DIMS - i -1;
         }
 
-        return std::make_shared<tt::tt_metal::Tensor>(ttnn::transpose(*t,swapaxis[0], swapaxis[1]));
+        auto res = ttnn::transpose(*t,swapaxis[0], swapaxis[1]);
+        GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, res));
+        return std::make_shared<tt::tt_metal::Tensor>(res);
     }
 
     if(TensorWithMetadata* meta = (TensorWithMetadata*)tensor->extra; meta != nullptr && meta->tensor != nullptr) {
@@ -560,7 +573,7 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     auto aT = ttnn::transpose(a, -2, -1);
     // TODO: Ask TT to support multiplication of pre-transposed tensors. Calling transpose here is inefficient
     // https://github.com/tenstorrent/tt-metal/issues/9709
-    tt::operations::primary::Matmul cfg = tt::operations::primary::Matmul{};
+    ttnn::operations::matmul::Matmul cfg = ttnn::operations::matmul::Matmul{};
     *cm = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::operations::matmul::matmul(b, aT, std::nullopt, cfg)),
         .ggtype = dst->type,
@@ -847,7 +860,7 @@ static void ggml_backend_metalium_get_row(ggml_backend_metalium_context * ctx, s
     uint32_t idx = *(uint32_t*)dst->src[1]->data;
 
     auto t = realize_ggml_view(dst->src[0]);
-    auto res = tt::tt_metal::nlp_kv_cache_load_slice(*t, idx, idx + 1);
+    auto res = ttnn::experimental::nlp_kv_cache_load_slice(*t, idx, idx + 1);
     *dst_meta = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(res),
         .ggtype = dst->type,

@@ -30,8 +30,8 @@
 #include <ttnn/operations/data_movement/slice/slice.hpp>
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
-#include <ttnn/deprecated/tt_dnn/op_library/untilize/untilize_op.hpp>
-#include <ttnn/deprecated/tt_dnn/op_library/nlp_tms/nlp_tms.hpp>
+#include <ttnn/operations/data_movement/untilize/untilize.hpp>
+#include <ttnn/operations/experimental/transformer/nlp_kv_cache_load_slice/nlp_kv_cache_load_slice.hpp>
 #include <ttnn/deprecated/tt_numpy/functions.hpp>
 #include <ttnn/operations/eltwise/unary/unary_composite.hpp>
 #include <ttnn/operations/data_movement/transpose/transpose.hpp>

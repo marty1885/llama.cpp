@@ -431,9 +431,9 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
         std::reverse(start.begin(), start.end());
         std::reverse(end.begin(), end.end());
         tt::tt_metal::Tensor res;
-        std::cout << "Parent shape: " << parent->shape() << "\n";
-        std::cout << "Start: " << start << "\n";
-        std::cout << "End: " << end << "\n";
+        // std::cout << "Parent shape: " << parent->shape() << "\n";
+        // std::cout << "Start: " << start << "\n";
+        // std::cout << "End: " << end << "\n";
         if(dst_size[0] % tt::constants::TILE_WIDTH == 0 && dst_size[1] % tt::constants::TILE_HEIGHT == 0 &&
             start[2] % tt::constants::TILE_WIDTH == 0 && start[3] % tt::constants::TILE_HEIGHT == 0) {
             res = ttnn::slice(*parent, start, end);
@@ -441,12 +441,12 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
         else {
             // THIS is EXTREMELY SLOW. But it works
             tt::tt_metal::Tensor tmp = parent->cpu().to(tt::tt_metal::Layout::ROW_MAJOR).unpad(start, end);
-            std::cout << "TMP shape: " << tmp.shape() << std::endl;
+            // std::cout << "TMP shape: " << tmp.shape() << std::endl;
             res = ttnn::tilize_with_zero_padding(tmp.to(bufctx->device));
         }
 
-        std::cout << "TT shape: " << res.shape() << std::endl;
-        std::cout << "GGML expecting: " << tensor->ne[3] << " " << tensor->ne[2] << " " << tensor->ne[1] << " " << tensor->ne[0] << "\n";
+        // std::cout << "TT shape: " << res.shape() << std::endl;
+        // std::cout << "GGML expecting: " << tensor->ne[3] << " " << tensor->ne[2] << " " << tensor->ne[1] << " " << tensor->ne[0] << "\n";
         GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, res));
         return std::make_shared<tt::tt_metal::Tensor>(res);
     }
@@ -649,10 +649,10 @@ static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ct
             ret = ttnn::silu(*src_tensor);
             break;
         case GGML_UNARY_OP_HARDSWISH:
-            ret = ttnn::hardswish(*src_tensor, 1.f, 0.f);
+            ret = ttnn::hardswish(*src_tensor, 1.f/6.f, 0.5);
             break;
         case GGML_UNARY_OP_HARDSIGMOID:
-            ret = ttnn::hardsigmoid(*src_tensor, 0.f, 1.f);
+            ret = ttnn::hardsigmoid(*src_tensor, 1.f/6.f, 0.5);
             break;
         case GGML_UNARY_OP_STEP:
             // TODO: Make sure the resulting data type matches the input
@@ -1678,7 +1678,7 @@ ggml_backend_t ggml_backend_metalium_init(void) {
     const int device_id = 0;
     static std::once_flag once;
     std::call_once(once, [](){
-        // tt::tt_metal::detail::EnablePersistentKernelCache();
+        tt::tt_metal::detail::EnablePersistentKernelCache();
     });
 
     auto it = g_backend_map.find(device_id);
@@ -1696,7 +1696,7 @@ ggml_backend_t ggml_backend_metalium_init(void) {
 
     // store the device in the global map because tensor creation uses device ID but Metalium disallows opening the same device twice
     g_device_map[device_id] = ctx->device;
-    // ttnn::enable_program_cache(*ctx->device);
+    ttnn::enable_program_cache(*ctx->device);
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_metalium_guid(),

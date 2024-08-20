@@ -36,6 +36,7 @@
 #include <ttnn/operations/data_movement/concat/concat.hpp>
 #include <ttnn/operations/eltwise/unary/unary.hpp>
 #include <ttnn/operations/eltwise/unary/unary_composite.hpp>
+#include <ttnn/operations/experimental/copy/typecast/typecast.hpp>
 #include <tt_metal/detail/persistent_kernel_cache.hpp>
 #include <ttnn/operations/normalization/softmax/softmax.hpp>
 
@@ -1205,7 +1206,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     t = ttnn::tilize_with_zero_padding(t.to(bufctx->device));
     tt::tt_metal::DataType final_type = ggml2tt_type(ggtype, processor_class);
     if(final_type != t.dtype()) {
-        t = typecast(t, final_type);
+        t = ttnn::experimental::typecast(t, final_type);
     }
     GGML_ASSERT(t.storage_type() == tt::tt_metal::StorageType::DEVICE || t.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
     GGML_ASSERT(t.dtype() == final_type);
@@ -1244,7 +1245,7 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
     GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, *t));
     tt::tt_metal::Tensor holder;
     if(t->dtype() != tt::tt_metal::DataType::BFLOAT16 || t->dtype() != tt::tt_metal::DataType::FLOAT32) {
-        holder = tt::tt_metal::typecast(*t, tt::tt_metal::DataType::BFLOAT16);
+        holder = ttnn::experimental::typecast(*t, tt::tt_metal::DataType::BFLOAT16);
         t = std::make_shared<tt::tt_metal::Tensor>(std::move(holder));
     }
 
@@ -1677,7 +1678,7 @@ ggml_backend_t ggml_backend_metalium_init(void) {
     const int device_id = 0;
     static std::once_flag once;
     std::call_once(once, [](){
-        tt::tt_metal::detail::EnablePersistentKernelCache();
+        // tt::tt_metal::detail::EnablePersistentKernelCache();
     });
 
     auto it = g_backend_map.find(device_id);
@@ -1695,7 +1696,7 @@ ggml_backend_t ggml_backend_metalium_init(void) {
 
     // store the device in the global map because tensor creation uses device ID but Metalium disallows opening the same device twice
     g_device_map[device_id] = ctx->device;
-    ttnn::enable_program_cache(*ctx->device);
+    // ttnn::enable_program_cache(*ctx->device);
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_metalium_guid(),

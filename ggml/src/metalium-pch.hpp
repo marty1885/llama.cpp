@@ -26,7 +26,7 @@
 #include <ttnn/operations/eltwise/binary/binary.hpp>
 #include <ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp>
 #include <ttnn/operations/matmul/matmul.hpp>
-#include <ttnn/operations/kv_cache.hpp>
+#include <ttnn/operations/kv_cache/kv_cache.hpp>
 #include <ttnn/operations/data_movement/slice/slice.hpp>
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>

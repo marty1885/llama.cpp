@@ -24,7 +24,7 @@
 #include <ttnn/operations/eltwise/binary/binary.hpp>
 #include <ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp>
 #include <ttnn/operations/matmul/matmul.hpp>
-#include <ttnn/operations/kv_cache.hpp>
+#include <ttnn/operations/kv_cache/kv_cache.hpp>
 #include <ttnn/operations/data_movement/slice/slice.hpp>
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
@@ -33,6 +33,7 @@
 #include <ttnn/deprecated/tt_numpy/functions.hpp>
 #include <ttnn/operations/eltwise/unary/unary_composite.hpp>
 #include <ttnn/operations/data_movement/transpose/transpose.hpp>
+#include <ttnn/operations/data_movement/permute/permute.hpp>
 #include <ttnn/operations/data_movement/concat/concat.hpp>
 #include <ttnn/operations/eltwise/unary/unary.hpp>
 #include <ttnn/operations/eltwise/unary/unary_composite.hpp>
@@ -318,13 +319,13 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, [[maybe_unused]]
     for(size_t w = 0; w < shape[0]; w++) {
         for(size_t z = 0; z < shape[1]; z++) {
             for(size_t y = 0; y < shape[2]; y++) {
-                if(src_dst_same) {
-                    // optimization: copy a chunk of memory at a time
-                    const size_t src_idx = w * stride[0] + z * stride[1] + y * stride[2];
-                    memcpy((SrcType*)intermid + idx, buf.data() + src_idx, sizeof(SrcType) * shape[3]);
-                    idx += shape[3];
-                }
-                else {
+                // if(src_dst_same) {
+                //     // optimization: copy a chunk of memory at a time
+                //     const size_t src_idx = w * stride[0] + z * stride[1] + y * stride[2];
+                //     memcpy((SrcType*)intermid + idx, buf.data() + src_idx, sizeof(SrcType) * shape[3]);
+                //     idx += shape[3];
+                // }
+                // else {
                     for(size_t x = 0; x < shape[3]; x++) {
                         const size_t src_idx = w * stride[0] + z * stride[1] + y * stride[2] + x * stride[3];
                         GGML_ASSERT(src_idx < buf.size());
@@ -332,7 +333,7 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, [[maybe_unused]]
                         ((float*)intermid)[idx] = val;
                         idx++;
                     }
-                }
+                // }
             }
         }
     }
@@ -403,7 +404,6 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
     if(op == GGML_OP_TRANSPOSE) {
         auto patent = realize_ggml_view(src0);
         auto res = ttnn::transpose(*patent, -2, -1);
-        GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, res));
         return std::make_shared<tt::tt_metal::Tensor>(res);
     }
     if(op == GGML_OP_VIEW) {
@@ -431,9 +431,6 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
         std::reverse(start.begin(), start.end());
         std::reverse(end.begin(), end.end());
         tt::tt_metal::Tensor res;
-        // std::cout << "Parent shape: " << parent->shape() << "\n";
-        // std::cout << "Start: " << start << "\n";
-        // std::cout << "End: " << end << "\n";
         if(dst_size[0] % tt::constants::TILE_WIDTH == 0 && dst_size[1] % tt::constants::TILE_HEIGHT == 0 &&
             start[2] % tt::constants::TILE_WIDTH == 0 && start[3] % tt::constants::TILE_HEIGHT == 0) {
             res = ttnn::slice(*parent, start, end);
@@ -441,7 +438,10 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
         else {
             // THIS is EXTREMELY SLOW. But it works
             tt::tt_metal::Tensor tmp = parent->cpu().to(tt::tt_metal::Layout::ROW_MAJOR).unpad(start, end);
-            // std::cout << "TMP shape: " << tmp.shape() << std::endl;
+            std::cout << "Parent shape: " << parent->shape() << "\n";
+            std::cout << "Start: " << start << "\n";
+            std::cout << "End: " << end << "\n";
+            std::cout << "TMP shape: " << tmp.shape() << std::endl;
             res = ttnn::tilize_with_zero_padding(tmp.to(bufctx->device));
         }
 
@@ -461,25 +461,44 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
             ndiff += tensor->nb[i] != src0->nb[i];
         }
         GGML_ASSERT(ndiff != 1);
-        auto t = realize_ggml_view(src0);
 
+        auto t = realize_ggml_view(src0);
         if(ndiff == 0) {
             return t;
         }
 
-        // TODO: Only support the 2-axis special case for now
-        GGML_ASSERT(ndiff == 2);
-        std::array<int, 2> swapaxis;
-        int count = 0;
+        // TODO: Use a better algorithm. This one should work but does not 
+        // Guarentee the optimal result
+        std::vector<int64_t> dims(GGML_MAX_DIMS);
+        std::vector<bool> taken(GGML_MAX_DIMS, false);
         for(int i=0;i<GGML_MAX_DIMS;i++) {
-            if(tensor->nb[i] == src0->nb[i]) {
-                continue;
+            int target = -1;
+            for(int j=0;j<GGML_MAX_DIMS;j++) {
+                if(taken[j]) {
+                    continue;
+                }
+                if(tensor->nb[i] == src0->nb[j]) {
+                    target = j;
+                    taken[j] = true;
+                    break;
+                }
             }
-            swapaxis[count++] = GGML_MAX_DIMS - i -1;
+            GGML_ASSERT(target >= 0);
+            dims[i] = target;
+        }
+        for(int i=0;i<GGML_MAX_DIMS;i++) {
+            dims[i] = GGML_MAX_DIMS - dims[i] - 1;
         }
 
-        auto res = ttnn::transpose(*t,swapaxis[0], swapaxis[1]);
-        GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, res));
+        auto res = ttnn::permute(*t, dims);
+        if(!ggml_tt_tensors_shape_equal(tensor, res)) {
+            std::cout << "FATAL ERROR: Shape mismatch between TTNN and GGML after op " << ggml_op_name(op) << "\n"
+                << "  Permute order: " << dims[0] << " " << dims[1] << " " << dims[2] << " " << dims[3] << "\n"
+                << "  Input tensor shape: " << t->shape() << "\n"
+                << "  GGML expecting: " << tensor->ne[3] << " " << tensor->ne[2] << " " << tensor->ne[1] << " " << tensor->ne[0] << "\n"
+                << "  TTNN made: " << res.shape() << std::endl;
+            GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, res));
+        }
         return std::make_shared<tt::tt_metal::Tensor>(res);
     }
 
@@ -778,7 +797,7 @@ static void ggml_backend_metalium_set(ggml_backend_metalium_context * ctx, struc
     int batch_idx = offset / nb2;
     GGML_ASSERT(offset < nb3);
     GGML_ASSERT(offset % nb1 == 0);
-    auto res = tt::tt_metal::update_cache(*src0_meta->tensor, *src1_meta->tensor, idx, batch_idx);
+    auto res = ttnn::update_cache(*src0_meta->tensor, *src1_meta->tensor, idx, batch_idx);
     if(!inplace) {
         *dst_meta = {
             .tensor = std::make_shared<tt::tt_metal::Tensor>(res),
@@ -962,7 +981,7 @@ static bool ggml_backend_metalium_can_concat(const struct ggml_tensor * dst)
     int32_t dim = 0;
     memcpy(&dim, dst->op_params, sizeof(dim));
 
-    // TTNN requires tensors to be tile aligned if concat on the last 2 dimensions 
+    // TTNN requires tensors to be tile aligned if concat on the last 2 dimensions
     if(dim == 0 || dim == 1) {
         return src0->ne[dim] % 32 == 0 && src1->ne[dim] % 32 == 0;
     }
@@ -1458,31 +1477,31 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
             case GGML_OP_SET:
                 ggml_backend_metalium_set(ctx, node);
                 break;
-            
+
             case GGML_OP_CLAMP:
                 ggml_backend_metalium_clamp(ctx, node);
                 break;
-            
+
             case GGML_OP_SCALE:
                 ggml_backend_metalium_scale(ctx, node);
                 break;
-            
+
             case GGML_OP_GET_ROWS:
                 ggml_backend_metalium_get_row(ctx, node);
                 break;
-            
+
             case GGML_OP_NORM:
                 ggml_backend_metalium_norm(ctx, node, false);
                 break;
-            
+
             case GGML_OP_RMS_NORM:
                 ggml_backend_metalium_norm(ctx, node, true);
                 break;
-            
+
             case GGML_OP_ADD1:
                 ggml_backend_metalium_add1(ctx, node);
                 break;
-            
+
             case GGML_OP_SQRT:
                 ggml_backend_metalium_sqrt(ctx, node);
                 break;
@@ -1490,11 +1509,11 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
             case GGML_OP_SQR:
                 ggml_backend_metalium_sqr(ctx, node);
                 break;
-            
+
             case GGML_OP_CONCAT:
                 ggml_backend_metalium_concat(ctx, node);
                 break;
-            
+
             case GGML_OP_SOFT_MAX:
                 ggml_backend_metalium_softmax(ctx, node);
                 break;

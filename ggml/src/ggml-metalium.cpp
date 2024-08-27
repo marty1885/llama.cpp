@@ -250,19 +250,23 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, [[maybe_unused]]
     static_assert(std::is_same_v<SrcType, float> || std::is_same_v<SrcType, bfloat16>);
 
     tt::tt_metal::Tensor row_major_tensor = tensor.cpu().to(tt::tt_metal::Layout::ROW_MAJOR);
-    std::vector<SrcType> buf(padded_shape.volume()); // .volume() returns the underlying volume of the tensor not the logical one (TT enforces 32x32 tiles)
     GGML_ASSERT(row_major_tensor.storage_type() == StorageType::OWNED or row_major_tensor.storage_type() == StorageType::BORROWED);
     GGML_ASSERT(std::holds_alternative<OwnedStorage>(row_major_tensor.storage()) || std::holds_alternative<BorrowedStorage>(row_major_tensor.storage()));
+
+    std::span<SrcType> buf;
     if(std::holds_alternative<OwnedStorage>(row_major_tensor.storage())) {
         const OwnedStorage& owned = std::get<OwnedStorage>(row_major_tensor.storage());
-        memcpy(buf.data(), std::get<owned_buffer::Buffer<SrcType>>(owned.buffer).data(), padded_shape.volume() * sizeof(SrcType));
+        auto buffer = std::get<owned_buffer::Buffer<SrcType>>(owned.buffer);
+        buf = std::span<SrcType>(buffer.begin(), buffer.end());
     }
     else if(std::holds_alternative<BorrowedStorage>(row_major_tensor.storage())) {
         const BorrowedStorage& borrowed = std::get<BorrowedStorage>(row_major_tensor.storage());
-        memcpy(buf.data(), std::get<borrowed_buffer::Buffer<SrcType>>(borrowed.buffer).data(), padded_shape.volume() * sizeof(SrcType));
+        auto buffer = std::get<borrowed_buffer::Buffer<SrcType>>(borrowed.buffer);
+        buf = std::span<SrcType>(buffer.begin(), buffer.end());
     } else {
         GGML_ASSERT(false && "Unsupported buffer type");
     }
+    GGML_ASSERT(buf.size() != 0);
     // TODO: Measure the performance of the following code. This is much simpeer and does untiling on the device
     // But does not work for large tensors
     // row_major_tensor = ttnn::untilize(tensor);

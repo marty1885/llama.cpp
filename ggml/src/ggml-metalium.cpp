@@ -464,40 +464,27 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
         for(int i=0;i<GGML_MAX_DIMS;i++) {
             ndiff += tensor->nb[i] != src0->nb[i];
         }
-        GGML_ASSERT(ndiff != 1);
+        GGML_ASSERT(ndiff == 2);
 
         auto t = realize_ggml_view(src0);
         if(ndiff == 0) {
             return t;
         }
 
-        // TODO: Use a better algorithm. This one should work but does not 
-        // Guarentee the optimal result
-        std::vector<int64_t> dims(GGML_MAX_DIMS);
-        std::vector<bool> taken(GGML_MAX_DIMS, false);
-        for(int i=0;i<GGML_MAX_DIMS;i++) {
-            int target = -1;
-            for(int j=0;j<GGML_MAX_DIMS;j++) {
-                if(taken[j]) {
-                    continue;
-                }
-                if(tensor->nb[i] == src0->nb[j]) {
-                    target = j;
-                    taken[j] = true;
-                    break;
-                }
+        std::array<uint32_t, 2> swapaxis = {0, 1};
+        uint32_t count = 0;
+        for(uint32_t i=0;i<GGML_MAX_DIMS;i++) {
+            if(tensor->nb[i] != src0->nb[i]) {
+                swapaxis[count] = i;
+                count++;
             }
-            GGML_ASSERT(target >= 0);
-            dims[i] = target;
-        }
-        for(int i=0;i<GGML_MAX_DIMS;i++) {
-            dims[i] = GGML_MAX_DIMS - dims[i] - 1;
+            GGML_ASSERT(count <= swapaxis.size());
         }
 
-        auto res = ttnn::permute(*t, dims);
+        auto res = ttnn::transpose(*t, swapaxis[0], swapaxis[1]);
         if(!ggml_tt_tensors_shape_equal(tensor, res)) {
             std::cout << "FATAL ERROR: Shape mismatch between TTNN and GGML after op " << ggml_op_name(op) << "\n"
-                << "  Permute order: " << dims[0] << " " << dims[1] << " " << dims[2] << " " << dims[3] << "\n"
+                // << "  Permute order: " << dims[0] << " " << dims[1] << " " << dims[2] << " " << dims[3] << "\n"
                 << "  Input tensor shape: " << t->shape() << "\n"
                 << "  GGML expecting: " << tensor->ne[3] << " " << tensor->ne[2] << " " << tensor->ne[1] << " " << tensor->ne[0] << "\n"
                 << "  TTNN made: " << res.shape() << std::endl;

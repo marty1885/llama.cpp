@@ -1393,6 +1393,7 @@ static ggml_backend_buffer_type_i ggml_backend_metalium_buffer_type_interface = 
 ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(int device) {
     GGML_ASSERT((size_t)device < tt::tt_metal::GetNumAvailableDevices());
     static std::map<int, ggml_backend_buffer_type> buffer_type_map;
+    static std::set<std::unique_ptr<ggml_backend_metalium_buffer_type_context>> buffer_type_context_deleter;
 
     if(!g_device_map.contains(device)) {
         ggml_backend_metalium_init();
@@ -1403,12 +1404,17 @@ ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(int device) {
         return &buffer_type_map[device];
     }
 
+
+    auto bufctx = std::make_unique<ggml_backend_metalium_buffer_type_context>(
+        ggml_backend_metalium_buffer_type_context{
+            .device = g_device_map[device],
+            .name = "Metalium " + std::to_string(device),
+        });
+    auto* bufctx_ptr = bufctx.get();
+    buffer_type_context_deleter.insert(std::move(bufctx));
     buffer_type_map[device] = {
         /* .iface    = */ ggml_backend_metalium_buffer_type_interface,
-        /* .context  = */ new ggml_backend_metalium_buffer_type_context{
-            /* .device = */ g_device_map[device],
-            /* .name   = */ "Metalium " + std::to_string(device),
-        },
+        /* .context  = */ bufctx_ptr,
     };
     return &buffer_type_map[device];
 }
@@ -1628,7 +1634,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         case GGML_OP_ADD1:
         case GGML_OP_SQRT:
         case GGML_OP_SQR:
-        case GGML_OP_PERMUTE:
+        // case GGML_OP_PERMUTE: // FIXME: Needs fix https://github.com/tenstorrent/tt-metal/issues/11650
             return true;
 
         case GGML_OP_ADD:

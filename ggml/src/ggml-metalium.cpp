@@ -87,7 +87,7 @@ struct ggml_backend_metalium_buffer_context {
 struct TensorWithMetadata
 {
     std::shared_ptr<tt::tt_metal::Tensor> tensor;
-    ggml_type ggtype = (ggml_type)-1;
+    ggml_type ggtype = GGML_TYPE_COUNT;
     ggml_backend_metalium_buffer_context* bufctx = nullptr;
 };
 
@@ -1295,7 +1295,7 @@ ggml_backend_metalium_buffer_init_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_metalium_buffer_context * bufctx = (ggml_backend_metalium_buffer_context *)buffer->context;
     bufctx->metadata_to_free.push_back(std::make_unique<TensorWithMetadata>(TensorWithMetadata{
         .tensor = nullptr,
-        .ggtype = (ggml_type)-1,
+        .ggtype = GGML_TYPE_COUNT,
         .bufctx = bufctx
     }));
     tensor->extra = bufctx->metadata_to_free.back().get();

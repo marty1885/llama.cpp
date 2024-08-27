@@ -319,13 +319,13 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, [[maybe_unused]]
     for(size_t w = 0; w < shape[0]; w++) {
         for(size_t z = 0; z < shape[1]; z++) {
             for(size_t y = 0; y < shape[2]; y++) {
-                // if(src_dst_same) {
-                //     // optimization: copy a chunk of memory at a time
-                //     const size_t src_idx = w * stride[0] + z * stride[1] + y * stride[2];
-                //     memcpy((SrcType*)intermid + idx, buf.data() + src_idx, sizeof(SrcType) * shape[3]);
-                //     idx += shape[3];
-                // }
-                // else {
+                if(src_dst_same) {
+                    // optimization: copy a chunk of memory at a time
+                    const size_t src_idx = w * stride[0] + z * stride[1] + y * stride[2];
+                    memcpy((SrcType*)intermid + idx, buf.data() + src_idx, sizeof(SrcType) * shape[3]);
+                    idx += shape[3];
+                }
+                else {
                     for(size_t x = 0; x < shape[3]; x++) {
                         const size_t src_idx = w * stride[0] + z * stride[1] + y * stride[2] + x * stride[3];
                         GGML_ASSERT(src_idx < buf.size());
@@ -333,7 +333,7 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, [[maybe_unused]]
                         ((float*)intermid)[idx] = val;
                         idx++;
                     }
-                // }
+                }
             }
         }
     }

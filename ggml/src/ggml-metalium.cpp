@@ -255,11 +255,11 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, [[maybe_unused]]
     GGML_ASSERT(std::holds_alternative<OwnedStorage>(row_major_tensor.storage()) || std::holds_alternative<BorrowedStorage>(row_major_tensor.storage()));
     if(std::holds_alternative<OwnedStorage>(row_major_tensor.storage())) {
         const OwnedStorage& owned = std::get<OwnedStorage>(row_major_tensor.storage());
-        memcpy(buf.data(), std::get<owned_buffer::Buffer<SrcType>>(owned.buffer).data(), shape.volume() * sizeof(SrcType));
+        memcpy(buf.data(), std::get<owned_buffer::Buffer<SrcType>>(owned.buffer).data(), padded_shape.volume() * sizeof(SrcType));
     }
     else if(std::holds_alternative<BorrowedStorage>(row_major_tensor.storage())) {
         const BorrowedStorage& borrowed = std::get<BorrowedStorage>(row_major_tensor.storage());
-        memcpy(buf.data(), std::get<borrowed_buffer::Buffer<SrcType>>(borrowed.buffer).data(), shape.volume() * sizeof(SrcType));
+        memcpy(buf.data(), std::get<borrowed_buffer::Buffer<SrcType>>(borrowed.buffer).data(), padded_shape.volume() * sizeof(SrcType));
     } else {
         GGML_ASSERT(false && "Unsupported buffer type");
     }
@@ -438,10 +438,10 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
         else {
             // THIS is EXTREMELY SLOW. But it works
             tt::tt_metal::Tensor tmp = parent->cpu().to(tt::tt_metal::Layout::ROW_MAJOR).unpad(start, end);
-            std::cout << "Parent shape: " << parent->shape() << "\n";
-            std::cout << "Start: " << start << "\n";
-            std::cout << "End: " << end << "\n";
-            std::cout << "TMP shape: " << tmp.shape() << std::endl;
+            // std::cout << "Parent shape: " << parent->shape() << "\n";
+            // std::cout << "Start: " << start << "\n";
+            // std::cout << "End: " << end << "\n";
+            // std::cout << "TMP shape: " << tmp.shape() << std::endl;
             res = ttnn::tilize_with_zero_padding(tmp.to(bufctx->device));
         }
 

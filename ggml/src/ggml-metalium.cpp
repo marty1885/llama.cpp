@@ -679,7 +679,7 @@ static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ct
             break;
         case GGML_UNARY_OP_STEP:
             // TODO: Make sure the resulting data type matches the input
-            ret = ttnn::where(ttnn::gtz(*src_tensor), 1.f, 0.f);
+            ret = ttnn::experimental::typecast(ttnn::gtz(*src_tensor), ggml2tt_type(dst->type, tt::ARCH::GRAYSKULL));
             break;
         default:
             return false;
@@ -1188,6 +1188,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
 
     tt::ARCH processor_class = bufctx->device->arch();
     // only grayskull is supported for now.
+    // TODO: Wormhole support
     GGML_ASSERT(processor_class == tt::ARCH::GRAYSKULL);
 
     // TODO: See if we can use BorrowedStorage to avoid copying the data

@@ -378,8 +378,21 @@ static tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tens
 
     return tensor.reshape(target_shape);
 }
-
+static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_tensor* tensor);
 static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tensor)
+{
+    auto res = realize_ggml_view_impl(tensor);
+    if(!ggml_tt_tensors_shape_equal(tensor, *res)) {
+        std::cout << "FATAL ERROR: Shape mismatch between TTNN and GGML after view op " << ggml_op_name(tensor->op) << "\n"
+            << "  Result: " << res->shape() << "\n"
+            << "  GGML expecting: " << tensor->ne[3] << " " << tensor->ne[2] << " " << tensor->ne[1] << " " << tensor->ne[0] << "\n";
+        GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, *res));
+    }
+    return res;
+}
+
+
+static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_tensor* tensor)
 {
     // Since TTNN does not support the traditional view operation, we had to support it ourselves
     // This function, realize, extracts the data from the source tensor and creates a new tensor
@@ -443,21 +456,12 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
         else {
             // THIS is EXTREMELY SLOW. But it works
             tt::tt_metal::Tensor tmp = parent->cpu().to(tt::tt_metal::Layout::ROW_MAJOR).unpad(start, end);
-            // std::cout << "Parent shape: " << parent->shape() << "\n";
-            // std::cout << "Start: " << start << "\n";
-            // std::cout << "End: " << end << "\n";
-            // std::cout << "TMP shape: " << tmp.shape() << std::endl;
             res = ttnn::tilize_with_zero_padding(tmp.to(bufctx->device));
         }
-
-        // std::cout << "TT shape: " << res.shape() << std::endl;
-        // std::cout << "GGML expecting: " << tensor->ne[3] << " " << tensor->ne[2] << " " << tensor->ne[1] << " " << tensor->ne[0] << "\n";
-        GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, res));
         return std::make_shared<tt::tt_metal::Tensor>(res);
     }
     if(op == GGML_OP_RESHAPE) {
         auto t = realize_ggml_view(src0);
-        GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, *t));
         return std::make_shared<tt::tt_metal::Tensor>(reshape_tt_tensor_into_ggml(*t, tensor));
     }
     if(op == GGML_OP_PERMUTE) {
@@ -483,14 +487,6 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
         }
 
         auto res = ttnn::transpose(*t, swapaxis[0], swapaxis[1]);
-        if(!ggml_tt_tensors_shape_equal(tensor, res)) {
-            std::cout << "FATAL ERROR: Shape mismatch between TTNN and GGML after op " << ggml_op_name(op) << "\n"
-                // << "  Permute order: " << dims[0] << " " << dims[1] << " " << dims[2] << " " << dims[3] << "\n"
-                << "  Input tensor shape: " << t->shape() << "\n"
-                << "  GGML expecting: " << tensor->ne[3] << " " << tensor->ne[2] << " " << tensor->ne[1] << " " << tensor->ne[0] << "\n"
-                << "  TTNN made: " << res.shape() << std::endl;
-            GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, res));
-        }
         return std::make_shared<tt::tt_metal::Tensor>(res);
     }
 

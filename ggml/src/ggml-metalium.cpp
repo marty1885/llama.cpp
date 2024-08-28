@@ -426,6 +426,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor
         std::array<uint32_t, GGML_MAX_DIMS> start;
         std::array<uint32_t, GGML_MAX_DIMS> end;
 
+        // FIXME: Does not work when we are viewing into a permuted tensor. Sucks
         size_t remaining_offset = offset;
         for(size_t i = GGML_MAX_DIMS - 1; i < GGML_MAX_DIMS; i--) {
             start[i] = remaining_offset / src_stride[i];

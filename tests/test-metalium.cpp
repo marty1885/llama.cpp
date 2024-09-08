@@ -599,7 +599,7 @@ int main()
     double not_supported_ratio = (double)not_supported / total_tests;
     std::cout << "\nStats for Metalium backend: " << (total_tests != passed_tests ? "\033[1;31mFAIL\033[0m\n" : "\033[1;32mOK\033[0m\n") 
         << "  Test status: " << passed_tests << " / " << total_tests << " passed\n"
-        << "  Failed: " << total_tests - passed_tests - not_supported << " (" << (1.0 - passed_ratio - not_supported_ratio) * 100 << "%)\n"
+        << "  Failed: " << total_tests - passed_tests - not_supported << " (" << std::round(1.0 - passed_ratio - not_supported_ratio) * 100 << "%)\n"
         << "  Not supported: " << not_supported << "\n";
     
     bool failed = total_tests != passed_tests;

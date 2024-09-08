@@ -1705,7 +1705,7 @@ ggml_backend_t ggml_backend_metalium_init(void) {
         /* device_id         = */ device_id,
         /* name              = */ "Metalium " + std::to_string(device_id),
     };
-    AutoFormat::SetDefaultDevice(ctx->device);
+    ttnn::operations::experimental::auto_format::AutoFormat::SetDefaultDevice(ctx->device);
 
 
     // store the device in the global map because tensor creation uses device ID but Metalium disallows opening the same device twice

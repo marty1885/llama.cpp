@@ -40,5 +40,6 @@
 #include <ttnn/operations/eltwise/unary/unary_composite.hpp>
 #include <tt_metal/detail/persistent_kernel_cache.hpp>
 #include <ttnn/operations/normalization/softmax/softmax.hpp>
+#include <ttnn/operations/experimental/auto_format/auto_format.hpp>
 
 #endif

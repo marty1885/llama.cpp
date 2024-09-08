@@ -122,7 +122,7 @@ static tt::tt_metal::DataType ggml2tt_type_internal(ggml_type ggtype, tt::ARCH a
         static constexpr std::array<tt::tt_metal::DataType, GGML_TYPE_COUNT> table = {
             /*GGML_TYPE_F32 = */ tt::tt_metal::DataType::BFLOAT16,
             /*GGML_TYPE_F16 = */ tt::tt_metal::DataType::BFLOAT16,
-            /*GGML_TYPE_Q4_0 = */ tt::tt_metal::DataType::BFLOAT4_B,
+            /*GGML_TYPE_Q4_0 = */ tt::tt_metal::DataType::BFLOAT8_B,    // Using BFLOAT8_B for now as BFLOAT4_B is broken on Grayskull
             /*GGML_TYPE_Q4_1 = */ tt::tt_metal::DataType::INVALID,      // Does work but causes issues in unit tests
             tt::tt_metal::DataType::INVALID,
             tt::tt_metal::DataType::INVALID,
@@ -131,8 +131,8 @@ static tt::tt_metal::DataType ggml2tt_type_internal(ggml_type ggtype, tt::ARCH a
             /*GGML_TYPE_Q8_0 = */ tt::tt_metal::DataType::BFLOAT8_B,
             /*GGML_TYPE_Q8_1 = */ tt::tt_metal::DataType::BFLOAT8_B,
             /*GGML_TYPE_Q2_K = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_Q3_K = */ tt::tt_metal::DataType::BFLOAT4_B,
-            /*GGML_TYPE_Q4_K = */ tt::tt_metal::DataType::BFLOAT4_B,
+            /*GGML_TYPE_Q3_K = */ tt::tt_metal::DataType::BFLOAT8_B,   // Using BFLOAT8_B for now as BFLOAT4_B is broken on Grayskull
+            /*GGML_TYPE_Q4_K = */ tt::tt_metal::DataType::BFLOAT8_B,   // Using BFLOAT8_B for now as BFLOAT4_B is broken on Grayskull
             /*GGML_TYPE_Q5_K = */ tt::tt_metal::DataType::BFLOAT8_B,
             /*GGML_TYPE_Q6_K = */ tt::tt_metal::DataType::BFLOAT8_B,
             /*GGML_TYPE_Q8_K = */ tt::tt_metal::DataType::BFLOAT8_B,
@@ -1607,7 +1607,6 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         case GGML_OP_LEAKY_RELU:
         case GGML_OP_NONE:
         case GGML_OP_CONT:
-        case GGML_OP_VIEW:
         case GGML_OP_CPY:
         case GGML_OP_DUP:
         case GGML_OP_RESHAPE:
@@ -1621,6 +1620,12 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         case GGML_OP_SQR:
         // case GGML_OP_PERMUTE: // FIXME: Needs fix https://github.com/tenstorrent/tt-metal/issues/11650
             return true;
+
+        // TTNN can really only do unpad() so the source rank must be greater than or equal to the destination rank
+        // and must not be permuted as that's a sign of it being reshaped from another tensor. Which is costly due to
+        // TTNN not using row-major layout.
+        case GGML_OP_VIEW:
+            return ggml_n_dims(op) <= ggml_n_dims(src0) && ggml_is_permuted(op) == false && ggml_is_permuted(src0) == false;
 
         case GGML_OP_ADD:
         case GGML_OP_SUB:

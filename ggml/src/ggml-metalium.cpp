@@ -1074,6 +1074,56 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
     };
 }
 
+static void ggml_backend_metalium_cos(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
+{
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+    GGML_UNUSED(ctx);
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+
+    auto src = realize_ggml_view(src0);
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::cos(*src)),
+        .ggtype = dst->type,
+        .bufctx = ((TensorWithMetadata*)src0->extra)->bufctx
+    };
+}
+
+static void ggml_backend_metalium_sin(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
+{
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+    GGML_UNUSED(ctx);
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+
+    auto src = realize_ggml_view(src0);
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::sin(*src)),
+        .ggtype = dst->type,
+        .bufctx = ((TensorWithMetadata*)src0->extra)->bufctx
+    };
+}
+
+static void ggml_backend_metalium_log(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
+{
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+    GGML_UNUSED(ctx);
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+
+    auto src = realize_ggml_view(src0);
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::log(*src)),
+        .ggtype = dst->type,
+        .bufctx = ((TensorWithMetadata*)src0->extra)->bufctx
+    };
+}
 
 // backend interface
 
@@ -1513,6 +1563,18 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
             case GGML_OP_SOFT_MAX:
                 ggml_backend_metalium_softmax(ctx, node);
                 break;
+            
+            case GGML_OP_COS:
+                ggml_backend_metalium_cos(ctx, node);
+                break;
+            
+            case GGML_OP_SIN:
+                ggml_backend_metalium_sin(ctx, node);
+                break;
+
+            case GGML_OP_LOG:
+                ggml_backend_metalium_log(ctx, node);
+                break;
 
             case GGML_OP_NONE:
                 break;
@@ -1620,6 +1682,9 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         case GGML_OP_SQRT:
         case GGML_OP_SQR:
         // case GGML_OP_PERMUTE: // FIXME: Needs fix https://github.com/tenstorrent/tt-metal/issues/11650
+        // case GGML_OP_SIN:     // Sin and Cos disabled due to bug in TTNN until fixed
+        // case GGML_OP_COS:     // ref: https://github.com/tenstorrent/tt-metal/issues/12753
+        case GGML_OP_LOG:
             return true;
 
         // TTNN can really only do unpad() so the source rank must be greater than or equal to the destination rank

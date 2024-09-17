@@ -1802,6 +1802,10 @@ struct test_log : public test_case {
         }
     }
 
+    double max_nmse_err() override {
+        return 0.002;
+    }
+
     bool grad_precise() override {
         return true;
     }

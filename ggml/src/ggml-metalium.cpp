@@ -4,6 +4,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "ggml-impl.h"
 #include "ggml-metalium.h"
 
 #include "host_api.hpp"

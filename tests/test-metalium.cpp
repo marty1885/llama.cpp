@@ -198,7 +198,7 @@ struct test_case
 
         // add sentinels as graph nodes so that they are checked in the callback
         for (ggml_tensor * sentinel : sentinels) {
-            gf->nodes[gf->n_nodes++] = sentinel;
+            ggml_graph_add_node(gf, sentinel);
         }
 
         // randomize tensors

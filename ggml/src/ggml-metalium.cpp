@@ -451,7 +451,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         tt::tt_metal::Tensor res;
         if(dst_size[0] % tt::constants::TILE_WIDTH == 0 && dst_size[1] % tt::constants::TILE_HEIGHT == 0 &&
             start[2] % tt::constants::TILE_WIDTH == 0 && start[3] % tt::constants::TILE_HEIGHT == 0) {
-            res = ttnn::slice(*parent, start, end);
+            res = ttnn::slice(*parent, tt::tt_metal::LegacyShape(start), tt::tt_metal::LegacyShape(end), std::nullopt, tt::tt_metal::MemoryConfig());
         }
         else {
             // THIS is EXTREMELY SLOW. But it works
@@ -1204,7 +1204,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
         shape[i] = tensor->ne[GGML_MAX_DIMS - i - 1];
     }
 
-    tt::tt_metal::Tensor t(std::move(storage), tt::tt_metal::Shape(shape)
+    tt::tt_metal::Tensor t(std::move(storage), shape
         , tt::tt_metal::DataType::BFLOAT16, tt::tt_metal::Layout::ROW_MAJOR);
 
     // I think we can allow this.. right?
@@ -1293,7 +1293,7 @@ ggml_backend_metalium_buffer_init_tensor(ggml_backend_buffer_t buffer,
         TensorWithMetadata* meta = (TensorWithMetadata*)tensor->extra;
         std::vector<uint32_t> shape(tensor->ne, tensor->ne + GGML_MAX_DIMS);
         std::reverse(shape.begin(), shape.end());
-        auto t = tt::numpy::zeros(tt::numpy::Shape(shape), ggml2tt_type(tensor->type, bufctx->device->arch()));
+        auto t = tt::numpy::zeros(shape, ggml2tt_type(tensor->type, bufctx->device->arch()));
         t = ttnn::tilize_with_zero_padding(t.to(bufctx->device));
         meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(t));
     }

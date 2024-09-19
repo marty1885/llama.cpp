@@ -415,6 +415,55 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         return std::make_shared<tt::tt_metal::Tensor>(res);
     }
     if(op == GGML_OP_VIEW) {
+
+        std::shared_ptr<tt::tt_metal::Tensor> parent = realize_ggml_view(tensor->view_src);
+        std::array dst_size = std::to_array(tensor->ne);
+        std::array dst_stride = std::to_array(tensor->nb);
+        std::array src_size = std::to_array(src0->ne);
+        std::array src_stride = std::to_array(src0->nb);
+        size_t offset = tensor->view_offs;
+        ggml_backend_metalium_buffer_context* bufctx = ((TensorWithMetadata*)tensor->extra)->bufctx;
+
+        // TODO: Generalize this to use permute instead of transpose
+        std::optional<std::pair<uint32_t, uint32_t>> axisswap;
+        for (int i = 0; i < ggml_n_dims(tensor); ++i) {
+            size_t expected_stride = tensor->nb[0];
+            for (int j = 0; j < i; ++j) {
+                expected_stride *= tensor->ne[j];
+            }
+            // std::cout << "  Axis " << i << " stride: " << tensor->nb[i] << " expected: " << expected_stride << std::endl;
+            if (tensor->nb[i] != expected_stride) {
+                if (!axisswap) {
+                    axisswap = std::make_pair(i, 1000);
+                } else if (axisswap->second == 1000) {
+                    axisswap->second = i;
+                } else {
+                    GGML_ASSERT(false && "More than one axis swap detected");
+                }
+            }
+        }
+        // TODO: Do something with axisswap. I think some ops needs this but it haven't crashed yet
+
+        // Fast path if we can just return the parent tensor (view is a no-op)
+        if(dst_size == src_size && dst_stride == src_stride && offset == 0) {
+            return parent;
+        }
+        std::array<uint32_t, GGML_MAX_DIMS> start;
+        std::array<uint32_t, GGML_MAX_DIMS> end;
+
+        // FIXME: Does not work when we are viewing into a permuted tensor. Sucks
+        size_t remaining_offset = offset;
+        for(size_t i = GGML_MAX_DIMS - 1; i < GGML_MAX_DIMS; i--) {
+            start[i] = remaining_offset / src_stride[i];
+            end[i] = dst_size[i] + start[i] - 1;
+            remaining_offset = remaining_offset % src_stride[i];
+        }
+        std::reverse(start.begin(), start.end());
+        std::reverse(end.begin(), end.end());
+        tt::tt_metal::Tensor res;
+
+        // Debug prints to help debug complicated view operations
+#if 0
         std::cout << "\nrealize_ggml_view() OP: " << ggml_op_desc(tensor) << std::endl;
         std::cout << "  dst shape: " << tensor->ne[0] << " " << tensor->ne[1] << " " << tensor->ne[2] << " " << tensor->ne[3] << std::endl;
         std::cout << "  dst stride: " << tensor->nb[0] << " " << tensor->nb[1] << " " << tensor->nb[2] << " " << tensor->nb[3] << std::endl;
@@ -435,44 +484,32 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         std::cout << "  src0 shape: " << src0->ne[0] << " " << src0->ne[1] << " " << src0->ne[2] << " " << src0->ne[3] << std::endl;
         std::cout << "  src0 stride: " << src0->nb[0] << " " << src0->nb[1] << " " << src0->nb[2] << " " << src0->nb[3] << std::endl;
         std::cout << "  src0 OP: " << ggml_op_desc(src0) << std::endl;
-
-        
-        std::shared_ptr<tt::tt_metal::Tensor> parent = realize_ggml_view(tensor->view_src);
         std::cout << "TT parent shape: " << parent->shape() << std::endl;
-        std::array dst_size = std::to_array(tensor->ne);
-        std::array dst_stride = std::to_array(tensor->nb);
-        std::array src_size = std::to_array(src0->ne);
-        std::array src_stride = std::to_array(src0->nb);
-        size_t offset = tensor->view_offs;
-        ggml_backend_metalium_buffer_context* bufctx = ((TensorWithMetadata*)tensor->extra)->bufctx;
-
-        // Fast path if we can just return the parent tensor (view is a no-op)
-        if(dst_size == src_size && dst_stride == src_stride && offset == 0) {
-            return parent;
-        }
-        std::array<uint32_t, GGML_MAX_DIMS> start;
-        std::array<uint32_t, GGML_MAX_DIMS> end;
-
-        // FIXME: Does not work when we are viewing into a permuted tensor. Sucks
-        size_t remaining_offset = offset;
-        for(size_t i = GGML_MAX_DIMS - 1; i < GGML_MAX_DIMS; i--) {
-            start[i] = remaining_offset / src_stride[i];
-            end[i] = dst_size[i] + start[i] - 1;
-            remaining_offset = remaining_offset % src_stride[i];
-        }
-        std::reverse(start.begin(), start.end());
-        std::reverse(end.begin(), end.end());
-        tt::tt_metal::Tensor res;
         std::cout << "TT slice start: " << start[0] << " " << start[1] << " " << start[2] << " " << start[3] << std::endl;
         std::cout << "TT slice end: " << end[0] << " " << end[1] << " " << end[2] << " " << end[3] << std::endl;
+#endif
+        // The following if statements are handlers for special cases
         // Actually a reshape written as a slice
         if(offset == 0 && ggml_nelements(src0) == ggml_nelements(tensor)) {
-            return std::make_shared<tt::tt_metal::Tensor>(reshape_tt_tensor_into_ggml(*parent, tensor));
+            res = reshape_tt_tensor_into_ggml(*parent, tensor);
         }
-        if(dst_size[0] % tt::constants::TILE_WIDTH == 0 && dst_size[1] % tt::constants::TILE_HEIGHT == 0 &&
+        // Trying to convert a flat 1D tensor to N-D tensor (potentially with an offset)
+        else if(ggml_n_dims(src0) == 1) {
+            // slow: grab the source tensor and unpad it
+            tt::tt_metal::LegacyShape start{0, 0, 0, uint32_t(offset / ggml_type_size(src0->type))};
+            auto dst_volume = ggml_nelements(tensor);
+            tt::tt_metal::LegacyShape end({0, 0, 0, uint32_t(dst_volume - 1) + start[3]});
+            auto t = parent->cpu().to(tt::tt_metal::Layout::ROW_MAJOR).unpad(start, end);
+            // TODO: I'm lazy and this copy is completely unnecessary. Only here because reshape_tt_tensor_into_ggml() needs a device tensor
+            t = ttnn::tilize_with_zero_padding(t.to(bufctx->device));
+            res = reshape_tt_tensor_into_ggml(t, tensor);
+        }
+        // The fast path, this is what TTNN is designed for
+        else if(dst_size[0] % tt::constants::TILE_WIDTH == 0 && dst_size[1] % tt::constants::TILE_HEIGHT == 0 &&
             start[2] % tt::constants::TILE_WIDTH == 0 && start[3] % tt::constants::TILE_HEIGHT == 0) {
             res = ttnn::slice(*parent, tt::tt_metal::LegacyShape(start), tt::tt_metal::LegacyShape(end), std::nullopt, tt::tt_metal::MemoryConfig());
         }
+        // Unpad on the CPU and then pad back on the device
         else {
             // THIS is EXTREMELY SLOW. But it works
             tt::tt_metal::Tensor tmp = parent->cpu().to(tt::tt_metal::Layout::ROW_MAJOR).unpad(start, end);
@@ -1593,11 +1630,11 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
             case GGML_OP_SOFT_MAX:
                 ggml_backend_metalium_softmax(ctx, node);
                 break;
-            
+
             case GGML_OP_COS:
                 ggml_backend_metalium_cos(ctx, node);
                 break;
-            
+
             case GGML_OP_SIN:
                 ggml_backend_metalium_sin(ctx, node);
                 break;

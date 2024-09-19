@@ -6,11 +6,13 @@
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "ggml-impl.h"
 #include "ggml-metalium.h"
 
 #include "host_api.hpp"
 #include "impl/dispatch/command_queue.hpp"
 #include "ttnn/operations/eltwise/unary/unary.hpp"
+#include "ttnn/operations/experimental/auto_format/auto_format.hpp"
 #include "ttnn/operations/normalization/softmax/device/softmax_op.hpp"
 #include "ttnn/tensor/types.hpp"
 #include <algorithm>
@@ -26,6 +28,7 @@
 #include <ttnn/operations/eltwise/binary/binary.hpp>
 #include <ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp>
 #include <ttnn/operations/matmul/matmul.hpp>
+#include <ttnn/operations/moreh/moreh_matmul/moreh_matmul.hpp>
 #include <ttnn/operations/kv_cache/kv_cache.hpp>
 #include <ttnn/operations/data_movement/slice/slice.hpp>
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
@@ -35,11 +38,16 @@
 #include <ttnn/deprecated/tt_numpy/functions.hpp>
 #include <ttnn/operations/eltwise/unary/unary_composite.hpp>
 #include <ttnn/operations/data_movement/transpose/transpose.hpp>
+#include <ttnn/operations/data_movement/permute/permute.hpp>
 #include <ttnn/operations/data_movement/concat/concat.hpp>
 #include <ttnn/operations/eltwise/unary/unary.hpp>
 #include <ttnn/operations/eltwise/unary/unary_composite.hpp>
+#include <ttnn/operations/experimental/copy/typecast/typecast.hpp>
 #include <tt_metal/detail/persistent_kernel_cache.hpp>
 #include <ttnn/operations/normalization/softmax/softmax.hpp>
-#include <ttnn/operations/experimental/auto_format/auto_format.hpp>
 
+
+#include <memory>
+#include <type_traits>
+#include <variant>
 #endif

@@ -10,6 +10,7 @@
 #include "host_api.hpp"
 #include "impl/dispatch/command_queue.hpp"
 #include "ttnn/operations/eltwise/unary/unary.hpp"
+#include "ttnn/operations/experimental/auto_format/auto_format.hpp"
 #include "ttnn/operations/normalization/softmax/device/softmax_op.hpp"
 #include "ttnn/tensor/types.hpp"
 #include <algorithm>
@@ -370,14 +371,17 @@ static tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tens
         target_shape[i] = node->ne[GGML_MAX_DIMS - i - 1];
     }
 
-    if(node->ne[0] % tt::constants::TILE_WIDTH != 0 || node->ne[1] % tt::constants::TILE_HEIGHT != 0) {
+    if(node->ne[0] % tt::constants::TILE_WIDTH != 0 || node->ne[1] % tt::constants::TILE_HEIGHT != 0 ||
+        tensor.shape()[2] < tt::constants::TILE_HEIGHT || tensor.shape()[3] < tt::constants::TILE_WIDTH) {
         // This path is SLOW. Reshape on a tilized tensor only works when the last two dimensions are tile aligned
-        tt::tt_metal::Tensor row_major_tensor = ttnn::untilize(tensor);
+        tt::tt_metal::LegacyShape begin({0, 0, 0, 0});
+        tt::tt_metal::LegacyShape end({tensor.shape()[0]-1, tensor.shape()[1]-1, tensor.shape()[2]-1, tensor.shape()[3]-1});
+
+        tt::tt_metal::Tensor row_major_tensor = ttnn::untilize(tensor).cpu().unpad(begin, end);
         tt::tt_metal::Tensor reshaped = row_major_tensor.reshape(target_shape);
-        tt::tt_metal::Tensor ret = ttnn::tilize_with_zero_padding(reshaped);
+        tt::tt_metal::Tensor ret = ttnn::tilize_with_zero_padding(reshaped.to(tensor.device()));
         return ret;
     }
-
     return tensor.reshape(target_shape);
 }
 static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_tensor* tensor);
@@ -403,21 +407,6 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
     ggml_tensor* src0 = tensor->src[0];
     ggml_op op = tensor->op;
 
-    // std::cout << "\nrealize_ggml_view() OP: " << ggml_op_desc(tensor) << std::endl;
-    // std::cout << "  dst shape: " << tensor->ne[0] << " " << tensor->ne[1] << " " << tensor->ne[2] << " " << tensor->ne[3] << std::endl;
-    // std::cout << "  dst stride: " << tensor->nb[0] << " " << tensor->nb[1] << " " << tensor->nb[2] << " " << tensor->nb[3] << std::endl;
-    // std::cout << "  dst extra: " << tensor->extra << std::endl;
-    // if(tensor->extra != nullptr) {
-    //     TensorWithMetadata* meta = (TensorWithMetadata*)tensor->extra;
-    //     std::cout << "  dst tensor: " << meta->tensor << std::endl;
-    //     if(meta->tensor != nullptr) {
-    //         std::cout << "  dst tensor shape: " << meta->tensor->shape() << std::endl;
-    //     }
-    // }
-    // std::cout << "  dst data: " << tensor->data << std::endl;
-    // std::cout << "  dst view_src: " << tensor->view_src << std::endl;
-    // std::cout << "  dst src0: " << src0 << std::endl;
-    // std::cout << "  dst src1: " << tensor->src[1] << std::endl;
 
     // Do we really need to lazy evaluate this? Currently transpose is eagerly evaluated
     if(op == GGML_OP_TRANSPOSE) {
@@ -426,7 +415,30 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         return std::make_shared<tt::tt_metal::Tensor>(res);
     }
     if(op == GGML_OP_VIEW) {
+        std::cout << "\nrealize_ggml_view() OP: " << ggml_op_desc(tensor) << std::endl;
+        std::cout << "  dst shape: " << tensor->ne[0] << " " << tensor->ne[1] << " " << tensor->ne[2] << " " << tensor->ne[3] << std::endl;
+        std::cout << "  dst stride: " << tensor->nb[0] << " " << tensor->nb[1] << " " << tensor->nb[2] << " " << tensor->nb[3] << std::endl;
+        std::cout << "  dst extra: " << tensor->extra << std::endl;
+        if(tensor->extra != nullptr) {
+            TensorWithMetadata* meta = (TensorWithMetadata*)tensor->extra;
+            std::cout << "  dst tensor: " << meta->tensor << std::endl;
+            if(meta->tensor != nullptr) {
+                std::cout << "  dst tensor shape: " << meta->tensor->shape() << std::endl;
+            }
+        }
+        std::cout << "  dst data: " << tensor->data << std::endl;
+        std::cout << "  dst view_src: " << tensor->view_src << std::endl;
+        std::cout << "  dst view_src shape: " << tensor->view_src->ne[0] << " " << tensor->view_src->ne[1] << " " << tensor->view_src->ne[2] << " " << tensor->view_src->ne[3] << std::endl;
+        std::cout << "  dst view_src stride: " << tensor->view_src->nb[0] << " " << tensor->view_src->nb[1] << " " << tensor->view_src->nb[2] << " " << tensor->view_src->nb[3] << std::endl;
+        std::cout << "  dst src0: " << src0 << std::endl;
+        std::cout << "  dst src1: " << tensor->src[1] << std::endl;
+        std::cout << "  src0 shape: " << src0->ne[0] << " " << src0->ne[1] << " " << src0->ne[2] << " " << src0->ne[3] << std::endl;
+        std::cout << "  src0 stride: " << src0->nb[0] << " " << src0->nb[1] << " " << src0->nb[2] << " " << src0->nb[3] << std::endl;
+        std::cout << "  src0 OP: " << ggml_op_desc(src0) << std::endl;
+
+        
         std::shared_ptr<tt::tt_metal::Tensor> parent = realize_ggml_view(tensor->view_src);
+        std::cout << "TT parent shape: " << parent->shape() << std::endl;
         std::array dst_size = std::to_array(tensor->ne);
         std::array dst_stride = std::to_array(tensor->nb);
         std::array src_size = std::to_array(src0->ne);
@@ -451,6 +463,12 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         std::reverse(start.begin(), start.end());
         std::reverse(end.begin(), end.end());
         tt::tt_metal::Tensor res;
+        std::cout << "TT slice start: " << start[0] << " " << start[1] << " " << start[2] << " " << start[3] << std::endl;
+        std::cout << "TT slice end: " << end[0] << " " << end[1] << " " << end[2] << " " << end[3] << std::endl;
+        // Actually a reshape written as a slice
+        if(offset == 0 && ggml_nelements(src0) == ggml_nelements(tensor)) {
+            return std::make_shared<tt::tt_metal::Tensor>(reshape_tt_tensor_into_ggml(*parent, tensor));
+        }
         if(dst_size[0] % tt::constants::TILE_WIDTH == 0 && dst_size[1] % tt::constants::TILE_HEIGHT == 0 &&
             start[2] % tt::constants::TILE_WIDTH == 0 && start[3] % tt::constants::TILE_HEIGHT == 0) {
             res = ttnn::slice(*parent, tt::tt_metal::LegacyShape(start), tt::tt_metal::LegacyShape(end), std::nullopt, tt::tt_metal::MemoryConfig());
@@ -1703,7 +1721,8 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         // and must not be permuted as that's a sign of it being reshaped from another tensor. Which is costly due to
         // TTNN not using row-major layout.
         case GGML_OP_VIEW:
-            return ggml_n_dims(op) <= ggml_n_dims(src0) && ggml_is_permuted(op) == false && ggml_is_permuted(src0) == false;
+            // return ggml_n_dims(op) <= ggml_n_dims(src0) && ggml_is_permuted(op) == false && ggml_is_permuted(src0) == false;
+            return true;
 
         case GGML_OP_ADD:
         case GGML_OP_SUB:

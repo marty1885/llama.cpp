@@ -25,6 +25,7 @@
 #include <ttnn/operations/eltwise/binary/binary.hpp>
 #include <ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp>
 #include <ttnn/operations/matmul/matmul.hpp>
+#include <ttnn/operations/moreh/moreh_matmul/moreh_matmul.hpp>
 #include <ttnn/operations/kv_cache/kv_cache.hpp>
 #include <ttnn/operations/data_movement/slice/slice.hpp>
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
@@ -579,15 +580,26 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     TensorWithMetadata* cm = (TensorWithMetadata*)dst->extra;
 
     GGML_ASSERT(cm != NULL);
-    auto aT = ttnn::transpose(a, -2, -1);
     // TODO: Ask TT to support multiplication of pre-transposed tensors. Calling transpose here is inefficient
     // https://github.com/tenstorrent/tt-metal/issues/9709
-    ttnn::operations::matmul::Matmul cfg = ttnn::operations::matmul::Matmul{};
-    *cm = {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::operations::matmul::matmul(b, aT, std::nullopt, cfg)),
-        .ggtype = dst->type,
-        .bufctx = cm->bufctx
-    };
+
+    if(a.dtype() == tt::tt_metal::DataType::BFLOAT16 && b.dtype() == tt::tt_metal::DataType::BFLOAT16) {
+        // Fast path
+        *cm = {
+            .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::moreh_matmul(b, a, false, true, std::nullopt, std::nullopt, std::nullopt, std::nullopt)),
+            .ggtype = dst->type,
+            .bufctx = cm->bufctx
+        };
+    }
+    else {
+        auto aT = ttnn::transpose(a, -2, -1);
+        ttnn::operations::matmul::Matmul cfg = ttnn::operations::matmul::Matmul{};
+        *cm = {
+            .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::operations::matmul::matmul(b, aT, std::nullopt, cfg)),
+            .ggtype = dst->type,
+            .bufctx = cm->bufctx
+        };
+    }
     GGML_ASSERT(cm->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE || cm->tensor->storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
     GGML_UNUSED(ctx);
 }

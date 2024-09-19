@@ -527,6 +527,16 @@ int main()
         ggml_tensor* b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 64, 10);
         return ggml_mul_mat(ctx, a, b);
     }, "3D matrix multiplication"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 32);
+        ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+        return ggml_mul_mat(ctx, a, b);
+    }, "matrix-vector multiplication"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 24, 18);
+        ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 24);
+        return ggml_mul_mat(ctx, a, b);
+    }, "matrix-vector multiplication non tile aligned"));
     // TODO: TTNN does not support the style of broadcasting GGML wants
     // Failing
     // tests.push_back(make_test([](ggml_context* ctx) {

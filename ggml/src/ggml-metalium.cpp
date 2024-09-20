@@ -733,6 +733,9 @@ static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ct
             // TODO: Make sure the resulting data type matches the input
             ret = ttnn::experimental::typecast(ttnn::gtz(*src_tensor), ggml2tt_type(dst->type, tt::ARCH::GRAYSKULL));
             break;
+        case GGML_UNARY_OP_EXP:
+            ret = ttnn::exp(*src_tensor);
+            break;
         default:
             return false;
     }
@@ -1561,6 +1564,7 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
                 case GGML_UNARY_OP_HARDSWISH:
                 case GGML_UNARY_OP_HARDSIGMOID:
                 case GGML_UNARY_OP_STEP:
+                case GGML_UNARY_OP_EXP:
                     ok = ggml_backend_metalium_activations(ctx, node, unary_op);
                     break;
                 default:
@@ -1730,6 +1734,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
                 case GGML_UNARY_OP_HARDSWISH:
                 case GGML_UNARY_OP_HARDSIGMOID:
                 case GGML_UNARY_OP_STEP:
+                case GGML_UNARY_OP_EXP:
                     return true;
                 default:
                     return false;
@@ -1752,22 +1757,20 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
         // case GGML_OP_SIN:     // Sin and Cos disabled due to bug in TTNN until fixed
         // case GGML_OP_COS:     // ref: https://github.com/tenstorrent/tt-metal/issues/12753
         case GGML_OP_LOG:
-            return true;
-
         // TTNN can really only do unpad() so the source rank must be greater than or equal to the destination rank
         // and must not be permuted as that's a sign of it being reshaped from another tensor. Which is costly due to
         // TTNN not using row-major layout.
         case GGML_OP_VIEW:
-            // return ggml_n_dims(op) <= ggml_n_dims(src0) && ggml_is_permuted(op) == false && ggml_is_permuted(src0) == false;
             return true;
 
         case GGML_OP_ADD:
         case GGML_OP_SUB:
-        case GGML_OP_DIV:
         case GGML_OP_MUL:
-            // DIV does not support broadcasting on TTNN
-            return tensor_supported(src1) &&
-                (memcmp(src0->ne, src1->ne, sizeof(src0->ne)) == 0 || (numpy_broadcast_rule(src0, src1) && op->op != GGML_OP_DIV));
+            return tensor_supported(src1) && numpy_broadcast_rule(src0, src1);
+        // DIV does not support broadcasting on TTNN
+        case GGML_OP_DIV:
+            return tensor_supported(src1) && memcmp(src0->ne, src1->ne, sizeof(src0->ne)) == 0;
+
         case GGML_OP_MUL_MAT:
             return tensor_supported(src1) && ggml_backend_metalium_can_mul_mat(op);
         case GGML_OP_SET:

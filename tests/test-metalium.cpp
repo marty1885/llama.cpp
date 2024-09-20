@@ -333,6 +333,7 @@ int main()
         GGML_UNARY_OP_SILU,
         GGML_UNARY_OP_HARDSWISH,
         GGML_UNARY_OP_HARDSIGMOID,
+        GGML_UNARY_OP_EXP,
     };
 
     // TODO: Add more types
@@ -576,6 +577,13 @@ int main()
         ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 24);
         return ggml_mul_mat(ctx, a, b);
     }, "matrix-vector multiplication non tile aligned"));
+
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2048, 64);
+        ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2048);
+        return ggml_add(ctx, a, b);
+    }, "Add broadcasted vector to matrix"));
+
     // TODO: TTNN does not support the style of broadcasting GGML wants
     // Failing
     // tests.push_back(make_test([](ggml_context* ctx) {

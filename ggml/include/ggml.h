@@ -534,6 +534,7 @@ extern "C" {
 
         GGML_OP_CROSS_ENTROPY_LOSS,
         GGML_OP_CROSS_ENTROPY_LOSS_BACK,
+        GGML_OP_OPT_STEP_ADAMW,
 
         GGML_OP_COUNT,
     };
@@ -569,12 +570,15 @@ extern "C" {
         GGML_LOG_LEVEL_WARN  = 2,
         GGML_LOG_LEVEL_ERROR = 3,
         GGML_LOG_LEVEL_DEBUG = 4,
+        GGML_LOG_LEVEL_CONT  = 5, // continue previous log
     };
 
+    // this tensor...
     enum ggml_tensor_flag {
-        GGML_TENSOR_FLAG_INPUT  = 1,
-        GGML_TENSOR_FLAG_OUTPUT = 2,
-        GGML_TENSOR_FLAG_PARAM  = 4,
+        GGML_TENSOR_FLAG_INPUT    = 1, // ...is an input for the GGML compute graph
+        GGML_TENSOR_FLAG_OUTPUT   = 2, // ...is an output for the GGML compute graph
+        GGML_TENSOR_FLAG_PARAM    = 4, // ...contains trainable parameters
+        GGML_TENSOR_FLAG_LOSS     = 8, // ...defines loss for numerical optimization (multiple loss tensors add up)
     };
 
     // n-dimensional tensor
@@ -1976,6 +1980,9 @@ extern "C" {
     typedef void (*ggml_custom2_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, const struct ggml_tensor * b, int ith, int nth, void * userdata);
     typedef void (*ggml_custom3_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, const struct ggml_tensor * b, const struct ggml_tensor * c, int ith, int nth, void * userdata);
 
+#define GGML_N_TASKS_MAX (-1)
+    // n_tasks == GGML_N_TASKS_MAX means to use max number of tasks
+
     GGML_API struct ggml_tensor * ggml_map_custom1(
             struct ggml_context   * ctx,
             struct ggml_tensor    * a,
@@ -2037,23 +2044,44 @@ extern "C" {
             struct ggml_tensor          * b,
             struct ggml_tensor          * c);
 
+    // AdamW optimizer step
+    // Paper: https://arxiv.org/pdf/1711.05101v3.pdf
+    // PyTorch: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
+    GGML_API struct ggml_tensor * ggml_opt_step_adamw(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 alpha,
+            float                 beta1,
+            float                 beta2,
+            float                 eps,
+            float                 wd); // weight decay
+
     //
     // automatic differentiation
     //
 
-    GGML_API void ggml_set_param(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * tensor);
+    GGML_API void ggml_set_param(struct ggml_context * ctx, struct ggml_tensor * tensor);
+    GGML_API void ggml_set_loss(struct ggml_tensor * tensor);
 
     GGML_API void ggml_build_forward_expand (struct ggml_cgraph * cgraph, struct ggml_tensor * tensor);
-    GGML_API void ggml_build_backward_expand(struct ggml_context * ctx, struct ggml_cgraph * gf, struct ggml_cgraph * gb, bool keep);
+    GGML_API void ggml_build_backward_expand(struct ggml_context * ctx, struct ggml_cgraph * gf, struct ggml_cgraph * gb, bool accumulate, bool keep);
+
+    GGML_API void ggml_build_opt_adamw(
+            struct ggml_context * ctx,
+            struct ggml_cgraph  * gf,
+            struct ggml_cgraph  * gb,
+            float                 alpha,
+            float                 beta1,
+            float                 beta2,
+            float                 eps,
+            float                 wd); // weight decay
 
     // graph allocation in a context
     GGML_API struct ggml_cgraph * ggml_new_graph       (struct ggml_context * ctx); // size = GGML_DEFAULT_GRAPH_SIZE, grads = false
     GGML_API struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t size, bool grads);
     GGML_API struct ggml_cgraph * ggml_graph_dup       (struct ggml_context * ctx, struct ggml_cgraph * cgraph);
     GGML_API void                 ggml_graph_cpy       (struct ggml_cgraph * src, struct ggml_cgraph * dst);
-    GGML_API void                 ggml_graph_reset     (struct ggml_cgraph * cgraph);  // zero grads
+    GGML_API void                 ggml_graph_reset     (struct ggml_cgraph * cgraph); // set regular grads + optimizer momenta to 0, set loss grad to 1
     GGML_API void                 ggml_graph_clear     (struct ggml_cgraph * cgraph);
 
     GGML_API int                   ggml_graph_size   (struct ggml_cgraph * cgraph);
@@ -2478,6 +2506,9 @@ extern "C" {
     GGML_API int ggml_cpu_has_matmul_int8(void);
     GGML_API int ggml_cpu_has_cann       (void);
     GGML_API int ggml_cpu_has_llamafile  (void);
+
+    // get the sve vector length in bytes
+    GGML_API int ggml_cpu_get_sve_cnt(void);
 
     //
     // Internal types and functions exposed for tests and benchmarks

@@ -33,7 +33,7 @@
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
 #include <ttnn/operations/data_movement/untilize/untilize.hpp>
 #include <ttnn/operations/experimental/transformer/nlp_kv_cache_load_slice/nlp_kv_cache_load_slice.hpp>
-#include <ttnn/deprecated/tt_numpy/functions.hpp>
+#include <ttnn/operations/creation.hpp>
 #include <ttnn/operations/eltwise/unary/unary_composite.hpp>
 #include <ttnn/operations/data_movement/transpose/transpose.hpp>
 #include <ttnn/operations/data_movement/permute/permute.hpp>
@@ -507,7 +507,8 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         // The fast path, this is what TTNN is designed for
         else if(dst_size[0] % tt::constants::TILE_WIDTH == 0 && dst_size[1] % tt::constants::TILE_HEIGHT == 0 &&
             start[2] % tt::constants::TILE_WIDTH == 0 && start[3] % tt::constants::TILE_HEIGHT == 0) {
-            res = ttnn::slice(*parent, tt::tt_metal::LegacyShape(start), tt::tt_metal::LegacyShape(end), std::nullopt, tt::tt_metal::MemoryConfig());
+            std::array<uint32_t, GGML_MAX_DIMS> step = {1, 1, 1, 1};
+            res = ttnn::slice(*parent, start, end, step, tt::tt_metal::MemoryConfig());
         }
         // Unpad on the CPU and then pad back on the device
         else {
@@ -1126,8 +1127,8 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
 
             // const float slope = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
             auto *dev = t->device();
-            auto slope = make_tile(tt::numpy::arange<float>(1, n_head+1, 1), dev);
-            auto lim = make_tile(tt::numpy::full(slope.legacy_shape(), (float)n_head_log2, tt::tt_metal::DataType::BFLOAT16), dev);
+            auto slope = make_tile(ttnn::arange(1, n_head+1, 1), dev);
+            auto lim = make_tile(ttnn::full(slope.shape(), (float)n_head_log2, tt::tt_metal::DataType::BFLOAT16), dev);
             // BUG: Results in the wrong shape
             // slope = tt::tt_metal::max(slope, lim);
             slope = ttnn::rpow(ttnn::add(slope, 1.f), m0);
@@ -1251,6 +1252,7 @@ ggml_backend_metalium_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     delete ctx;
 }
 
+// void         (*GGML_CALL set_tensor)    (ggml_backend_buffer_t buffer,       struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
 static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                 ggml_tensor *tensor,
                                                 const void *data, size_t offset,
@@ -1414,7 +1416,8 @@ ggml_backend_metalium_buffer_init_tensor(ggml_backend_buffer_t buffer,
         TensorWithMetadata* meta = (TensorWithMetadata*)tensor->extra;
         std::vector<uint32_t> shape(tensor->ne, tensor->ne + GGML_MAX_DIMS);
         std::reverse(shape.begin(), shape.end());
-        auto t = tt::numpy::zeros(shape, ggml2tt_type(tensor->type, bufctx->device->arch()));
+        // TODO: Check if we can make TILE tensors and not pad on CPU
+        auto t = ttnn::zeros(ttnn::Shape(shape), ggml2tt_type(tensor->type, bufctx->device->arch()), tt::tt_metal::Layout::ROW_MAJOR);
         t = ttnn::tilize_with_zero_padding(t.to(bufctx->device));
         meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(t));
     }
@@ -1445,7 +1448,7 @@ ggml_backend_metalium_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
 
     tt::tt_metal::Tensor& src_tensor = *src_meta->tensor;
 
-    tt::tt_metal::Tensor ret = tt::numpy::zeros_like(src_tensor);
+    tt::tt_metal::Tensor ret = ttnn::zeros_like(src_tensor);
     ret.deepcopy(src_tensor);
     GGML_ASSERT(ret.storage_type() == tt::tt_metal::StorageType::DEVICE || ret.storage_type() == tt::tt_metal::StorageType::MULTI_DEVICE);
     dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(ret));
@@ -1458,6 +1461,7 @@ static struct ggml_backend_buffer_i ggml_backend_metalium_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_metalium_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_metalium_buffer_get_base,
     /* .init_tensor     = */ ggml_backend_metalium_buffer_init_tensor,
+    /* .memset_tensor   = */ nullptr,
     /* .set_tensor      = */ ggml_backend_metalium_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_metalium_buffer_get_tensor,
     /* .cpy_tensor      = */ ggml_backend_metalium_buffer_cpy_tensor,

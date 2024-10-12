@@ -59,7 +59,7 @@ static std::string dump_tt_tensor(const tt::tt_metal::Tensor& tensor)
 {
     std::stringstream ss;
     auto tmp = ttnn::untilize(tensor);
-    std::vector<bfloat16> vec(tmp.shape().volume());
+    std::vector<bfloat16> vec(tmp.get_padded_shape().volume());
     memcpy(vec.data(), tmp);
     for(size_t i = 0; i < vec.size(); i++) {
         if(i % 32 == 0) {
@@ -294,7 +294,7 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, [[maybe_unused]]
         src_dst_same = true;
     }
     else {
-        intermid_buf.resize(shape.volume() * sizeof(float));
+        intermid_buf.resize(shape.padded_shape().volume() * sizeof(float));
         intermid = intermid_buf.data();
         need_quantized_conversion = true;
         src_dst_same = false;

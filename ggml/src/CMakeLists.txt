@@ -840,22 +840,36 @@ if(GGML_METALIUM)
     endif()
 
     message(STATUS "Metalium found. Compiling with archicture \"$ENV{ARCH_NAME}\".")
+    # N stands for Normalized
+    set(ARCH_NAME_N "$ENV{ARCH_NAME}")
+    if("$ENV{ARCH_NAME}" STREQUAL "wormhole_b0")
+        set(ARCH_NAME_N "wormhole")
+    endif()
+
+    set(METALIUM_EXTRA_INCLUDES "")
+    if(ARCH_NAME_N STREQUAL "wormhole")
+        set(METALIUM_EXTRA_INCLUDES  $ENV{TT_METAL_HOME}/tt_metal/hw/inc/wormhole/wormhole_b0_defines)
+    endif()
 
     set(METALIUM_INCLUDE_DIRS
         # Metalium
         $ENV{TT_METAL_HOME}
         $ENV{TT_METAL_HOME}/tt_metal
         $ENV{TT_METAL_HOME}/tt_metal/third_party/umd
+        $ENV{TT_METAL_HOME}/tt_metal/third_party/umd/device/
         $ENV{TT_METAL_HOME}/tt_metal/third_party/fmt
-        $ENV{TT_METAL_HOME}/tt_metal/hw/inc/$ENV{ARCH_NAME}
+        $ENV{TT_METAL_HOME}/tt_metal/hw/inc/${ARCH_NAME_N}
         $ENV{TT_METAL_HOME}/tt_metal/hw/inc/
-        $ENV{TT_METAL_HOME}/tt_metal/third_party/umd/src/firmware/riscv/$ENV{ARCH_NAME}
+        $ENV{TT_METAL_HOME}/tt_metal/third_party/umd/src/firmware/riscv/${ARCH_NAME_N}
 
         # TTNN
         $ENV{TT_METAL_HOME}/ttnn/cpp
         $ENV{TT_METAL_HOME}/ttnn/cpp/ttnn/deprecated/
         $ENV{TT_METAL_HOME}/tt_eager
         $ENV{TT_METAL_HOME}/tt_metal/third_party/magic_enum
+
+        # Metalium extra includes
+        ${METALIUM_EXTRA_INCLUDES}
     )
     set(METALIUM_LIB_DIRS
         $ENV{TT_METAL_HOME}/build/lib
@@ -874,7 +888,7 @@ if(GGML_METALIUM)
         $ENV{TT_METAL_HOME}/build/lib/_ttnn.so
     )
 
-    
+
     set(METALIUM_DEDINES
         FMT_HEADER_ONLY
     )

@@ -234,10 +234,10 @@ tt::tt_metal::OwnedStorage data2owned_storage(const SrcType* src, size_t size) {
 
 template <typename DstType>
 tt::tt_metal::OwnedStorage ggml_quantized2owned_storage(const void* src, ggml_tensor* tensor) {
-    ggml_type_traits_t trait = ggml_internal_get_type_traits(tensor->type);
-    GGML_ASSERT(trait.to_float != NULL);
+    const ggml_type_traits* trait = ggml_get_type_traits(tensor->type);
+    GGML_ASSERT(trait->to_float != NULL);
     std::vector<float> vec(ggml_nelements(tensor));
-    trait.to_float(src, vec.data(), ggml_nelements(tensor));
+    trait->to_float(src, vec.data(), ggml_nelements(tensor));
 
     return data2owned_storage<float, bfloat16>(vec.data(), vec.size());
 }
@@ -347,9 +347,9 @@ void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, [[maybe_unused]]
         GGML_ASSERT((ggml_is_quantized(dst_ggtype) || dst_ggtype == GGML_TYPE_F16) && "This block should only reach for quantized data types");
         GGML_ASSERT(intermid_buf.size() != 0);
         size_t real_volume = shape[0] * shape[1] * shape[2] * shape[3];
-        ggml_type_traits_t trait = ggml_internal_get_type_traits(dst_ggtype);
-        GGML_ASSERT(trait.to_float != NULL);
-        trait.from_float((float*)intermid, dst, real_volume);
+        const ggml_type_traits* trait = ggml_get_type_traits(dst_ggtype);
+        GGML_ASSERT(trait->to_float != NULL);
+        trait->from_float((float*)intermid, dst, real_volume);
     }
 }
 
@@ -1196,13 +1196,13 @@ static void ggml_backend_metalium_log(ggml_backend_metalium_context * ctx, struc
 
 // backend interface
 
-GGML_CALL static const char * ggml_backend_metalium_name(ggml_backend_t backend) {
+static const char * ggml_backend_metalium_name(ggml_backend_t backend) {
     return "Metalium";
 
     GGML_UNUSED(backend);
 }
 
-GGML_CALL static void ggml_backend_metalium_free(ggml_backend_t backend) {
+static void ggml_backend_metalium_free(ggml_backend_t backend) {
     ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
     ctx->device->close();
     delete ctx;
@@ -1214,13 +1214,13 @@ struct ggml_backend_metalium_buffer_type_context {
     std::string name;
 };
 
-GGML_CALL static const char * ggml_backend_metalium_buffer_type_name(ggml_backend_buffer_type_t buft) {
+static const char * ggml_backend_metalium_buffer_type_name(ggml_backend_buffer_type_t buft) {
     ggml_backend_metalium_buffer_type_context * ctx = (ggml_backend_metalium_buffer_type_context *)buft->context;
 
     return ctx->name.c_str();
 }
 
-GGML_CALL static size_t ggml_backend_metalium_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+static size_t ggml_backend_metalium_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     // Not using this. Metalium's allication model is not compatible with GGML's allocator
     return 128;
     GGML_UNUSED(buft);
@@ -1233,13 +1233,13 @@ static size_t ggml_backend_metalium_buffer_type_get_max_size(ggml_backend_buffer
     return ctx->device->num_dram_channels() * (size_t)ctx->device->dram_size_per_channel();
 }
 
-GGML_CALL static size_t ggml_backend_metalium_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+static size_t ggml_backend_metalium_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     // Not using this. Metalium's allication model is not compatible with GGML's allocator
     return ggml_nbytes(tensor);
     GGML_UNUSED(buft);
 }
 
-GGML_CALL static const char * ggml_backend_metalium_buffer_get_name(ggml_backend_buffer_t buffer) {
+static const char * ggml_backend_metalium_buffer_get_name(ggml_backend_buffer_t buffer) {
     ggml_backend_metalium_buffer_context * ctx = (ggml_backend_metalium_buffer_context *)buffer->context;
     return ctx->name.c_str();
 }
@@ -1398,7 +1398,7 @@ static void * ggml_backend_metalium_buffer_get_base(ggml_backend_buffer_t buffer
     return (uint8_t*)0xdeadbeef + ctx->base_offset;
 }
 
-GGML_CALL static void
+static void
 ggml_backend_metalium_buffer_init_tensor(ggml_backend_buffer_t buffer,
                                      ggml_tensor *tensor)
 {
@@ -1423,7 +1423,7 @@ ggml_backend_metalium_buffer_init_tensor(ggml_backend_buffer_t buffer,
     GGML_UNUSED(buffer);
 }
 
-GGML_CALL static void ggml_backend_metalium_buffer_clear(ggml_backend_buffer_t buffer,
+static void ggml_backend_metalium_buffer_clear(ggml_backend_buffer_t buffer,
                                                         uint8_t value)
 {
     // Not using this. Metalium's allication model is not compatible with GGML's allocator
@@ -1431,7 +1431,7 @@ GGML_CALL static void ggml_backend_metalium_buffer_clear(ggml_backend_buffer_t b
     GGML_UNUSED(value);
 }
 
-GGML_CALL static bool
+static bool
 ggml_backend_metalium_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
                                     const ggml_tensor *src,
                                     ggml_tensor *dst)
@@ -1468,7 +1468,7 @@ static struct ggml_backend_buffer_i ggml_backend_metalium_buffer_interface = {
 };
 
 
-GGML_CALL static ggml_backend_buffer_t
+static ggml_backend_buffer_t
 ggml_backend_metalium_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
                                            size_t size) {
     ggml_backend_metalium_buffer_type_context * buft_ctx = (ggml_backend_metalium_buffer_type_context *)buft->context;
@@ -1522,17 +1522,18 @@ ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(int device) {
     buffer_type_context_deleter.insert(std::move(bufctx));
     buffer_type_map[device] = {
         /* .iface    = */ ggml_backend_metalium_buffer_type_interface,
+        /* .device   = */ NULL, // TODO: Fill in the device interface
         /* .context  = */ bufctx_ptr,
     };
     return &buffer_type_map[device];
 }
 
-GGML_CALL static ggml_backend_buffer_type_t ggml_backend_metalium_get_default_buffer_type(ggml_backend_t backend) {
+static ggml_backend_buffer_type_t ggml_backend_metalium_get_default_buffer_type(ggml_backend_t backend) {
     auto* ctx = (ggml_backend_metalium_context *)backend->context;
     return ggml_backend_metalium_buffer_type(ctx->device_id);
 }
 
-GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -1669,7 +1670,7 @@ GGML_CALL static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backe
     GGML_UNUSED(backend);
 }
 
-GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, const struct ggml_tensor * op) {
+static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
     ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
@@ -1788,7 +1789,7 @@ GGML_CALL static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, 
     }
 }
 
-GGML_CALL static bool ggml_backend_metalium_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
+static bool ggml_backend_metalium_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
     if (buft->iface.get_name != ggml_backend_metalium_buffer_type_name) {
         return false;
     }
@@ -1819,11 +1820,8 @@ static struct ggml_backend_i metalium_backend_i = {
     /* .supports_op             = */ ggml_backend_metalium_supports_op,
     /* .supports_buft           = */ ggml_backend_metalium_supports_buft,
     /* .offload_op              = */ NULL,
-    /* .event_new               = */ NULL,
-    /* .event_free              = */ NULL,
     /* .event_record            = */ NULL,
-    /* .event_wait              = */ NULL,
-    /* .event_synchronize       = */ NULL,
+    /* .event_wait              = */ NULL
 };
 
 static ggml_guid_t ggml_backend_metalium_guid(void) {
@@ -1859,18 +1857,19 @@ ggml_backend_t ggml_backend_metalium_init(void) {
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_metalium_guid(),
         /* .interface = */ metalium_backend_i,
-        /* .context   = */ ctx,
+        /* .device    = */ NULL, // TODO: Fill in the device interface
+        /* .context   = */ ctx
     };
     g_backend_map[device_id] = backend;
     return backend;
 }
 
-GGML_CALL bool ggml_backend_is_metalium(ggml_backend_t backend) {
+bool ggml_backend_is_metalium(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_metalium_guid());
 }
 
 
-GGML_CALL ggml_backend_t ggml_backend_reg_metalium_init(const char * params, void * user_data)
+ggml_backend_t ggml_backend_reg_metalium_init(const char * params, void * user_data)
 {
     // Sanity check for the environment
     static_assert(tt::tt_metal::MAX_NUM_DIMENSIONS >= GGML_MAX_DIMS, "tt::tt_metal::MAX_NUM_DIMENSIONS must be at least GGML_MAX_DIMS");

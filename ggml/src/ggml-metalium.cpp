@@ -1,3 +1,4 @@
+#include "common/base_types.hpp"
 #include "common/bfloat16.hpp"
 #include "common/constants.hpp"
 #include "device/tt_arch_types.h"
@@ -9,6 +10,7 @@
 
 #include "host_api.hpp"
 #include "impl/dispatch/command_queue.hpp"
+#include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
 #include "ttnn/operations/eltwise/unary/unary.hpp"
 #include "ttnn/operations/experimental/auto_format/auto_format.hpp"
 #include "ttnn/operations/normalization/softmax/device/softmax_op.hpp"
@@ -637,8 +639,22 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
 
     if(a.dtype() == tt::tt_metal::DataType::BFLOAT16 && b.dtype() == tt::tt_metal::DataType::BFLOAT16) {
         // Fast path
+        // Need to increase the math fidelity as moreh_matmul by default uses LoFi and won't pass GGML unit tests
+        ttnn::DeviceComputeKernelConfig cfg;
+        if(a.device()->arch() == tt::ARCH::GRAYSKULL) {
+            cfg = ttnn::GrayskullComputeKernelConfig{
+                .math_fidelity = MathFidelity::HiFi4
+            };
+        }
+        else {
+            cfg = ttnn::WormholeComputeKernelConfig{
+                .math_fidelity = MathFidelity::HiFi4,
+                .fp32_dest_acc_en = true
+            };
+        }
+
         *cm = {
-            .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::moreh_matmul(b, a, false, true, std::nullopt, std::nullopt, std::nullopt, std::nullopt)),
+            .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::moreh_matmul(b, a, false, true, std::nullopt, std::nullopt, std::nullopt, cfg)),
             .ggtype = dst->type,
             .bufctx = cm->bufctx
         };

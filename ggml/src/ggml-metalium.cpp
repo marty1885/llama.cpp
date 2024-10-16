@@ -1151,7 +1151,7 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
             x = ttnn::add(x, ttnn::multiply(*mask, slope));
         }
     }
-    x = ttnn::operations::normalization::softmax(x);
+    x = ttnn::operations::normalization::softmax(x, tt::tt_metal::operation::DEFAULT_OUTPUT_MEMORY_CONFIG, std::nullopt, true);
     *dst_meta = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(x)),
         .ggtype = dst->type,

@@ -440,23 +440,23 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
 
         // TODO: Generalize this to use permute instead of transpose
         // FIXME: This is failing views in test-backend-ops
-        std::optional<std::pair<uint32_t, uint32_t>> axisswap;
-        for (int i = 0; i < ggml_n_dims(tensor); ++i) {
-            size_t expected_stride = tensor->nb[0];
-            for (int j = 0; j < i; ++j) {
-                expected_stride *= tensor->ne[j];
-            }
-            // std::cout << "  Axis " << i << " stride: " << tensor->nb[i] << " expected: " << expected_stride << std::endl;
-            if (tensor->nb[i] != expected_stride) {
-                if (!axisswap) {
-                    axisswap = std::make_pair(i, 1000);
-                } else if (axisswap->second == 1000) {
-                    axisswap->second = i;
-                } else {
-                    GGML_ASSERT(false && "More than one axis swap detected");
-                }
-            }
-        }
+        // std::optional<std::pair<uint32_t, uint32_t>> axisswap;
+        // for (int i = 0; i < ggml_n_dims(tensor); ++i) {
+        //     size_t expected_stride = tensor->nb[0];
+        //     for (int j = 0; j < i; ++j) {
+        //         expected_stride *= tensor->ne[j];
+        //     }
+        //     // std::cout << "  Axis " << i << " stride: " << tensor->nb[i] << " expected: " << expected_stride << std::endl;
+        //     if (tensor->nb[i] != expected_stride) {
+        //         if (!axisswap) {
+        //             axisswap = std::make_pair(i, 1000);
+        //         } else if (axisswap->second == 1000) {
+        //             axisswap->second = i;
+        //         } else {
+        //             GGML_ASSERT(false && "More than one axis swap detected");
+        //         }
+        //     }
+        // }
         // TODO: Do something with axisswap. I think some ops needs this but it haven't crashed yet
 
         // Fast path if we can just return the parent tensor (view is a no-op)

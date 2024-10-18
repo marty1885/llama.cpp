@@ -1,5 +1,6 @@
 // Note: porting this file to C++ is a work in progress
 
+#include <mutex>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
@@ -563,6 +564,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_RPC
         register_backend(ggml_backend_rpc_reg());
+#endif
+#ifdef GGML_USE_METALIUM
+        register_backend(ggml_backend_metalium_reg());
 #endif
 
         // TODO: sycl, vulkan, kompute, cann

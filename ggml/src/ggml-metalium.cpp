@@ -439,6 +439,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         ggml_backend_metalium_buffer_context* bufctx = ((TensorWithMetadata*)tensor->extra)->bufctx;
 
         // TODO: Generalize this to use permute instead of transpose
+        // FIXME: This is failing views in test-backend-ops
         std::optional<std::pair<uint32_t, uint32_t>> axisswap;
         for (int i = 0; i < ggml_n_dims(tensor); ++i) {
             size_t expected_stride = tensor->nb[0];

@@ -135,7 +135,8 @@ static size_t g_metalium_base_offset = 0;
 
 static tt::tt_metal::DataType ggml2tt_type_internal(ggml_type ggtype, tt::ARCH arch) {
     // This table is consulted to map GGML types to TT types dueing tensor creation
-    if(arch == tt::ARCH::GRAYSKULL) {
+    // TODO: Separate Wormhole out, it supports more types
+    if(arch == tt::ARCH::GRAYSKULL || arch == tt::ARCH::WORMHOLE_B0) {
         static constexpr std::array<tt::tt_metal::DataType, GGML_TYPE_COUNT> table = {
             /*GGML_TYPE_F32 = */ tt::tt_metal::DataType::BFLOAT16,
             /*GGML_TYPE_F16 = */ tt::tt_metal::DataType::BFLOAT16,
@@ -1322,10 +1323,8 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
 
     // std::cout << "Writing to tensor with address: " << tensor->data << std::endl;
 
+    // TODO: Support for FP32 on Wormhole
     tt::ARCH processor_class = bufctx->device->arch();
-    // only grayskull is supported for now.
-    // TODO: Wormhole support
-    GGML_ASSERT(processor_class == tt::ARCH::GRAYSKULL);
 
     // TODO: See if we can use BorrowedStorage to avoid copying the data
     bool source_is_quantized = ggml_is_quantized(ggtype);
@@ -2020,7 +2019,7 @@ static std::string identidy_tensotrrent_device(const ttnn::Device* device)
         return "Tenstorrent Grayskull e150";
     }
     if(device->arch() == tt::ARCH::WORMHOLE_B0) {
-        if(grid_size.x == 8 && grid_size.y == 8) {
+        if(grid_size.x == 8 && grid_size.y == 7) {
             return "Tenstorrent Wormhole N300";
         }
         return "Tenstorrent Wormhole N150";
@@ -2040,7 +2039,8 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
         // TODO: Opening all device is the easiest way to get things initialized
         // but TTNN devices are mutually exclusive so we will need to lazy initialize them
         // in the future to allow multiple processes to use the same device
-        const size_t num_devices = tt::tt_metal::GetNumAvailableDevices();
+        // FIXME: TTNN doesn't support opening multiple devices at the same time yet.. What?
+        const size_t num_devices = 1;//tt::tt_metal::GetNumAvailableDevices();
         ctx->devices.reserve(num_devices);
         for(size_t device_id = 0; device_id < num_devices; device_id++) {
             ggml_backend_metalium_device_context * dev_ctx = new ggml_backend_metalium_device_context;
@@ -2053,6 +2053,7 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
                 g_device_map[device_id] = device;
             }
             GGML_ASSERT(device != nullptr);
+            GGML_ASSERT(device->arch() == tt::ARCH::GRAYSKULL || device->arch() == tt::ARCH::WORMHOLE_B0);
 
             dev_ctx->device = device;
             dev_ctx->device_id = device_id;

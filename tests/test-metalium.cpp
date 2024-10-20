@@ -315,7 +315,7 @@ std::string type_name(ggml_type type)
 int main()
 {
     ggml_backend_t cpu = ggml_backend_cpu_init();
-    ggml_backend_t metalium = ggml_backend_metalium_init();
+    ggml_backend_t metalium = ggml_backend_metalium_init(0);
 
     std::vector<std::unique_ptr<test_case>> tests;
 

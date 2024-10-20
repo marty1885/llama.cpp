@@ -75,7 +75,7 @@ void load_model(test_model & model, float* a, float* b, int M, int N, int K, boo
 #ifdef GGML_USE_METALIUM
     if (use_gpu) {
         fprintf(stderr, "%s: using Metalium backend\n", __func__);
-        model.backend = ggml_backend_metalium_init();
+        model.backend = ggml_backend_metalium_init(0);
         if (!model.backend) {
             fprintf(stderr, "%s: ggml_backend_metalium_init() failed\n", __func__);
         }

@@ -19509,7 +19509,7 @@ struct llama_context * llama_new_context_with_model(
         }
 #elif defined(GGML_USE_METALIUM)
         if (model->n_gpu_layers > 0) {
-            auto * backend = ggml_backend_metalium_init();
+            auto * backend = ggml_backend_metalium_init(0);
             if (backend == nullptr) {
                 LLAMA_LOG_ERROR("%s: failed to initialize Metallium backend\n", __func__);
                 llama_free(ctx);

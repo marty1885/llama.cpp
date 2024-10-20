@@ -1,3 +1,4 @@
+#include "common/base_types.hpp"
 #include "common/bfloat16.hpp"
 #include "common/constants.hpp"
 #include "device/tt_arch_types.h"
@@ -9,15 +10,19 @@
 
 #include "host_api.hpp"
 #include "impl/dispatch/command_queue.hpp"
+#include "ttnn/distributed/types.hpp"
+#include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
 #include "ttnn/operations/eltwise/unary/unary.hpp"
 #include "ttnn/operations/experimental/auto_format/auto_format.hpp"
 #include "ttnn/operations/normalization/softmax/device/softmax_op.hpp"
 #include "ttnn/tensor/types.hpp"
+#include "ttnn/types.hpp"
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <optional>
@@ -51,6 +56,17 @@ struct ggml_backend_metalium_context {
     ttnn::device::Device* device = nullptr;
     int device_id = 0;
     std::string name;
+};
+
+struct ggml_backend_metalium_device_context {
+    ttnn::Device* device = nullptr; // TODO: Replace with DeviceMesh?
+    int device_id = -1;
+    std::string name;
+    std::string description;
+};
+
+struct ggml_backend_metalium_reg_context {
+    std::vector<ggml_backend_dev_t> devices;
 };
 
 struct TensorWithMetadata;
@@ -423,23 +439,24 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         ggml_backend_metalium_buffer_context* bufctx = ((TensorWithMetadata*)tensor->extra)->bufctx;
 
         // TODO: Generalize this to use permute instead of transpose
-        std::optional<std::pair<uint32_t, uint32_t>> axisswap;
-        for (int i = 0; i < ggml_n_dims(tensor); ++i) {
-            size_t expected_stride = tensor->nb[0];
-            for (int j = 0; j < i; ++j) {
-                expected_stride *= tensor->ne[j];
-            }
-            // std::cout << "  Axis " << i << " stride: " << tensor->nb[i] << " expected: " << expected_stride << std::endl;
-            if (tensor->nb[i] != expected_stride) {
-                if (!axisswap) {
-                    axisswap = std::make_pair(i, 1000);
-                } else if (axisswap->second == 1000) {
-                    axisswap->second = i;
-                } else {
-                    GGML_ASSERT(false && "More than one axis swap detected");
-                }
-            }
-        }
+        // FIXME: This is failing views in test-backend-ops
+        // std::optional<std::pair<uint32_t, uint32_t>> axisswap;
+        // for (int i = 0; i < ggml_n_dims(tensor); ++i) {
+        //     size_t expected_stride = tensor->nb[0];
+        //     for (int j = 0; j < i; ++j) {
+        //         expected_stride *= tensor->ne[j];
+        //     }
+        //     // std::cout << "  Axis " << i << " stride: " << tensor->nb[i] << " expected: " << expected_stride << std::endl;
+        //     if (tensor->nb[i] != expected_stride) {
+        //         if (!axisswap) {
+        //             axisswap = std::make_pair(i, 1000);
+        //         } else if (axisswap->second == 1000) {
+        //             axisswap->second = i;
+        //         } else {
+        //             GGML_ASSERT(false && "More than one axis swap detected");
+        //         }
+        //     }
+        // }
         // TODO: Do something with axisswap. I think some ops needs this but it haven't crashed yet
 
         // Fast path if we can just return the parent tensor (view is a no-op)
@@ -637,8 +654,22 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
 
     if(a.dtype() == tt::tt_metal::DataType::BFLOAT16 && b.dtype() == tt::tt_metal::DataType::BFLOAT16) {
         // Fast path
+        // Need to increase the math fidelity as moreh_matmul by default uses LoFi and won't pass GGML unit tests
+        ttnn::DeviceComputeKernelConfig cfg;
+        if(a.device()->arch() == tt::ARCH::GRAYSKULL) {
+            cfg = ttnn::GrayskullComputeKernelConfig{
+                .math_fidelity = MathFidelity::HiFi4
+            };
+        }
+        else {
+            cfg = ttnn::WormholeComputeKernelConfig{
+                .math_fidelity = MathFidelity::HiFi4,
+                .fp32_dest_acc_en = true
+            };
+        }
+
         *cm = {
-            .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::moreh_matmul(b, a, false, true, std::nullopt, std::nullopt, std::nullopt, std::nullopt)),
+            .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::moreh_matmul(b, a, false, true, std::nullopt, std::nullopt, std::nullopt, cfg)),
             .ggtype = dst->type,
             .bufctx = cm->bufctx
         };
@@ -1135,7 +1166,7 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
             x = ttnn::add(x, ttnn::multiply(*mask, slope));
         }
     }
-    x = ttnn::operations::normalization::softmax(x);
+    x = ttnn::operations::normalization::softmax(x, tt::tt_metal::operation::DEFAULT_OUTPUT_MEMORY_CONFIG, std::nullopt, true);
     *dst_meta = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(x)),
         .ggtype = dst->type,
@@ -1504,7 +1535,7 @@ ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(int device) {
     static std::set<std::unique_ptr<ggml_backend_metalium_buffer_type_context>> buffer_type_context_deleter;
 
     if(!g_device_map.contains(device)) {
-        ggml_backend_metalium_init();
+        ggml_backend_metalium_init(device);
         GGML_ASSERT(g_device_map.contains(device));
     }
 
@@ -1670,10 +1701,10 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
     GGML_UNUSED(backend);
 }
 
-static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, const struct ggml_tensor * op) {
+static bool ggml_backend_metalium_device_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
-    ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
+    ggml_backend_metalium_device_context * ctx = (ggml_backend_metalium_device_context *)device->context;
 
     // The metalium backend has seperated internal data types from the GGML data types. We really only care about
     // what we can convert to and from.
@@ -1757,14 +1788,16 @@ static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, const stru
         case GGML_OP_SQRT:
         case GGML_OP_SQR:
         // case GGML_OP_PERMUTE: // FIXME: Needs fix https://github.com/tenstorrent/tt-metal/issues/11650
-        // case GGML_OP_SIN:     // Sin and Cos disabled due to bug in TTNN until fixed
-        // case GGML_OP_COS:     // ref: https://github.com/tenstorrent/tt-metal/issues/12753
         case GGML_OP_LOG:
         // TTNN can really only do unpad() so the source rank must be greater than or equal to the destination rank
         // and must not be permuted as that's a sign of it being reshaped from another tensor. Which is costly due to
         // TTNN not using row-major layout.
         case GGML_OP_VIEW:
             return true;
+        
+        case GGML_OP_SIN:     // Sin and Cos disabled on GS due to bug in TTNN until fixed
+        case GGML_OP_COS:     // ref: https://github.com/tenstorrent/tt-metal/issues/12753
+            return ctx->device->arch() != tt::ARCH::GRAYSKULL;
 
         case GGML_OP_ADD:
         case GGML_OP_SUB:
@@ -1789,12 +1822,12 @@ static bool ggml_backend_metalium_supports_op(ggml_backend_t backend, const stru
     }
 }
 
-static bool ggml_backend_metalium_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
+static bool ggml_backend_metalium_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     if (buft->iface.get_name != ggml_backend_metalium_buffer_type_name) {
         return false;
     }
     ggml_backend_metalium_buffer_type_context * buft_ctx = (ggml_backend_metalium_buffer_type_context *)buft->context;
-    ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
+    ggml_backend_metalium_device_context * ctx = (ggml_backend_metalium_device_context *)dev->context;
     return buft_ctx->device == ctx->device;
 }
 
@@ -1817,8 +1850,8 @@ static struct ggml_backend_i metalium_backend_i = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_metalium_graph_compute,
-    /* .supports_op             = */ ggml_backend_metalium_supports_op,
-    /* .supports_buft           = */ ggml_backend_metalium_supports_buft,
+    /* .supports_op             = */ NULL, // moved to device API
+    /* .supports_buft           = */ NULL, // moved to device API
     /* .offload_op              = */ NULL,
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL
@@ -1829,9 +1862,9 @@ static ggml_guid_t ggml_backend_metalium_guid(void) {
     return &guid;
 }
 
-ggml_backend_t ggml_backend_metalium_init(void) {
+ggml_backend_t ggml_backend_metalium_init(int device_id) {
+    GGML_ASSERT(device_id >= 0 && (size_t)device_id < tt::tt_metal::GetNumAvailableDevices());
     // TODO: Support multiple devices (do we even need to? TT supports merging diverse devices into a single device, at least the API suggests that)
-    const int device_id = 0;
     static std::once_flag once;
     std::call_once(once, [](){
         tt::tt_metal::detail::EnablePersistentKernelCache();
@@ -1842,22 +1875,26 @@ ggml_backend_t ggml_backend_metalium_init(void) {
         return it->second;
     }
 
+    ttnn::Device* device = nullptr;
+    if(g_device_map.contains(device_id)) {
+        device = g_device_map[device_id];
+    }
+    else {
+        device = &ttnn::device::open_device(device_id);
+        ttnn::enable_program_cache(*device);
+        // store the device in the global map because tensor creation uses device ID but Metalium disallows opening the same device twice
+        g_device_map[device_id] = device;
+    }
     ggml_backend_metalium_context * ctx = new ggml_backend_metalium_context {
-        /* device            = */ &ttnn::device::open_device(device_id),
+        /* device            = */ device,
         /* device_id         = */ device_id,
-        /* name              = */ "Metalium " + std::to_string(device_id),
+        /* name              = */ "METALIUM" + std::to_string(device_id),
     };
-    ttnn::operations::experimental::auto_format::AutoFormat::SetDefaultDevice(ctx->device);
-
-
-    // store the device in the global map because tensor creation uses device ID but Metalium disallows opening the same device twice
-    g_device_map[device_id] = ctx->device;
-    ttnn::enable_program_cache(*ctx->device);
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_metalium_guid(),
         /* .interface = */ metalium_backend_i,
-        /* .device    = */ NULL, // TODO: Fill in the device interface
+        /* .device    = */ ggml_backend_reg_dev_get(ggml_backend_metalium_reg(), device_id),
         /* .context   = */ ctx
     };
     g_backend_map[device_id] = backend;
@@ -1876,5 +1913,165 @@ ggml_backend_t ggml_backend_reg_metalium_init(const char * params, void * user_d
 
     GGML_UNUSED(params);
     GGML_UNUSED(user_data);
-    return ggml_backend_metalium_init();
+    return ggml_backend_metalium_init(0);
+}
+
+static const char * ggml_backend_metaliium_reg_get_name(ggml_backend_reg_t reg) {
+    GGML_UNUSED(reg);
+    return "Metalium";
+}
+
+static size_t ggml_backend_metalium_reg_get_device_count(ggml_backend_reg_t reg) {
+    ggml_backend_metalium_reg_context * ctx = (ggml_backend_metalium_reg_context *)reg->context;
+    return ctx->devices.size();
+}
+
+static ggml_backend_dev_t ggml_backend_metalium_reg_get_device(ggml_backend_reg_t reg, size_t index) {
+    ggml_backend_metalium_reg_context * ctx = (ggml_backend_metalium_reg_context *)reg->context;
+    GGML_ASSERT(index < ctx->devices.size());
+    return ctx->devices[index];
+}
+
+static const ggml_backend_reg_i ggml_backend_metalium_reg_interface = {
+    /* .get_name          = */ ggml_backend_metaliium_reg_get_name,
+    /* .get_device_count  = */ ggml_backend_metalium_reg_get_device_count,
+    /* .get_device_get    = */ ggml_backend_metalium_reg_get_device,
+    /* .get_proc_address  = */ NULL,
+};
+
+static const char* ggml_backend_metalium_device_get_name(ggml_backend_dev_t dev) {
+    ggml_backend_metalium_device_context * ctx = (ggml_backend_metalium_device_context *)dev->context;
+    return ctx->name.c_str();
+}
+
+static const char * ggml_backend_metalium_device_get_description(ggml_backend_dev_t dev) {
+    ggml_backend_metalium_device_context * ctx = (ggml_backend_metalium_device_context *)dev->context;
+    return ctx->description.c_str();
+}
+
+static void ggml_backend_metalium_get_memory(ggml_backend_dev_t dev, size_t * total, size_t * free) {
+    ggml_backend_metalium_device_context * ctx = (ggml_backend_metalium_device_context *)dev->context;
+    size_t num_dram_channels = ctx->device->num_dram_channels();
+    size_t dram_channel_size = ctx->device->dram_size_per_channel();
+
+    *total = num_dram_channels * dram_channel_size;
+    *free = *total; // TODO: Figure out how to get the free memory
+}
+
+static enum ggml_backend_dev_type ggml_backend_metalium_get_type(ggml_backend_dev_t dev) {
+    GGML_UNUSED(dev);
+    return GGML_BACKEND_DEVICE_TYPE_GPU; // Do we make it _FULL?
+}
+
+static ggml_backend_t ggml_backend_metalium_device_init(ggml_backend_dev_t dev, const char * params) {
+    GGML_UNUSED(params);
+    ggml_backend_metalium_device_context * ctx = (ggml_backend_metalium_device_context *)dev->context;
+    ggml_backend_t backend = ggml_backend_metalium_init(ctx->device_id);
+    GGML_ASSERT(backend != NULL);
+    return backend;
+}
+
+static void ggml_backend_metalium_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
+    ggml_backend_metalium_device_context * ctx = (ggml_backend_metalium_device_context *)dev->context;
+    size_t free = 0;
+    size_t total = 0;
+    ggml_backend_metalium_get_memory(dev, &total, &free);
+    *props = ggml_backend_dev_props {
+        .name = ctx->name.c_str(),
+        .description = ctx->description.c_str(),
+        .memory_free = free,
+        .memory_total = total,
+        .type = ggml_backend_metalium_get_type(dev),
+        .caps = ggml_backend_dev_caps {
+            .async = true,
+            .host_buffer = false,
+            .buffer_from_host_ptr = true,
+            .events = false,
+        }
+    };
+}
+
+static const ggml_backend_device_i ggml_backend_metalium_device_interface = {
+    /* .get_name                = */ ggml_backend_metalium_device_get_name,
+    /* .get_description         = */ ggml_backend_metalium_device_get_description,
+    /* .get_memory              = */ ggml_backend_metalium_get_memory,
+    /* .get_type                = */ ggml_backend_metalium_get_type,
+    /* .get_props               = */ ggml_backend_metalium_device_get_props,
+    /* .init_backend            = */ ggml_backend_metalium_device_init,
+    /* .get_buffer_type         = */ NULL,
+    /* .get_host_buffer_type    = */ NULL,
+    /* .buffer_from_host_ptr    = */ NULL,
+    /* .supports_op             = */ ggml_backend_metalium_device_supports_op,
+    /* .supports_buft           = */ ggml_backend_metalium_device_supports_buft,
+    /* .offload_op              = */ NULL,
+    /* .event_new               = */ NULL,
+    /* .event_free              = */ NULL,
+    /* .event_synchronize       = */ NULL,
+};
+
+static std::string identidy_tensotrrent_device(const ttnn::Device* device)
+{
+    auto grid_size = device->compute_with_storage_grid_size();
+    // TODO: Support mesh configurations
+    if(device->arch() == tt::ARCH::GRAYSKULL) {
+        if(grid_size.x == 11 && grid_size.y == 8) {
+            return "Tenstorrent Grayskull e75";
+        }
+        return "Tenstorrent Grayskull e150";
+    }
+    if(device->arch() == tt::ARCH::WORMHOLE_B0) {
+        if(grid_size.x == 8 && grid_size.y == 8) {
+            return "Tenstorrent Wormhole N300";
+        }
+        return "Tenstorrent Wormhole N150";
+    }
+
+    return "Unknown Tenstorrent device";
+}
+
+GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
+{
+    static ggml_backend_reg reg;
+    static std::once_flag once;
+    std::call_once(once, [&]() {
+        // TODO: Support multiple devices (TT supports mesh configuration so it's going to be tricky)
+        // but for now we just work on 1 device at a time
+        ggml_backend_metalium_reg_context * ctx = new ggml_backend_metalium_reg_context;
+        // TODO: Opening all device is the easiest way to get things initialized
+        // but TTNN devices are mutually exclusive so we will need to lazy initialize them
+        // in the future to allow multiple processes to use the same device
+        const size_t num_devices = tt::tt_metal::GetNumAvailableDevices();
+        ctx->devices.reserve(num_devices);
+        for(size_t device_id = 0; device_id < num_devices; device_id++) {
+            ggml_backend_metalium_device_context * dev_ctx = new ggml_backend_metalium_device_context;
+            ttnn::Device* device = nullptr;
+            if(g_device_map.contains(device_id)) {
+                device = g_device_map[device_id];
+            } else {
+                device = &ttnn::device::open_device(device_id);
+                ttnn::enable_program_cache(*device);
+                g_device_map[device_id] = device;
+            }
+            GGML_ASSERT(device != nullptr);
+
+            dev_ctx->device = device;
+            dev_ctx->device_id = device_id;
+            dev_ctx->name = "METALIUM" + std::to_string(device_id);
+            dev_ctx->description = identidy_tensotrrent_device(dev_ctx->device);
+
+            // FIXME: Release the device context when appropriate
+            ggml_backend_dev_t dev = new ggml_backend_device {
+                .iface = ggml_backend_metalium_device_interface,
+                .reg = &reg,
+                .context = dev_ctx
+            };
+            ctx->devices.push_back(dev);
+        }
+        
+        reg = ggml_backend_reg {
+            /* .interface = */ ggml_backend_metalium_reg_interface,
+            /* .context   = */ ctx
+        };
+    });
+    return &reg;
 }

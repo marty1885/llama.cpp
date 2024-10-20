@@ -372,8 +372,8 @@ static tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tens
     if(node->ne[0] % tt::constants::TILE_WIDTH != 0 || node->ne[1] % tt::constants::TILE_HEIGHT != 0 ||
         tensor.shape()[2] < tt::constants::TILE_HEIGHT || tensor.shape()[3] < tt::constants::TILE_WIDTH) {
         // This path is SLOW. Reshape on a tilized tensor only works when the last two dimensions are tile aligned
-        tt::tt_metal::LegacyShape begin({0, 0, 0, 0});
-        tt::tt_metal::LegacyShape end({tensor.shape()[0], tensor.shape()[1], tensor.shape()[2], tensor.shape()[3]});
+        ttnn::SimpleShape begin({0, 0, 0, 0});
+        ttnn::SimpleShape end({tensor.shape()[0], tensor.shape()[1], tensor.shape()[2], tensor.shape()[3]});
 
         tt::tt_metal::Tensor row_major_tensor = ttnn::untilize(tensor).cpu().unpad(begin, end);
         tt::tt_metal::Tensor reshaped = row_major_tensor.reshape(target_shape);
@@ -494,9 +494,9 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         // Trying to convert a flat 1D tensor to N-D tensor (potentially with an offset)
         else if(ggml_n_dims(src0) == 1) {
             // slow: grab the source tensor and unpad it
-            tt::tt_metal::LegacyShape start{0, 0, 0, uint32_t(offset / ggml_type_size(src0->type))};
+            ttnn::SimpleShape start{0, 0, 0, uint32_t(offset / ggml_type_size(src0->type))};
             auto dst_volume = ggml_nelements(tensor);
-            tt::tt_metal::LegacyShape end({1, 1, 1, uint32_t(dst_volume) + start[3]});
+            ttnn::SimpleShape end({1, 1, 1, uint32_t(dst_volume) + start[3]});
             auto t = parent->cpu().to(tt::tt_metal::Layout::ROW_MAJOR).unpad(start, end);
             // TODO: I'm lazy and this copy is completely unnecessary. Only here because reshape_tt_tensor_into_ggml() needs a device tensor
             t = ttnn::tilize_with_zero_padding(t.to(bufctx->device));
@@ -511,7 +511,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         // Unpad on the CPU and then pad back on the device
         else {
             // THIS is EXTREMELY SLOW. But it works
-            tt::tt_metal::Tensor tmp = parent->cpu().to(tt::tt_metal::Layout::ROW_MAJOR).unpad(start, end);
+            tt::tt_metal::Tensor tmp = parent->cpu().to(tt::tt_metal::Layout::ROW_MAJOR).unpad(ttnn::SimpleShape(start), ttnn::SimpleShape(end));
             res = ttnn::tilize_with_zero_padding(tmp.to(bufctx->device));
         }
         return std::make_shared<tt::tt_metal::Tensor>(res);

@@ -245,7 +245,7 @@ tt::tt_metal::OwnedStorage data2owned_storage(const SrcType* src, size_t size) {
             dst_adaptor(vec[i], src_adaptor(src[i]));
         }
     }
-    auto owned = tt::tt_metal::owned_buffer::create(std::move(vec));
+    auto owned = tt::tt_metal::owned_buffer::Buffer<DstType>(std::make_shared<std::vector<DstType>>(vec));
     return OwnedStorage(std::move(owned));
 }
 
@@ -381,7 +381,7 @@ static bool is_view(const ggml_tensor* tensor)
 
 static tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tensor& tensor, const struct ggml_tensor * node)
 {
-    std::vector<uint32_t> target_shape(GGML_MAX_DIMS, 1);
+    std::array<uint32_t, GGML_MAX_DIMS> target_shape;
     for(int i = 0; i < GGML_MAX_DIMS; i++) {
         target_shape[i] = node->ne[GGML_MAX_DIMS - i - 1];
     }
@@ -393,11 +393,11 @@ static tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tens
         ttnn::SimpleShape end({tensor.shape()[0], tensor.shape()[1], tensor.shape()[2], tensor.shape()[3]});
 
         tt::tt_metal::Tensor row_major_tensor = ttnn::untilize(tensor).cpu().unpad(begin, end);
-        tt::tt_metal::Tensor reshaped = row_major_tensor.reshape(target_shape);
+        tt::tt_metal::Tensor reshaped = row_major_tensor.reshape(ttnn::SimpleShape(target_shape));
         tt::tt_metal::Tensor ret = ttnn::tilize_with_zero_padding(reshaped.to(tensor.device()));
         return ret;
     }
-    return tensor.reshape(target_shape);
+    return tensor.reshape(ttnn::SimpleShape(target_shape));
 }
 static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_tensor* tensor);
 static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tensor)

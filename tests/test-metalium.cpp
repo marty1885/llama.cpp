@@ -318,17 +318,16 @@ int main()
 {
     ggml_backend_t cpu = ggml_backend_cpu_init();
 
-    ggml_backend_t metalium = NULL;
-    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
-        ggml_backend_reg_t reg = ggml_backend_reg_by_name("Metalium");
-        GGML_ASSERT(ggml_backend_reg_dev_count(reg) > 0);
-        metalium = ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, 0), NULL);
-        break;
-    }
-    if(metalium == NULL) {
-        printf("Cannot find Metalium backend\n");
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("Metalium");
+    if(reg == NULL) {
+        fprintf(stderr, "Cannot find the Metalium backend. Is the Meralium backend disabled?\n");
         return 1;
     }
+    if(ggml_backend_reg_dev_count(reg) == 0) {
+        fprintf(stderr, "No devices found for Metalium backend. Is the kernel driver working?\n");
+        return 1;
+    }
+    ggml_backend_t metalium = ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, 0), NULL);
 
     std::vector<std::unique_ptr<test_case>> tests;
 
@@ -336,7 +335,7 @@ int main()
         GGML_UNARY_OP_ABS,
         GGML_UNARY_OP_SGN,
         GGML_UNARY_OP_NEG,
-        // GGML_UNARY_OP_STEP, // Not supported by Metalium
+        GGML_UNARY_OP_STEP, // Not supported by Metalium
         GGML_UNARY_OP_TANH,
         GGML_UNARY_OP_ELU,
         GGML_UNARY_OP_RELU,

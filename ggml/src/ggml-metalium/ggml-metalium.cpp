@@ -3,6 +3,7 @@
 #include "common/constants.hpp"
 #include "common/logger.hpp"
 #include "device/tt_arch_types.h"
+#include "distributed/mesh_device_view.hpp"
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -33,6 +34,8 @@
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <ttnn/core.hpp>
 #include <ttnn/device.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
@@ -204,6 +207,13 @@ static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
         .print_view = func("GGML_METALIUM_PRINT_VIEW")
     };
 }();
+
+static std::string_view trim_sv(std::string_view sv, std::string_view chars = " \t\n\r")
+{
+    sv.remove_prefix(std::min(sv.find_first_not_of(chars), sv.size()));
+    sv.remove_suffix(sv.size() - std::min(sv.find_last_not_of(chars) + 1, sv.size()));
+    return sv;
+}
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 // Backend internal state tracking because GGML API does not allow
@@ -2369,19 +2379,122 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
             tt::log_fatal(tt::LogType::LogAlways, "TT_METAL_HOME and ARCH_NAME environment variables must be set to use the Metalium backend");
             abort();
         }
+
+        const char* c_device = getenv("GGML_METALIUM_DEVICE");
+        std::vector<int> device_ids = {0};
+        bool use_cluster = false;
+        std::pair<int, int> offset = {0, 0};
+        ttnn::distributed::MeshShape mesh_shape = {1, 1};
+        ttnn::distributed::MeshType mesh_type = ttnn::distributed::MeshType::RowMajor;
+        if(c_device != NULL && strlen(c_device) > 0) {
+            // GGML_METALIUM_DEVICE supports a few configuration syntaxes
+            // 1. "0" - Use the device at index 0
+            // 2. "0,1" - Use the device at index 0 and 1 (comma separated, doesn't work as of now as TTNN needs explicit data transfer between deices. but useful for testing backends)
+            // 3. "cluster(x,y, [topology, offset_x, offset_y])" - Use a cluster of devices with x by y configuration and optional topology and offset (default is row-major)
+
+            const std::string_view device_str = c_device;
+            // trim leading and trailing whitespaces
+            std::string_view remaining = trim_sv(device_str);
+
+            // case 1 is a special case of case 2. So we simply implement case 2
+            if(!remaining.starts_with("cluster")) {
+                device_ids.clear();
+                while(remaining.size() > 0) {
+                    size_t pos = remaining.find(',');
+                    const std::string_view devid = trim_sv(remaining.substr(0, pos));
+                    remaining = pos == std::string::npos ? std::string_view() : remaining.substr(pos + 1);
+                    int id = std::stoi(std::string(devid), &pos);
+                    if(pos != devid.size()) {
+                        tt::log_fatal(tt::LogType::LogAlways, "Invalid device id '{}'", devid);
+                        abort();
+                    }
+                    device_ids.push_back(id);
+                }
+
+                mesh_shape = {1, (int)device_ids.size()};
+            } else {
+                use_cluster = true;
+                remaining = trim_sv(remaining.substr(7));
+                if(remaining.size() == 0 || remaining[0] != '(') {
+                    tt::log_fatal(tt::LogType::LogAlways, "Syntax errpr: Invalid cluster configuration '{}'. Expecting '(' after 'cluster'", c_device);
+                    abort();
+                }
+                if(remaining[remaining.size() - 1] != ')') {
+                    tt::log_fatal(tt::LogType::LogAlways, "Syntax errpr: Invalid cluster configuration '{}'. Expecting ')' at the end", c_device);
+                    abort();
+                }
+
+                remaining = trim_sv(remaining.substr(1, remaining.size() - 2));
+                std::vector<std::string_view> args;
+                while(remaining.size() > 0) {
+                    size_t pos = remaining.find(',');
+                    const std::string_view part = trim_sv(remaining.substr(0, pos));
+                    remaining = pos == std::string::npos ? std::string_view() : remaining.substr(pos + 1);
+                    args.push_back(part);
+                }
+
+                if(args.size() < 2) {
+                    tt::log_fatal(tt::LogType::LogAlways, "Syntax error: Invalid cluster configuration '{}'. Expecting at least 2 arguments", c_device);
+                    abort();
+                }
+                
+                int x = std::stoi(std::string(args[0]));
+                int y = std::stoi(std::string(args[1]));
+                mesh_shape = {x, y};
+
+                for(size_t i = 2; i < args.size(); i++) {
+                    const std::string_view arg = args[i];
+                    if(i == 2) {
+                        if(arg == "ROW_MAJOR") {
+                            mesh_type = ttnn::distributed::MeshType::RowMajor;
+                        }
+                        else if(arg == "LINE") {
+                            mesh_type = ttnn::distributed::MeshType::Line;
+                        }
+                        else if(arg == "RING") {
+                            mesh_type = ttnn::distributed::MeshType::Ring;
+                        }
+                        else {
+                            tt::log_fatal(tt::LogType::LogAlways, "Invalid topology '{}'. Supported topologies are ROW_MAJOR, LINE, RING", arg);
+                            abort();
+                        }
+                    }
+                    else if(i == 3) {
+                        offset.first = std::stoi(std::string(arg));
+                    }
+                    else if(i == 4) {
+                        offset.second = std::stoi(std::string(arg));
+                    }
+                    else {
+                        tt::log_fatal(tt::LogType::LogAlways, "Invalid argument '{}'", arg);
+                        abort();
+                    }
+                }
+                device_ids.clear();
+                for(int x = offset.first; x < (int)mesh_shape.first; x++) {
+                    for(int y = offset.second; y < (int)mesh_shape.second; y++) {
+                        device_ids.push_back(x * mesh_shape.second + y);
+                    }
+                }
+            }
+        }
+
         tt::tt_metal::detail::EnablePersistentKernelCache();
-        // TODO: Support multiple devices (TT supports mesh configuration so it's going to be tricky)
-        // but for now we just work on 1 device at a time
         static std::unique_ptr<ggml_backend_metalium_reg_context> ctx = std::make_unique<ggml_backend_metalium_reg_context>();
-        // TODO: Opening all device is the easiest way to get things initialized
-        // but TTNN devices are mutually exclusive so we will need to lazy initialize them
-        // in the future to allow multiple processes to use the same device
-        // FIXME: TTNN doesn't support opening multiple devices at the same time yet.. What?
-        const size_t num_devices = 1;//tt::tt_metal::GetNumAvailableDevices();
-        ctx->devices.reserve(num_devices);
-        // for(size_t device_id = 0; device_id < num_devices; device_id++) {
-            auto device = ttnn::distributed::open_mesh_device({2, 4}, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 1, tt::tt_metal::DispatchCoreType::WORKER);
-            size_t device_id = 0;
+        auto mesh = ttnn::distributed::open_mesh_device(mesh_shape, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 1, tt::tt_metal::DispatchCoreType::WORKER, mesh_type, offset, device_ids);
+        std::vector<std::shared_ptr<ttnn::distributed::MeshDevice>> devices;
+        if(use_cluster) {
+            devices = {mesh};
+        }
+        else {
+            for(size_t x = 0; x < mesh_shape.first; x++) {
+                for(size_t y = 0; y < mesh_shape.second; y++) {
+                    devices.push_back(mesh->create_submesh({x, y}));
+                }
+            }
+        }
+        for(size_t device_id = 0; device_id < devices.size(); device_id++) {
+            auto device = devices[device_id];
             ggml_backend_metalium_device_context * dev_ctx = new ggml_backend_metalium_device_context;
             for(size_t i = 0; i < device->num_devices(); i++) {
                 auto* dev = device->get_device_index(i);
@@ -2393,7 +2506,13 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
             dev_ctx->device = device;
             dev_ctx->device_id = device_id;
             dev_ctx->name = "METALIUM" + std::to_string(device_id);
-            dev_ctx->description = "Tenstorrent Cluster";//identify_tensotrrent_device(dev_ctx->device) + (dev_ctx->device->is_mmio_capable() ? " [Local]" : " [Remote]");
+            if(device->num_cols() == 1 && device->num_rows() == 1) {
+                auto* dev = device->get_device_index(0);
+                dev_ctx->description = identify_tensotrrent_device(dev) + (dev->is_mmio_capable() ? " [Local]" : " [Remote]");
+            }
+            else {
+                dev_ctx->description = fmt::format("Tenstorrent cluster of {}x{} devices", device->num_rows(), device->num_cols());
+            }
 
             // FIXME: Release the device context when appropriate
             ggml_backend_dev_t dev = new ggml_backend_device {
@@ -2404,7 +2523,7 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
             ctx->devices.push_back(dev);
             g_backend_device_context_holder.push_back(std::unique_ptr<ggml_backend_metalium_device_context>(dev_ctx));
             g_backend_device_holder.push_back(std::unique_ptr<ggml_backend_device>(dev));
-        // }
+        }
         
         reg = ggml_backend_reg {
             /* .interface = */ ggml_backend_metalium_reg_interface,

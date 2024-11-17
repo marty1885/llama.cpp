@@ -215,6 +215,19 @@ static std::string_view trim_sv(std::string_view sv, std::string_view chars = " 
     return sv;
 }
 
+static std::optional<int> try_stoi(std::string_view sv)
+{
+    try {
+        size_t pos = 0;
+        return std::stoi(std::string(sv), &pos);
+        if(pos != sv.size()) {
+            return std::nullopt;
+        }
+    } catch(...) {
+        return std::nullopt;
+    }
+}
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 // Backend internal state tracking because GGML API does not allow
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2403,12 +2416,12 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
                     size_t pos = remaining.find(',');
                     const std::string_view devid = trim_sv(remaining.substr(0, pos));
                     remaining = pos == std::string::npos ? std::string_view() : remaining.substr(pos + 1);
-                    int id = std::stoi(std::string(devid), &pos);
-                    if(pos != devid.size()) {
+                    auto id = try_stoi(devid);
+                    if(!id.has_value()) {
                         tt::log_fatal(tt::LogType::LogAlways, "Invalid device id '{}'", devid);
                         abort();
                     }
-                    device_ids.push_back(id);
+                    device_ids.push_back(*id);
                 }
 
                 mesh_shape = {1, (int)device_ids.size()};
@@ -2438,9 +2451,17 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
                     abort();
                 }
                 
-                int x = std::stoi(std::string(args[0]));
-                int y = std::stoi(std::string(args[1]));
-                mesh_shape = {x, y};
+                auto x = try_stoi(args[0]);
+                if(!x.has_value()) {
+                    tt::log_fatal(tt::LogType::LogAlways, "Invalid cluser x dimension '{}'. Expecting an integer as the first argument", args[0]);
+                    abort();
+                }
+                auto y = try_stoi(args[1]);
+                if(!y.has_value()) {
+                    tt::log_fatal(tt::LogType::LogAlways, "Invalid cluser y dimension '{}'. Expecting an integer as the second argument", args[1]);
+                    abort();
+                }
+                mesh_shape = {*x, *y};
 
                 for(size_t i = 2; i < args.size(); i++) {
                     const std::string_view arg = args[i];
@@ -2460,13 +2481,23 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
                         }
                     }
                     else if(i == 3) {
-                        offset.first = std::stoi(std::string(arg));
+                        auto offset_x = try_stoi(arg);
+                        if(!offset_x.has_value()) {
+                            tt::log_fatal(tt::LogType::LogAlways, "Invalid x offset '{}'. Expecting an integer", arg);
+                            abort();
+                        }
+                        offset.first = *offset_x;
                     }
                     else if(i == 4) {
-                        offset.second = std::stoi(std::string(arg));
+                        auto offset_y = try_stoi(arg);
+                        if(!offset_y.has_value()) {
+                            tt::log_fatal(tt::LogType::LogAlways, "Invalid argument '{}' for y offset. Expecting an integer", arg);
+                            abort();
+                        }
+                        offset.second = *offset_y;
                     }
                     else {
-                        tt::log_fatal(tt::LogType::LogAlways, "Invalid argument '{}'", arg);
+                        tt::log_fatal(tt::LogType::LogAlways, "Invalid argument '{}'. More arguments then expected", arg);
                         abort();
                     }
                 }
@@ -2483,7 +2514,7 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
         static std::unique_ptr<ggml_backend_metalium_reg_context> ctx = std::make_unique<ggml_backend_metalium_reg_context>();
         auto mesh = ttnn::distributed::open_mesh_device(mesh_shape, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 1, tt::tt_metal::DispatchCoreType::WORKER, mesh_type, offset, device_ids);
         std::vector<std::shared_ptr<ttnn::distributed::MeshDevice>> devices;
-        if(use_cluster) {
+        if(use_cluster || (mesh->num_cols() == 1 && mesh->num_rows() == 1)) {
             devices = {mesh};
         }
         else {

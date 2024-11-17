@@ -14,7 +14,6 @@
 
 #include "host_api.hpp"
 #include "hostdevcommon/common_values.hpp"
-#include "impl/dispatch/command_queue.hpp"
 #include "impl/dispatch/dispatch_core_manager.hpp"
 #include "ttnn/distributed/types.hpp"
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
@@ -2524,7 +2523,7 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
                             mesh_type = ttnn::distributed::MeshType::Ring;
                         }
                         else {
-                            tt::log_fatal(tt::LogType::LogAlways, "Invalid topology '{}'. Supported topologies are ROW_MAJOR, LINE, RING", arg);
+                            tt::log_fatal(tt::LogType::LogAlways, "Invalid topology '{}'. Supported topologies are ROW_MAJOR (MESH), LINE (LINEAR), RING (TORUS)", arg);
                             abort();
                         }
                     }
@@ -2565,13 +2564,7 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
                         abort();
                     }
                 }
-                device_ids.clear();
-                // TODO: Confirm the IDs are correct
-                for(int x = offset.first; x < (int)mesh_shape.first; x++) {
-                    for(int y = offset.second; y < (int)mesh_shape.second; y++) {
-                        device_ids.push_back(x * mesh_shape.second + y);
-                    }
-                }
+                device_ids.clear(); // Empty. Let TTNN decide the device ids
             }
         }
 

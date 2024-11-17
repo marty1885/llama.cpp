@@ -2416,6 +2416,7 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
             // case 1 is a special case of case 2. So we simply implement case 2
             if(!remaining.starts_with("cluster")) {
                 device_ids.clear();
+                std::set<int> device_id_set;
                 while(remaining.size() > 0) {
                     size_t pos = remaining.find(',');
                     const std::string_view devid_range = trim_sv(remaining.substr(0, pos));
@@ -2432,7 +2433,7 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
                             tt::log_fatal(tt::LogType::LogAlways, "Invalid device id '{}'. Device id must be between 0 and {}", devid_range, tt::tt_metal::GetNumAvailableDevices() - 1);
                             abort();
                         }
-                        device_ids.push_back(*id);
+                        device_id_set.insert(*id);
                     } else {
                         auto start = try_stoi(devid_range.substr(0, dash_pos));
                         if(!start.has_value()) {
@@ -2454,8 +2455,11 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
                             abort();
                         }
                         for(int i = *start; i <= *end; i++) {
-                            device_ids.push_back(i);
+                            device_id_set.insert(i);
                         }
+                    }
+                    for(auto id : device_id_set) {
+                        device_ids.push_back(id);
                     }
                 }
 
@@ -2509,13 +2513,14 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
                 for(size_t i = 2; i < args.size(); i++) {
                     const std::string_view arg = args[i];
                     if(i == 2) {
-                        if(arg == "ROW_MAJOR") {
+                        // Yeah this is stupid. tt-topology uses different naming compared to what we use in tt-metal
+                        if(arg == "ROW_MAJOR" || arg == "MESH") {
                             mesh_type = ttnn::distributed::MeshType::RowMajor;
                         }
-                        else if(arg == "LINE") {
+                        else if(arg == "LINE" || arg == "LINEAR") {
                             mesh_type = ttnn::distributed::MeshType::Line;
                         }
-                        else if(arg == "RING") {
+                        else if(arg == "RING" || arg == "TORUS") {
                             mesh_type = ttnn::distributed::MeshType::Ring;
                         }
                         else {

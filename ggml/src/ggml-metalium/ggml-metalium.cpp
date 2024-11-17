@@ -3,6 +3,7 @@
 #include "common/constants.hpp"
 #include "common/logger.hpp"
 #include "device/tt_arch_types.h"
+#include "distributed/mesh_device.hpp"
 #include "distributed/mesh_device_view.hpp"
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
@@ -2295,6 +2296,8 @@ static const char * ggml_backend_metalium_device_get_description(ggml_backend_de
 static void ggml_backend_metalium_get_memory(ggml_backend_dev_t dev, size_t * total, size_t * free) {
     ggml_backend_metalium_device_context * ctx = (ggml_backend_metalium_device_context *)dev->context;
 
+    *total = 0;
+    *free = 0;
     for(size_t i = 0; i < ctx->device->num_devices(); i++) {
         auto* dev = ctx->device->get_device_index(i);
         auto stats = dev->get_memory_allocation_statistics(tt::tt_metal::BufferType::DRAM);
@@ -2462,6 +2465,11 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
                     abort();
                 }
                 mesh_shape = {*x, *y};
+                auto& sys_mesh = tt::tt_metal::distributed::SystemMesh::instance();
+                if(*x > (int)sys_mesh.get_shape().first || *y > (int)sys_mesh.get_shape().second) {
+                    tt::log_fatal(tt::LogType::LogAlways, "Invalid cluster shape of {}x{}. Maximum supported shape is {}x{}", *x, *y, sys_mesh.get_shape().first, sys_mesh.get_shape().second);
+                    abort();
+                }
 
                 for(size_t i = 2; i < args.size(); i++) {
                     const std::string_view arg = args[i];
@@ -2502,6 +2510,7 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
                     }
                 }
                 device_ids.clear();
+                // TODO: Confirm the IDs are correct
                 for(int x = offset.first; x < (int)mesh_shape.first; x++) {
                     for(int y = offset.second; y < (int)mesh_shape.second; y++) {
                         device_ids.push_back(x * mesh_shape.second + y);
@@ -2531,6 +2540,7 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
                 auto* dev = device->get_device_index(i);
                 ttnn::enable_program_cache(*dev);
             }
+            device->enable_program_cache();
             // Limit device support to the ones I own
             GGML_ASSERT(device->arch() == tt::ARCH::GRAYSKULL || device->arch() == tt::ARCH::WORMHOLE_B0);
 
@@ -2542,7 +2552,19 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
                 dev_ctx->description = identify_tensotrrent_device(dev) + (dev->is_mmio_capable() ? " [Local]" : " [Remote]");
             }
             else {
-                dev_ctx->description = fmt::format("Tenstorrent cluster of {}x{} devices", device->num_rows(), device->num_cols());
+                std::string_view arch_name;
+                switch(device->arch()) {
+                    case tt::ARCH::GRAYSKULL:
+                        arch_name = "Grayskull";
+                        break;
+                    case tt::ARCH::WORMHOLE_B0:
+                        arch_name = "Wormhole";
+                        break;
+                    default:
+                        arch_name = "Unknown";
+                        break;
+                }
+                dev_ctx->description = fmt::format("Tenstorrent {} cluster of {}x{} devices", arch_name, device->num_rows(), device->num_cols());
             }
 
             // FIXME: Release the device context when appropriate

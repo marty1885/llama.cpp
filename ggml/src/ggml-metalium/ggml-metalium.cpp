@@ -2402,7 +2402,7 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
         std::pair<int, int> offset = {0, 0};
         ttnn::distributed::MeshShape mesh_shape = {1, 1};
         ttnn::distributed::MeshType mesh_type = ttnn::distributed::MeshType::RowMajor;
-        if(c_device != NULL && strlen(c_device) > 0) {
+        if(c_device != NULL && trim_sv(c_device).size() > 0) {
             auto& sys_mesh = tt::tt_metal::distributed::SystemMesh::instance();
             // GGML_METALIUM_DEVICE supports a few configuration syntaxes
             // 1. "0" - Use the device at index 0

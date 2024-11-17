@@ -220,10 +220,11 @@ static std::optional<int> try_stoi(std::string_view sv)
 {
     try {
         size_t pos = 0;
-        return std::stoi(std::string(sv), &pos);
+        int n = std::stoi(std::string(sv), &pos);
         if(pos != sv.size()) {
             return std::nullopt;
         }
+        return n;
     } catch(...) {
         return std::nullopt;
     }
@@ -1685,9 +1686,8 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
     //    - tensor2ggml internally handles the data type conversion
     GGML_ASSERT(size == ggml_nbytes(tensor));
     GGML_ASSERT(tensor->extra != NULL);
-    GGML_UNUSED(offset);
-
-    ggml_backend_metalium_buffer_context * ctx = (ggml_backend_metalium_buffer_context *)buffer->context;
+    GGML_UNUSED(buffer);
+    GGML_ASSERT(offset == 0);
 
     ggml_type dst_ggtype = tensor->type;
 
@@ -2403,9 +2403,10 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
         ttnn::distributed::MeshShape mesh_shape = {1, 1};
         ttnn::distributed::MeshType mesh_type = ttnn::distributed::MeshType::RowMajor;
         if(c_device != NULL && strlen(c_device) > 0) {
+            auto& sys_mesh = tt::tt_metal::distributed::SystemMesh::instance();
             // GGML_METALIUM_DEVICE supports a few configuration syntaxes
             // 1. "0" - Use the device at index 0
-            // 2. "0,1" - Use the device at index 0 and 1 (comma separated, doesn't work as of now as TTNN needs explicit data transfer between deices. but useful for testing backends)
+            // 2. "0-2,5" - Use the device at index 0, 1, 2 and 5 (without clustering. doesn't work as of now as TTNN needs explicit data transfer between deices. but useful for testing backends)
             // 3. "cluster(x,y, [topology, offset_x, offset_y])" - Use a cluster of devices with x by y configuration and optional topology and offset (default is row-major)
 
             const std::string_view device_str = c_device;
@@ -2417,14 +2418,45 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
                 device_ids.clear();
                 while(remaining.size() > 0) {
                     size_t pos = remaining.find(',');
-                    const std::string_view devid = trim_sv(remaining.substr(0, pos));
+                    const std::string_view devid_range = trim_sv(remaining.substr(0, pos));
                     remaining = pos == std::string::npos ? std::string_view() : remaining.substr(pos + 1);
-                    auto id = try_stoi(devid);
-                    if(!id.has_value()) {
-                        tt::log_fatal(tt::LogType::LogAlways, "Invalid device id '{}'", devid);
-                        abort();
+
+                    size_t dash_pos = devid_range.find('-');
+                    if(dash_pos == std::string::npos) {
+                        auto id = try_stoi(devid_range);
+                        if(!id.has_value()) {
+                            tt::log_fatal(tt::LogType::LogAlways, "Invalid device id '{}'", devid_range);
+                            abort();
+                        }
+                        if(id < 0 || id >= (int)tt::tt_metal::GetNumAvailableDevices()) {
+                            tt::log_fatal(tt::LogType::LogAlways, "Invalid device id '{}'. Device id must be between 0 and {}", devid_range, tt::tt_metal::GetNumAvailableDevices() - 1);
+                            abort();
+                        }
+                        device_ids.push_back(*id);
+                    } else {
+                        auto start = try_stoi(devid_range.substr(0, dash_pos));
+                        if(!start.has_value()) {
+                            tt::log_fatal(tt::LogType::LogAlways, "Invalid device id '{}'", devid_range.substr(0, dash_pos));
+                            abort();
+                        }
+                        auto end = try_stoi(devid_range.substr(dash_pos + 1));
+                        if(!end.has_value()) {
+                            tt::log_fatal(tt::LogType::LogAlways, "Invalid device id '{}'", devid_range.substr(dash_pos + 1));
+                            abort();
+                        }
+                        const std::string range_str = std::to_string(*start) + "-" + std::to_string(*end);
+                        if(*start < 0 || *start >= (int)tt::tt_metal::GetNumAvailableDevices() || *end < 0 || *end >= (int)tt::tt_metal::GetNumAvailableDevices()) {
+                            tt::log_fatal(tt::LogType::LogAlways, "Invalid device id range '{}'. Device id must be between 0 and {}", range_str, tt::tt_metal::GetNumAvailableDevices() - 1);
+                            abort();
+                        }
+                        if(*start > *end) {
+                            tt::log_fatal(tt::LogType::LogAlways, "Invalid device id range '{}'. Start id must be less than or equal to end id", range_str);
+                            abort();
+                        }
+                        for(int i = *start; i <= *end; i++) {
+                            device_ids.push_back(i);
+                        }
                     }
-                    device_ids.push_back(*id);
                 }
 
                 mesh_shape = {1, (int)device_ids.size()};
@@ -2465,9 +2497,12 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
                     abort();
                 }
                 mesh_shape = {*x, *y};
-                auto& sys_mesh = tt::tt_metal::distributed::SystemMesh::instance();
                 if(*x > (int)sys_mesh.get_shape().first || *y > (int)sys_mesh.get_shape().second) {
                     tt::log_fatal(tt::LogType::LogAlways, "Invalid cluster shape of {}x{}. Maximum supported shape is {}x{}", *x, *y, sys_mesh.get_shape().first, sys_mesh.get_shape().second);
+                    abort();
+                }
+                if(*x < 1 || *y < 1) {
+                    tt::log_fatal(tt::LogType::LogAlways, "Invalid cluster shape of {}x{}. Minimum supported shape is 1x1", *x, *y);
                     abort();
                 }
 
@@ -2494,12 +2529,28 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
                             tt::log_fatal(tt::LogType::LogAlways, "Invalid x offset '{}'. Expecting an integer", arg);
                             abort();
                         }
+                        if(*offset_x < 0 || *offset_x >= (int)mesh_shape.first) {
+                            tt::log_fatal(tt::LogType::LogAlways, "Invalid x offset '{}'. Offset must be between 0 and {}", arg, mesh_shape.first - 1);
+                            abort();
+                        }
+                        if(*offset_x + offset.first >= (int)mesh_shape.first) {
+                            tt::log_fatal(tt::LogType::LogAlways, "Invalid x offset '{}'. Offset must be less than {}", arg, mesh_shape.first - offset.first);
+                            abort();
+                        }
                         offset.first = *offset_x;
                     }
                     else if(i == 4) {
                         auto offset_y = try_stoi(arg);
                         if(!offset_y.has_value()) {
                             tt::log_fatal(tt::LogType::LogAlways, "Invalid argument '{}' for y offset. Expecting an integer", arg);
+                            abort();
+                        }
+                        if(*offset_y < 0 || *offset_y >= (int)mesh_shape.second) {
+                            tt::log_fatal(tt::LogType::LogAlways, "Invalid y offset '{}'. Offset must be between 0 and {}", arg, mesh_shape.second - 1);
+                            abort();
+                        }
+                        if(*offset_y + offset.second >= (int)mesh_shape.second) {
+                            tt::log_fatal(tt::LogType::LogAlways, "Invalid y offset '{}'. Offset must be less than {}", arg, mesh_shape.second - offset.second);
                             abort();
                         }
                         offset.second = *offset_y;
@@ -2529,7 +2580,7 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
         else {
             for(size_t x = 0; x < mesh_shape.first; x++) {
                 for(size_t y = 0; y < mesh_shape.second; y++) {
-                    devices.push_back(mesh->create_submesh({x, y}));
+                    devices.push_back(mesh->create_submesh({1,1}, {x, y}));
                 }
             }
         }

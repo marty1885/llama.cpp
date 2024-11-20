@@ -62,6 +62,7 @@
 
 #include <memory>
 #include <type_traits>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -510,14 +511,6 @@ static tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tens
         target_shape[i] = node->ne[GGML_MAX_DIMS - i - 1];
     }
 
-    // TODO: Remove these checks. see https://github.com/tenstorrent/tt-metal/issues/14922
-    //                                               vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
-    if(tensor.shape()[-1] == (uint32_t)node->ne[0] && tensor.shape()[-2] % 32 == 0 && node->ne[2] % 32 == 0) {
-        // Fast path. reshape_on_device() can reshape is both the last dimension is the same 
-        return ttnn::reshape_on_device(tensor, ttnn::SimpleShape(target_shape));
-    }
-
-    // This MAY trigger a slow path.
     return ttnn::reshape(tensor, ttnn::SimpleShape(target_shape));    
 }
 
@@ -1736,7 +1729,7 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
     }
     GGML_ASSERT(t->layout() == tt::tt_metal::Layout::TILE);
     if(t->dtype() != tt::tt_metal::DataType::BFLOAT16 || t->dtype() != tt::tt_metal::DataType::FLOAT32) {
-        *t = ttnn::experimental::typecast(*t, tt::tt_metal::DataType::BFLOAT16);
+        t = std::make_shared<tt::tt_metal::Tensor>(ttnn::experimental::typecast(*t, tt::tt_metal::DataType::BFLOAT16));
     }
 
     // TODO: Proper handling of data types
@@ -1764,19 +1757,21 @@ ggml_backend_metalium_buffer_init_tensor(ggml_backend_buffer_t buffer,
                                      ggml_tensor *tensor)
 {
     ggml_backend_metalium_buffer_context * bufctx = (ggml_backend_metalium_buffer_context *)buffer->context;
-    bufctx->metadata_to_free.push_back(std::make_unique<TensorWithMetadata>(TensorWithMetadata{
+
+    bufctx->metadata_to_free.push_back(std::make_unique<TensorWithMetadata>());
+    TensorWithMetadata* meta = bufctx->metadata_to_free.back().get();
+    tensor->extra = meta;
+    *meta = {
         .tensor = nullptr,
         .ggtype = GGML_TYPE_COUNT,
         .bufctx = bufctx
-    }));
-    tensor->extra = bufctx->metadata_to_free.back().get();
+    };
+
     // HACK: Make KV cache work
-    std::string name(tensor->name);
+    std::string_view name(tensor->name);
     if(name.find("cache") != std::string::npos && tensor->op == GGML_OP_NONE) {
-        TensorWithMetadata* meta = (TensorWithMetadata*)tensor->extra;
         std::vector<uint32_t> shape(tensor->ne, tensor->ne + GGML_MAX_DIMS);
         std::reverse(shape.begin(), shape.end());
-        // TODO: Check if we can make TILE tensors and not pad on CPU
         auto t = ttnn::zeros(ttnn::Shape(shape), ggml2tt_type(tensor->type, bufctx->device->arch()), tt::tt_metal::Layout::ROW_MAJOR);
         t = ttnn::tilize_with_zero_padding(t.to(bufctx->device));
         meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(t));
@@ -1816,6 +1811,11 @@ ggml_backend_metalium_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
     return true;
 }
 
+static void ggml_backend_metalium_buffer_reset(ggml_backend_buffer_t buffer) {
+    ggml_backend_metalium_buffer_context * bufctx = (ggml_backend_metalium_buffer_context *)buffer->context;
+    bufctx->metadata_to_free.clear();
+}
+
 static struct ggml_backend_buffer_i ggml_backend_metalium_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_metalium_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_metalium_buffer_get_base,
@@ -1825,7 +1825,7 @@ static struct ggml_backend_buffer_i ggml_backend_metalium_buffer_interface = {
     /* .get_tensor      = */ ggml_backend_metalium_buffer_get_tensor,
     /* .cpy_tensor      = */ ggml_backend_metalium_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_metalium_buffer_clear,
-    /* .reset           = */ nullptr,
+    /* .reset           = */ ggml_backend_metalium_buffer_reset,
 };
 
 
@@ -2616,7 +2616,6 @@ GGML_API ggml_backend_reg_t ggml_backend_metalium_reg()
                 dev_ctx->description = fmt::format("Tenstorrent {} cluster of {}x{} devices", arch_name, device->num_rows(), device->num_cols());
             }
 
-            // FIXME: Release the device context when appropriate
             ggml_backend_dev_t dev = new ggml_backend_device {
                 .iface = ggml_backend_metalium_device_interface,
                 .reg = &reg,

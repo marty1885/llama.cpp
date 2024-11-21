@@ -1,7 +1,9 @@
 #include <unistd.h>
 #ifdef __cplusplus
+#include "common/base_types.hpp"
 #include "common/bfloat16.hpp"
 #include "common/constants.hpp"
+#include "common/logger.hpp"
 #include "device/tt_arch_types.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
@@ -12,18 +14,24 @@
 
 #include "host_api.hpp"
 #include "impl/dispatch/command_queue.hpp"
+#include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
+#include "ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.hpp"
+#include "ttnn/operations/eltwise/binary/binary_composite.hpp"
 #include "ttnn/operations/eltwise/unary/unary.hpp"
-#include "ttnn/operations/experimental/auto_format/auto_format.hpp"
+#include "ttnn/operations/moreh/moreh_group_norm/moreh_group_norm.hpp"
 #include "ttnn/operations/normalization/softmax/device/softmax_op.hpp"
+#include "ttnn/tensor/tensor.hpp"
 #include "ttnn/tensor/types.hpp"
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <ttnn/core.hpp>
 #include <ttnn/device.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
@@ -36,13 +44,12 @@
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
 #include <ttnn/operations/data_movement/untilize/untilize.hpp>
 #include <ttnn/operations/experimental/transformer/nlp_kv_cache_load_slice/nlp_kv_cache_load_slice.hpp>
+#include <ttnn/operations/creation.hpp>
 #include <ttnn/operations/eltwise/unary/unary_composite.hpp>
 #include <ttnn/operations/data_movement/transpose/transpose.hpp>
 #include <ttnn/operations/data_movement/permute/permute.hpp>
-#include <ttnn/operations/data_movement/concat/concat.hpp>
 #include <ttnn/operations/data_movement/repeat/repeat.hpp>
-#include <ttnn/operations/eltwise/unary/unary.hpp>
-#include <ttnn/operations/eltwise/unary/unary_composite.hpp>
+#include <ttnn/operations/data_movement/concat/concat.hpp>
 #include <ttnn/operations/experimental/copy/typecast/typecast.hpp>
 #include <tt_metal/detail/persistent_kernel_cache.hpp>
 #include <ttnn/operations/normalization/softmax/softmax.hpp>
@@ -51,4 +58,5 @@
 #include <memory>
 #include <type_traits>
 #include <variant>
+#include <vector>
 #endif

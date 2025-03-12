@@ -55,6 +55,8 @@
 #include <tt-metalium/persistent_kernel_cache.hpp>
 #include <ttnn/operations/data_movement/reshape_view/reshape.hpp>
 #include <ttnn/operations/reduction/generic/generic_reductions.hpp>
+#include <ttnn/operations/experimental/transformer/rotary_embedding/rotary_embedding.hpp>
+#include <ttnn/operations/experimental/transformer/rotary_embedding_llama/rotary_embedding_llama.hpp>
 
 
 #include <memory>
@@ -103,6 +105,13 @@ struct TensorWithMetadata
     ggml_type ggtype = GGML_TYPE_COUNT;
     ggml_backend_metalium_buffer_context* bufctx = nullptr;
 };
+
+static ttnn::Tensor ggml_backend_metalium_host2tensor(ggml_backend_metalium_buffer_context * bufctx,
+                                                      ggml_type ggtype,
+                                                      void const * data,
+                                                      size_t size,
+                                                      size_t nelt,
+                                                      ttnn::Shape const& shape);
 
 static bool ggml_tt_tensors_shape_equal(const ggml_tensor* ggtensor, const tt::tt_metal::Tensor& ttensor)
 {
@@ -406,6 +415,7 @@ static bool is_ggml_type_supported_by_metalium(ggml_type ggtype, tt::ARCH arch) 
 // NOTE: Even though returns an OwnedStorage, the borrowed buffer is still owned by the storage
 // This simply optimizes away unnecessary initializations
 template <typename SrcType, typename DstType>
+static
 tt::tt_metal::BorrowedStorage data2borroweded_storage(const SrcType* src, size_t size) {
     // Converts GGML floating point (FP32, FP16, BF16) to TT floating point (FP32, BF16)
     using Src = std::remove_cv_t<std::remove_reference_t<SrcType>>;
@@ -468,22 +478,29 @@ tt::tt_metal::BorrowedStorage data2borroweded_storage(const SrcType* src, size_t
 }
 
 template <typename DstType>
-tt::tt_metal::BorrowedStorage ggml_quantized2owned_storage(const void* src, const ggml_tensor* tensor) {
-    const ggml_type_traits* trait = ggml_get_type_traits(tensor->type);
-    const size_t size = ggml_nelements(tensor);
+static
+tt::tt_metal::BorrowedStorage ggml_quantized2owned_storage(const void* src, ggml_type ggtype, size_t numelt) {
+    const ggml_type_traits* trait = ggml_get_type_traits(ggtype);
     GGML_ASSERT(trait->to_float != NULL);
 
-    std::unique_ptr<float[]> vec(new float[size]);
-    trait->to_float(src, vec.get(), size);
+    std::unique_ptr<float[]> vec(new float[numelt]);
+    trait->to_float(src, vec.get(), numelt);
 
     if constexpr(std::is_same_v<DstType, float>) {
-        auto storage = tt::tt_metal::borrowed_buffer::Buffer<float>(vec.get(), size);
+        auto storage = tt::tt_metal::borrowed_buffer::Buffer<float>(vec.get(), numelt);
         return tt::tt_metal::BorrowedStorage(storage, [](){}, [holder=std::shared_ptr<float[]>(std::move(vec))](){});
     }
-    return data2borroweded_storage<float, DstType>(vec.get(), size);
+    return data2borroweded_storage<float, DstType>(vec.get(), numelt);
+}
+
+template <typename DstType>
+static
+tt::tt_metal::BorrowedStorage ggml_quantized2owned_storage(const void* src, const ggml_tensor* tensor) {
+    return ggml_quantized2owned_storage<DstType>(src, tensor->type, ggml_nelements(tensor));
 }
 
 template <typename SrcType>
+static
 void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, [[maybe_unused]] tt::tt_metal::CommandQueue& queue, ggml_type dst_ggtype) {
     // Converts TT tensors to GGML types
     ttnn::Shape shape = tensor.logical_shape();
@@ -1626,6 +1643,215 @@ static void ggml_backend_metalium_sum_rows(ggml_backend_metalium_context * ctx, 
     };
 }
 
+// stolen (but modified) FROM CPU BACKEND
+
+static float rope_yarn_ramp(const float low, const float high, const int i0) {
+    const float y = (i0 / 2 - low) / MAX(0.001f, high - low);
+    return 1 - MIN(1, MAX(0, y));
+}
+
+// YaRN algorithm based on LlamaYaRNScaledRotaryEmbedding.py from https://github.com/jquesnelle/yarn
+// MIT licensed. Copyright (c) 2023 Jeffrey Quesnelle and Bowen Peng.
+static void rope_yarn(
+    float theta_extrap, float freq_scale, float corr_dims[2], int64_t i0, float ext_factor, float mscale,
+    float * cos_theta, float * sin_theta) {
+    // Get n-d rotational scaling corrected for extrapolation
+    float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    if (ext_factor != 0.0f) {
+        float ramp_mix = rope_yarn_ramp(corr_dims[0], corr_dims[1], i0) * ext_factor;
+        theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
+
+        // Get n-d magnitude scaling corrected for interpolation
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    *cos_theta = cosf(theta) * mscale;
+    *sin_theta = sinf(theta) * mscale;
+}
+
+static void ggml_rope_cache_init(
+     float theta_base, float freq_scale, const float * freq_factors, float corr_dims[2], int64_t ne0, float ext_factor, float mscale,
+     float * cacheCos, float * cacheSin, float sin_sign, float theta_scale) {
+    // ref: https://github.com/jquesnelle/yarn/blob/master/scaled_rope/LlamaYaRNScaledRotaryEmbedding.py
+    float theta = theta_base;
+    for (int64_t i0 = 0; i0 < ne0; i0 ++) {
+        const float ff = freq_factors ? freq_factors[i0] : 1.0f;
+        rope_yarn(
+            theta/ff, freq_scale, corr_dims, i0<<1, ext_factor, mscale, &cacheCos[i0], &cacheSin[i0]
+        );
+        cacheSin[i0] *= sin_sign;
+
+        theta *= theta_scale;
+    }
+}
+
+static void ggml_mrope_cache_init(
+     float theta_base_t, float theta_base_h, float theta_base_w, float theta_base_e, int sections[4], bool indep_sects,
+     float freq_scale, const float * freq_factors, float corr_dims[2], int64_t ne0, float ext_factor, float mscale,
+     float * cacheCos, float * cacheSin, float sin_sign, float theta_scale) {
+    // ref: https://github.com/jquesnelle/yarn/blob/master/scaled_rope/LlamaYaRNScaledRotaryEmbedding.py
+    float theta_t = theta_base_t;
+    float theta_h = theta_base_h;
+    float theta_w = theta_base_w;
+    float theta_e = theta_base_e;  // extra position id for vision encoder
+    int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
+    int sec_w = sections[1] + sections[0];
+    int sec_e = sections[2] + sec_w;
+    GGML_ASSERT(sect_dims <= ne0);
+
+    for (int64_t i0 = 0; i0 < ne0; i0 += 2) {
+        const float ff = freq_factors ? freq_factors[i0/2] : 1.0f;
+
+        int sector = (i0 / 2) % sect_dims;
+        if (indep_sects) {
+            // compute theta independently for each dim sections
+            // (i.e. reset corresponding theta when `i0` go from one section to another)
+            if (sector == 0) {
+                theta_t = theta_base_t;
+            }
+            else if (sector == sections[0]) {
+                theta_h = theta_base_h;;
+            }
+            else if (sector == sec_w) {
+                theta_w = theta_base_w;
+            }
+            else if (sector == sec_e) {
+                theta_e = theta_base_e;
+            }
+        }
+
+        float theta = theta_t;
+        if (sector >= sections[0] && sector < sec_w) {
+            theta = theta_h;
+        }
+        else if (sector >= sec_w && sector < sec_w + sections[2]) {
+            theta = theta_w;
+        }
+        else if (sector >= sec_w + sections[2]) {
+            theta = theta_e;
+        }
+
+        rope_yarn(
+            theta/ff, freq_scale, corr_dims, i0, ext_factor, mscale, &cacheCos[i0 >> 1], &cacheSin[i0 >> 1]
+        );
+        cacheSin[i0 >> 1] *= sin_sign;
+
+        theta_t *= theta_scale;
+        theta_w *= theta_scale;
+        theta_h *= theta_scale;
+        theta_e *= theta_scale;
+    }
+}
+
+static void ggml_backend_metalium_rope(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
+{
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+    GGML_UNUSED(ctx);
+
+    tt::tt_metal::CommandQueue& queue = ctx->device->command_queue(0);
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    const struct ggml_tensor * src2 = dst->src[2];
+
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    int sections[4];
+
+    memcpy(&freq_base,   (int32_t *) dst->op_params +  5, sizeof(float));
+    memcpy(&freq_scale,  (int32_t *) dst->op_params +  6, sizeof(float));
+    memcpy(&ext_factor,  (int32_t *) dst->op_params +  7, sizeof(float));
+    memcpy(&attn_factor, (int32_t *) dst->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,   (int32_t *) dst->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,   (int32_t *) dst->op_params + 10, sizeof(float));
+    memcpy(&sections,    (int32_t *) dst->op_params + 11, sizeof(int)*4);
+
+    //const int n_past     = ((int32_t *) dst->op_params)[0];
+    const int n_dims     = ((int32_t *) dst->op_params)[1];
+    const int mode       = ((int32_t *) dst->op_params)[2];
+    //const int n_ctx      = ((int32_t *) dst->op_params)[3];
+    const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
+
+    const bool is_neox  = mode & GGML_ROPE_TYPE_NEOX;
+    const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;  // ggml_rope_multi, multimodal rotary position embedding
+    const bool is_vision = mode == GGML_ROPE_TYPE_VISION;
+
+    GGML_ASSERT(!is_mrope  && "not yet implemented");
+    GGML_ASSERT(!is_vision && "not yet implemented");
+
+    GGML_ASSERT(n_dims <= dst->ne[0]);
+    GGML_ASSERT(n_dims % 2 == 0);
+
+    const float * freq_factors = NULL;
+    if (src2 != NULL) {
+        GGML_ASSERT(src2->type == GGML_TYPE_F32);
+        GGML_ASSERT(src2->ne[0] >= n_dims / 2);
+        freq_factors = (const float *) src2->data;
+    }
+
+    GGML_ASSERT(src1->type == GGML_TYPE_I32);
+    // TODO: should get rid of this copy somehow
+    GGML_ASSERT(src1->ne[3] == 1);
+    GGML_ASSERT(src1->ne[2] == 1);
+    GGML_ASSERT(src1->ne[1] == 1);
+    GGML_ASSERT(src1->ne[0] == dst->ne[2]); // seq-len
+    auto* pos = new int32_t[dst->ne[2]]; // seq-len
+    tensor2ggml<uint32_t>(*realize_ggml_view(src1), pos, queue, GGML_TYPE_I32);
+
+    const float theta_scale = powf(freq_base, -2.0f/n_dims);
+
+    float corr_dims[2];
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+
+    size_t cacheLen = dst->ne[2] * dst->ne[0]; // seq-len * dhead
+
+    float * cacheSin = new float[cacheLen]; // alex: the whole idea of GGML is to have no memory allocations... I don't care tho
+    float * cacheCos = new float[cacheLen];
+
+    for (int64_t i2 = 0; i2 < dst->ne[2]; i2++) { // seq-len
+        const int64_t p = pos[i2];
+        ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, dst->ne[0], ext_factor, attn_factor, cacheCos, cacheSin, 1.0f, theta_scale);
+    }
+
+#define SHA_STR(dst) \
+     "(" << dst->ne[0] << "," << dst->ne[1] << "," << dst->ne[2] << "," << dst->ne[3] << ")"
+
+    std::cout << "src0: " << SHA_STR(src0) << "\n";
+    std::cout << "src1: " << SHA_STR(src1) << "\n";
+    std::cout << "out: " << SHA_STR(dst) << "\n";
+
+#undef SHA_STR
+
+    // format of cos and sin: [1, 1, seq-len, dhead]
+    ttnn::Shape cacheShape { 1, 1, static_cast<unsigned int>(dst->ne[2]), static_cast<unsigned int>(dst->ne[0]) };
+    std::cout << cacheShape << "\n";
+
+    delete[] pos;
+
+    auto* bufctx = reinterpret_cast<ggml_backend_metalium_buffer_context *>(dst->buffer->context);
+    ttnn::Tensor sinTensor = ggml_backend_metalium_host2tensor(bufctx, GGML_TYPE_BF16, cacheSin, 2 * cacheLen, cacheLen, cacheShape);
+    ttnn::Tensor cosTensor = ggml_backend_metalium_host2tensor(bufctx, GGML_TYPE_BF16, cacheCos, 2 * cacheLen, cacheLen, cacheShape);
+
+    delete[] cacheSin;
+    delete[] cacheCos;
+
+    std::cout << "pre rope ttnn\n";
+
+    // TODO: pad src0 to dividable by 64
+    // TODO: we are ignoring is_neox, but that is incorrect!!!
+    ttnn::Tensor out = ttnn::experimental::rotary_embedding(*realize_ggml_view(src0), cosTensor, sinTensor);
+
+    std::cout << "post rope ttnn\n";
+
+    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(out),
+        .ggtype = dst->type,
+        .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
+    };
+}
+
 // backend interface
 
 static const char * ggml_backend_metalium_name(ggml_backend_t backend) {
@@ -1677,11 +1903,12 @@ ggml_backend_metalium_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     delete ctx;
 }
 
-static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer,
-                                                ggml_tensor *tensor,
-                                                const void *data, size_t offset,
-                                                size_t size)
-{
+static ttnn::Tensor ggml_backend_metalium_host2tensor(ggml_backend_metalium_buffer_context * bufctx,
+                                                      ggml_type ggtype,
+                                                      void const * data,
+                                                      size_t size,
+                                                      size_t nelt,
+                                                      ttnn::Shape const& shape) {
     // Here's the general logic of set_tensor
     // 1. Make a flat buffer and copy the data into it
     //    - If the data is quantized, convert it to BFLOAT16
@@ -1692,21 +1919,8 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     // TODO: Currently FP32 is hard coded to convert to BFLOAT16. Use FP32 when the hardware supports it
     // TODO: Make a scalable way to decide which GGML type casts to TT quantized types
     // TODO: Use the simpler tilize() when the final 2 dimensions are both multiples of 32
-    GGML_ASSERT(offset == 0);
-    GGML_ASSERT(tensor->extra != NULL);
 
-    ggml_backend_metalium_buffer_context * bufctx = (ggml_backend_metalium_buffer_context *)buffer->context;
-    ggml_type ggtype = tensor->type;
-    TensorWithMetadata * meta = (TensorWithMetadata *)tensor->extra;
     const tt::ARCH processor_class = bufctx->device->arch();
-
-    // Make sure we are not writing to a view tensor
-    if(size != ggml_nbytes(tensor) || (meta->tensor && ggml_tt_tensors_shape_equal(tensor, *meta->tensor) == false)
-        || tensor->view_src != NULL) {
-        // FIXME: Reenable this when got time
-        // fprintf(stderr, "Warning: Metalium set_tensor() does not work with tensor views\n");
-        return;
-    }
 
     tt::tt_metal::BorrowedStorage storage;
     tt::tt_metal::DataType intermidiate_type = tt::tt_metal::DataType::BFLOAT16;
@@ -1733,16 +1947,46 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
         // gives us (FP32) to the bfloat16, which is universally supported by all TT hardware. Then to quantized data type. This extra
         // conversion step is quite expensive.
         if(processor_class != tt::ARCH::GRAYSKULL) {
-            storage = ggml_quantized2owned_storage<float>(data, tensor);
+            storage = ggml_quantized2owned_storage<float>(data, ggtype, nelt);
             intermidiate_type = tt::tt_metal::DataType::FLOAT32;
         }
         else {
-            storage = ggml_quantized2owned_storage<bfloat16>(data, tensor);
+            storage = ggml_quantized2owned_storage<bfloat16>(data, ggtype, nelt);
         }
     }
     else {
-        tt::log_fatal(tt::LogType::LogAlways, "Unsupported data type while uploading to device: {}, name '{}', op type: {}\n", ggml_type_name(ggtype), tensor->name, ggml_op_name(tensor->op));
+        tt::log_fatal(tt::LogType::LogAlways, "Unsupported data type while uploading to device: {}\n", ggml_type_name(ggtype));
         GGML_ASSERT(false && "Unsupported data type while uploading to device");
+    }
+
+    tt::tt_metal::Tensor t(std::move(storage), shape
+        , intermidiate_type, tt::tt_metal::Layout::ROW_MAJOR);
+
+    tt::tt_metal::DataType final_type = ggml2tt_type(ggtype, processor_class);
+    t = ttnn::tilize_with_zero_padding(t.to_device(bufctx->device), std::nullopt, final_type);
+
+    return t;
+}
+
+static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer,
+                                                ggml_tensor *tensor,
+                                                const void *data, size_t offset,
+                                                size_t size)
+{
+    GGML_ASSERT(offset == 0);
+    GGML_ASSERT(tensor->extra != NULL);
+
+    ggml_backend_metalium_buffer_context * bufctx = (ggml_backend_metalium_buffer_context *)buffer->context;
+    ggml_type ggtype = tensor->type;
+    TensorWithMetadata * meta = (TensorWithMetadata *)tensor->extra;
+    const tt::ARCH processor_class = bufctx->device->arch();
+
+    // Make sure we are not writing to a view tensor
+    if(size != ggml_nbytes(tensor) || (meta->tensor && ggml_tt_tensors_shape_equal(tensor, *meta->tensor) == false)
+        || tensor->view_src != NULL) {
+        // FIXME: Reenable this when got time
+        // fprintf(stderr, "Warning: Metalium set_tensor() does not work with tensor views\n");
+        return;
     }
 
     ttnn::SmallVector<uint32_t> shape(GGML_MAX_DIMS, 1);
@@ -1750,6 +1994,8 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
         // GGML stores the shape in reverse order
         shape[i] = tensor->ne[GGML_MAX_DIMS - i - 1];
     }
+
+    ttnn::Tensor t = ggml_backend_metalium_host2tensor(bufctx, ggtype, data, size, ggml_nelements(tensor), ttnn::Shape(shape));
 
     std::optional<ttnn::SmallVector<int64_t>> permute;
     // In case GGML sent us a non-contiguous tensor, we need to permute it to make it contiguous
@@ -1778,18 +2024,15 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
         }
 
         // Now we can figure out the permutation that we need to apply
-        ttnn::SmallVector<int64_t> perm(GGML_MAX_DIMS, -1);
+        ttnn::SmallVector<int64_t> perm(GGML_MAX_DIMS);
         for(int i = 0; i < GGML_MAX_DIMS; i++) {
             perm[strides[i].second] = i;
         }
         permute = perm;
     }
 
-    tt::tt_metal::Tensor t(std::move(storage), ttnn::Shape(shape)
-        , intermidiate_type, tt::tt_metal::Layout::ROW_MAJOR);
-
     tt::tt_metal::DataType final_type = ggml2tt_type(ggtype, processor_class);
-    t = ttnn::tilize_with_zero_padding(t.to_device(bufctx->device), std::nullopt, final_type);
+
     if(permute.has_value()) {
         t = ttnn::permute(t, *permute);
     }
@@ -2176,6 +2419,10 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
                 ggml_backend_metalium_sum_rows(ctx, node);
                 break;
 
+            case GGML_OP_ROPE:
+                ggml_backend_metalium_rope(ctx, node);
+                break;
+
             case GGML_OP_NONE:
                 break;
 
@@ -2314,7 +2561,7 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
         case GGML_OP_SUM_ROWS:
             return true;
 
-        case GGML_OP_SIN:     // Sin and Cos disabled on GS due to bug in TTNN until fixed
+        case GGML_OP_SIN:     // Sin and Cos disabled on GS due to bug in TTNN that won't be fixed
         case GGML_OP_COS:     // ref: https://github.com/tenstorrent/tt-metal/issues/12753
             return ctx->device->arch() != tt::ARCH::GRAYSKULL;
 
@@ -2325,6 +2572,9 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
         // DIV does not support broadcasting on TTNN
         case GGML_OP_DIV:
             return tensor_supported(src1) && memcmp(src0->ne, src1->ne, sizeof(src0->ne)) == 0;
+
+        case GGML_OP_ROPE:
+            return true; // TODO: probably need more checks
 
         case GGML_OP_MUL_MAT:
             return tensor_supported(src1) && ggml_backend_metalium_can_mul_mat(op);

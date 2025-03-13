@@ -9,6 +9,7 @@
 #include "tt-metalium/logger.hpp"
 #include "tt-metalium/small_vector.hpp"
 #include "tt-metalium/tt_backend_api_types.hpp"
+#include "ttnn/common/queue_id.hpp"
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
 #include "ttnn/operations/data_movement/tilize/tilize.hpp"
 #include "ttnn/operations/eltwise/binary/binary_composite.hpp"
@@ -23,6 +24,7 @@
 #include "types/arch.h"
 #include <algorithm>
 #include <array>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -1743,6 +1745,7 @@ static void ggml_mrope_cache_init(
     }
 }
 
+#define DEBUG_ROPE 0
 static void ggml_backend_metalium_rope(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
 {
     GGML_METALIUM_OP_SANITY_CHECK(dst);
@@ -1803,7 +1806,9 @@ static void ggml_backend_metalium_rope(ggml_backend_metalium_context * ctx, stru
     float corr_dims[2];
     ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
 
-    size_t cacheLen = dst->ne[2] * dst->ne[0]; // seq-len * dhead
+    // TODO: cache this across runs
+
+    size_t cacheLen = dst->ne[2] * dst->ne[0]; // seq-len * embed
 
     float * cacheSin = new float[cacheLen]; // alex: the whole idea of GGML is to have no memory allocations... I don't care tho
     float * cacheCos = new float[cacheLen];
@@ -1813,18 +1818,34 @@ static void ggml_backend_metalium_rope(ggml_backend_metalium_context * ctx, stru
         ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, dst->ne[0], ext_factor, attn_factor, cacheCos, cacheSin, 1.0f, theta_scale);
     }
 
+#if DEBUG_ROPE
+
 #define SHA_STR(dst) \
      "(" << dst->ne[0] << "," << dst->ne[1] << "," << dst->ne[2] << "," << dst->ne[3] << ")"
 
+    std::cout << "flags:\n";
+    std::cout << "  neox: " << is_neox << "\n";
+    std::cout << "  mrope: " << is_mrope << "\n";
+    std::cout << "  vision: " << is_vision << "\n";
+
     std::cout << "src0: " << SHA_STR(src0) << "\n";
     std::cout << "src1: " << SHA_STR(src1) << "\n";
+
+    if (src2) {
+        std::cout << "src2: " << SHA_STR(src2) << "\n";
+    }
+
     std::cout << "out: " << SHA_STR(dst) << "\n";
 
 #undef SHA_STR
+#endif
 
-    // format of cos and sin: [1, 1, seq-len, dhead]
+    // format of cos and sin: [1, 1, seq-len, embed]
     ttnn::Shape cacheShape { 1, 1, static_cast<unsigned int>(dst->ne[2]), static_cast<unsigned int>(dst->ne[0]) };
+
+#if DEBUG_ROPE
     std::cout << cacheShape << "\n";
+#endif
 
     delete[] pos;
 
@@ -1835,13 +1856,38 @@ static void ggml_backend_metalium_rope(ggml_backend_metalium_context * ctx, stru
     delete[] cacheSin;
     delete[] cacheCos;
 
+#if DEBUG_ROPE
     std::cout << "pre rope ttnn\n";
+#endif
 
-    // TODO: pad src0 to dividable by 64
+    ttnn::Tensor inp = *realize_ggml_view(src0);
+
+    // TODO: get rid of transposes (maybe transpose caches instead?)
+
+    inp = ttnn::transpose(inp, 1, 2);
+
+#if DEBUG_ROPE
+    std::cout << "input ttnn shape: " << inp.get_logical_shape() << "\n";
+#endif
+
     // TODO: we are ignoring is_neox, but that is incorrect!!!
-    ttnn::Tensor out = ttnn::experimental::rotary_embedding(*realize_ggml_view(src0), cosTensor, sinTensor);
+    ttnn::Tensor out = ttnn::experimental::rotary_embedding(inp, cosTensor, sinTensor);
 
+#if DEBUG_ROPE
+    std::cout << "unmodified out ttnn shape: " << out.get_logical_shape() << "\n";
+#endif
+
+    out = ttnn::slice(static_cast<ttnn::QueueId>(queue.id()),
+            out,
+            ttnn::SmallVector<unsigned int> { 0,0,0,0 },
+            ttnn::SmallVector<unsigned int> { 1, static_cast<unsigned int>(dst->ne[1]), static_cast<unsigned int>(dst->ne[2]), static_cast<unsigned int>(dst->ne[0]) },
+            ttnn::SmallVector<unsigned int> { 1, 1, 1, 1 });
+    out = ttnn::transpose(out, 1, 2);
+
+#if DEBUG_ROPE
+    std::cout << "out ttnn shape: " << out.get_logical_shape() << "\n";
     std::cout << "post rope ttnn\n";
+#endif
 
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
 

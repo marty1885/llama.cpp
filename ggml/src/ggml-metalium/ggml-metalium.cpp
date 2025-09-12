@@ -224,7 +224,7 @@ static size_t g_metalium_base_offset = 0;
 
 static tt::tt_metal::DataType ggml2tt_type_internal(ggml_type ggtype, tt::ARCH arch) {
     // This table is consulted to map GGML types to TT types dueing tensor creation
-    if(arch == tt::ARCH::WORMHOLE_B0) {
+    if(arch == tt::ARCH::WORMHOLE_B0 || arch == tt::ARCH::BLACKHOLE) {
         static constexpr std::array<tt::tt_metal::DataType, GGML_TYPE_COUNT> table = {
             /*GGML_TYPE_F32 = */ tt::tt_metal::DataType::BFLOAT16,
             /*GGML_TYPE_F16 = */ tt::tt_metal::DataType::BFLOAT16,
@@ -2573,7 +2573,10 @@ static std::string identify_tensotrrent_device(const ttnn::IDevice* device)
 {
     auto grid_size = device->compute_with_storage_grid_size();
     // TODO: Support mesh configurations
-    if(device->arch() == tt::ARCH::WORMHOLE_B0) {
+    if (device->arch() == tt::ARCH::BLACKHOLE) {
+        return grid_size.x * grid_size.y == 140 ? "Tenstorrent Blackhole p150" : "Tenstorrent Blackhole p100";
+    }
+    if (device->arch() == tt::ARCH::WORMHOLE_B0) {
         if(grid_size.x == 8 && grid_size.y == 7) {
             return "Tenstorrent Wormhole n300";
         }
@@ -2613,7 +2616,7 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
                 ttnn::enable_program_cache(*device);
             }
             // Limit device support to the ones I own (GS is removed as TTNN dropped support)
-            GGML_ASSERT(device->arch() == tt::ARCH::WORMHOLE_B0);
+            GGML_ASSERT(device->arch() == tt::ARCH::WORMHOLE_B0 || device->arch() == tt::ARCH::BLACKHOLE);
 
             dev_ctx->device = device;
             dev_ctx->device_id = device_id;

@@ -69,10 +69,13 @@ struct llama_hparams {
     uint32_t n_lora_kv          = 0;
     uint32_t n_ff_exp           = 0;
     uint32_t n_ff_shexp         = 0;
+    uint32_t n_ff_chexp         = 0;
     uint32_t n_expert_shared    = 0;
     uint32_t n_norm_groups      = 0;
+    uint32_t n_group_experts    = 0;
 
-    float    expert_weights_scale = 0.0;
+    float    expert_group_scale   = 0.05f;
+    float    expert_weights_scale = 0.0f;
     bool     expert_weights_norm  = false;
     uint32_t expert_gating_func   = LLAMA_EXPERT_GATING_FUNC_TYPE_NONE;
     uint32_t moe_every_n_layers   = 0;
@@ -82,8 +85,9 @@ struct llama_hparams {
     float f_norm_rms_eps;
     float f_norm_group_eps;
 
-    float f_attn_logit_softcapping  = 50.0f;
-    float f_final_logit_softcapping = 30.0f;
+    float f_attn_logit_softcapping   = 50.0f;
+    float f_router_logit_softcapping = 30.0f;
+    float f_final_logit_softcapping  = 30.0f;
 
     // for RWKV
     uint32_t rescale_every_n_layers = 0;
@@ -103,6 +107,11 @@ struct llama_hparams {
     float    rope_freq_scale_train_swa;
     uint32_t n_ctx_orig_yarn;
     float    rope_yarn_log_mul = 0.0f;
+
+    float    yarn_ext_factor  = -1.0f;
+    float    yarn_attn_factor =  1.0f;
+    float    yarn_beta_fast   = 32.0f;
+    float    yarn_beta_slow   =  1.0f;
 
     std::array<int, 4> rope_sections;
 
@@ -136,10 +145,14 @@ struct llama_hparams {
     float f_embedding_scale = 0.0f;
     float f_attention_scale = 0.0f;
 
+    // grok-2
+    float    f_attn_out_scale = 0.0f;
+    uint32_t attn_temp_length = 0;
+
     bool causal_attn   = true;
     bool use_alibi     = false;
     bool attn_soft_cap = false;
-    bool use_kq_norm   = true;
+    bool use_kq_norm   = false;
 
     // for Classifiers
     uint32_t n_cls_out = 1;

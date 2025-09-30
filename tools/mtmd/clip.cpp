@@ -406,6 +406,7 @@ struct clip_ctx {
             }
             if (!backend) {
                 backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+                backend = backend ? backend : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
             }
         }
 
@@ -3066,7 +3067,7 @@ struct image_manipulation {
         dst.buf.resize(3 * target_width * target_height);
 
         float Cc;
-        float C[5];
+        float C[5] = {};
         float d0, d2, d3, a0, a1, a2, a3;
         int i, j, k, jj;
         int x, y;

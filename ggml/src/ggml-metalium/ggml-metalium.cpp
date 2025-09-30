@@ -262,6 +262,7 @@ static tt::tt_metal::DataType ggml2tt_type_internal(ggml_type ggtype, tt::ARCH a
             /*GGML_TYPE_Q4_0_8_8 = */ tt::tt_metal::DataType::INVALID,
             /*GGML_TYPE_TQ1_0   = */ tt::tt_metal::DataType::INVALID,
             /*GGML_TYPE_TQ2_0   = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_MXFP4   =  */ tt::tt_metal::DataType::BFLOAT4_B,
         };
         tt::tt_metal::DataType type = table[ggtype];
         return type;
@@ -2440,7 +2441,7 @@ static void ggml_backend_metalium_synchronize(ggml_backend_t backend)
 {
     return;
     ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
-    tt::tt_metal::Finish(ctx->device->get_mesh_device()->get_device(0)->command_queue());
+    tt::tt_metal::distributed::Finish(ctx->device->get_mesh_device()->mesh_command_queue());
 }
 
 static struct ggml_backend_i metalium_backend_i = {

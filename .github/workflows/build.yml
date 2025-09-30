@@ -56,7 +56,7 @@ env:
 
 jobs:
   macOS-latest-cmake-arm64:
-    runs-on: macos-14
+    runs-on: macos-latest
 
     steps:
       - name: Clone
@@ -127,7 +127,8 @@ jobs:
             -DCMAKE_BUILD_RPATH="@loader_path" \
             -DLLAMA_FATAL_WARNINGS=ON \
             -DGGML_METAL=OFF \
-            -DGGML_RPC=ON
+            -DGGML_RPC=ON \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
           cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
 
       - name: Test
@@ -137,7 +138,7 @@ jobs:
           ctest -L main --verbose --timeout 900
 
   macOS-latest-cmake-arm64-webgpu:
-    runs-on: macos-14
+    runs-on: macos-latest
 
     steps:
       - name: Clone
@@ -191,6 +192,10 @@ jobs:
             os: ubuntu-22.04
           - build: 'arm64'
             os: ubuntu-22.04-arm
+          - build: 's390x'
+            os: ubuntu-24.04-s390x
+          - build: 'ppc64le'
+            os: ubuntu-24.04-ppc64le
 
     runs-on: ${{ matrix.os }}
 
@@ -205,11 +210,28 @@ jobs:
           key: ubuntu-cpu-cmake
           evict-old-files: 1d
 
-      - name: Dependencies
-        id: depends
+      - name: Build Dependencies
+        id: build_depends
         run: |
           sudo apt-get update
-          sudo apt-get install build-essential libcurl4-openssl-dev
+          sudo apt-get install -y --no-install-recommends \
+            python3 python3-pip python3-dev \
+            libjpeg-dev build-essential libcurl4-openssl-dev \
+            git-lfs
+
+      - name: Python Dependencies
+        id: python_depends
+        run: |
+          python3 -m pip install --upgrade pip
+          pip3 install ./gguf-py
+
+      - name: Swap Endianness
+        id: endianness
+        if: ${{ matrix.build == 's390x' }}
+        run: |
+          for f in models/*.gguf; do
+            echo YES | python3 gguf-py/gguf/scripts/gguf_convert_endian.py $f big
+          done
 
       - name: Build
         id: cmake_build
@@ -227,6 +249,7 @@ jobs:
 
       - name: Test llama2c conversion
         id: llama2c_test
+        if: ${{ matrix.build != 's390x' }}
         run: |
           cd build
           echo "Fetch tokenizer"
@@ -235,6 +258,15 @@ jobs:
           wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories260K/stories260K.bin
           ./bin/llama-convert-llama2c-to-ggml --copy-vocab-from-model ./tok512.bin --llama2c-model stories260K.bin --llama2c-output-model stories260K.gguf
           ./bin/llama-cli -m stories260K.gguf -p "One day, Lily met a Shoggoth" -n 500 -c 256
+
+      - name: Test llama2c (s390x)
+        id: llama2c_test_s390x
+        if: ${{ matrix.build == 's390x' }}
+        run: |
+          cd build
+          echo "Fetch llama2c big-endian model"
+          wget https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K-be.gguf
+          ./bin/llama-cli -m stories260K-be.gguf -p "One day, Lily met a Shoggoth" -n 500 -c 256
 
   ubuntu-latest-cmake-sanitizer:
     runs-on: ubuntu-latest
@@ -474,7 +506,7 @@ jobs:
 
   ubuntu-22-cmake-musa:
     runs-on: ubuntu-22.04
-    container: mthreads/musa:rc4.2.0-devel-ubuntu22.04-amd64
+    container: mthreads/musa:rc4.3.0-devel-ubuntu22.04-amd64
 
     steps:
       - name: Clone
@@ -710,6 +742,7 @@ jobs:
 
   macOS-latest-swift:
     runs-on: macos-latest
+    needs: ios-xcode-build
 
     strategy:
       matrix:
@@ -725,6 +758,12 @@ jobs:
         with:
           key: macOS-latest-swift
           evict-old-files: 1d
+
+      - name: Download xcframework artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: llama-xcframework
+          path: build-apple/llama.xcframework/
 
       - name: Dependencies
         id: depends
@@ -746,11 +785,6 @@ jobs:
             -DLLAMA_BUILD_SERVER=OFF \
             -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
           cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
-
-      - name: xcodebuild for swift package
-        id: xcodebuild
-        run: |
-          ./build-xcframework.sh
 
   windows-msys2:
     runs-on: windows-2025
@@ -1051,8 +1085,12 @@ jobs:
         run:  examples/sycl/win-build-sycl.bat
 
   windows-latest-cmake-hip:
-    if: ${{ github.event.inputs.create_release != 'true' }}
     runs-on: windows-2022
+
+    env:
+      # The ROCm version must correspond to the version used in the HIP SDK.
+      ROCM_VERSION: "6.4.2"
+      HIPSDK_INSTALLER_VERSION: "25.Q3"
 
     steps:
       - name: Clone
@@ -1062,16 +1100,14 @@ jobs:
       - name: Clone rocWMMA repository
         id: clone_rocwmma
         run: |
-          git clone https://github.com/rocm/rocwmma --branch rocm-6.2.4 --depth 1
+          git clone https://github.com/rocm/rocwmma --branch rocm-${{ env.ROCM_VERSION }} --depth 1
 
       - name: Cache ROCm Installation
         id: cache-rocm
         uses: actions/cache@v4
         with:
           path: C:\Program Files\AMD\ROCm
-          key: rocm-6.1-${{ runner.os }}-v1
-          restore-keys: |
-            rocm-6.1-${{ runner.os }}-
+          key: rocm-${{ env.HIPSDK_INSTALLER_VERSION }}-${{ runner.os }}
 
       - name: Install ROCm
         if: steps.cache-rocm.outputs.cache-hit != 'true'
@@ -1079,7 +1115,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           write-host "Downloading AMD HIP SDK Installer"
-          Invoke-WebRequest -Uri "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-24.Q3-WinSvr2022-For-HIP.exe" -OutFile "${env:RUNNER_TEMP}\rocm-install.exe"
+          Invoke-WebRequest -Uri "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-${{ env.HIPSDK_INSTALLER_VERSION }}-WinSvr2022-For-HIP.exe" -OutFile "${env:RUNNER_TEMP}\rocm-install.exe"
           write-host "Installing AMD HIP SDK"
           $proc = Start-Process "${env:RUNNER_TEMP}\rocm-install.exe" -ArgumentList '-install' -NoNewWindow -PassThru
           $completed = $proc.WaitForExit(600000)
@@ -1167,8 +1203,17 @@ jobs:
         run: |
           ./build-xcframework.sh
 
+      - name: Upload xcframework artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-xcframework
+          path: build-apple/llama.xcframework/
+          retention-days: 1
+
       - name: Build Xcode project
-        run: xcodebuild -project examples/llama.swiftui/llama.swiftui.xcodeproj -scheme llama.swiftui -sdk iphoneos CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= -destination 'generic/platform=iOS' FRAMEWORK_FOLDER_PATH=./build-ios build
+        run: |
+          xcodebuild -downloadPlatform iOS
+          xcodebuild -project examples/llama.swiftui/llama.swiftui.xcodeproj -scheme llama.swiftui -sdk iphoneos CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= -destination 'generic/platform=iOS' FRAMEWORK_FOLDER_PATH=./build-ios build
 
   android-build:
     runs-on: ubuntu-latest
@@ -1233,3 +1278,212 @@ jobs:
               -DGGML_CANN=on \
               -DSOC_TYPE=${{ matrix.device }}
           cmake --build build -j $(nproc)
+
+# TODO: simplify the following workflows using a matrix
+# TODO: run lighter CI on PRs and the full CI only on master (if needed)
+  ggml-ci-x64-cpu-low-perf:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.16
+        with:
+          key: ggml-ci-x64-cpu-low-perf
+          evict-old-files: 1d
+
+      - name: Dependencies
+        id: depends
+        run: |
+          sudo apt-get update
+          sudo apt-get install build-essential libcurl4-openssl-dev
+
+      - name: Test
+        id: ggml-ci
+        run: |
+          LLAMA_ARG_THREADS=$(nproc) GG_BUILD_LOW_PERF=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
+
+  ggml-ci-arm64-cpu-low-perf:
+    runs-on: ubuntu-22.04-arm
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.16
+        with:
+          key: ggml-ci-arm64-cpu-low-perf
+          evict-old-files: 1d
+
+      - name: Dependencies
+        id: depends
+        run: |
+          sudo apt-get update
+          sudo apt-get install build-essential libcurl4-openssl-dev
+
+      - name: Test
+        id: ggml-ci
+        run: |
+          LLAMA_ARG_THREADS=$(nproc) GG_BUILD_LOW_PERF=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
+
+  ggml-ci-x64-cpu-high-perf:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.16
+        with:
+          key: ggml-ci-x64-cpu-high-perf
+          evict-old-files: 1d
+
+      - name: Dependencies
+        id: depends
+        run: |
+          sudo apt-get update
+          sudo apt-get install build-essential libcurl4-openssl-dev
+
+      - name: Test
+        id: ggml-ci
+        run: |
+          LLAMA_ARG_THREADS=$(nproc) bash ./ci/run.sh ./tmp/results ./tmp/mnt
+
+  ggml-ci-arm64-cpu-high-perf:
+    runs-on: ubuntu-22.04-arm
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.16
+        with:
+          key: ggml-ci-arm64-cpu-high-perf
+          evict-old-files: 1d
+
+      - name: Dependencies
+        id: depends
+        run: |
+          sudo apt-get update
+          sudo apt-get install build-essential libcurl4-openssl-dev
+
+      - name: Test
+        id: ggml-ci
+        run: |
+          LLAMA_ARG_THREADS=$(nproc) GG_BUILD_NO_SVE=1 GG_BUILD_NO_BF16=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
+
+  ggml-ci-arm64-cpu-high-perf-sve:
+    runs-on: ubuntu-22.04-arm
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.16
+        with:
+          key: ggml-ci-arm64-cpu-high-perf-sve
+          evict-old-files: 1d
+
+      - name: Dependencies
+        id: depends
+        run: |
+          sudo apt-get update
+          sudo apt-get install build-essential libcurl4-openssl-dev
+
+      - name: Test
+        id: ggml-ci
+        run: |
+          LLAMA_ARG_THREADS=$(nproc) GG_BUILD_NO_BF16=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
+
+  ggml-ci-x64-nvidia-cuda:
+    runs-on: [self-hosted, Linux, X64, NVIDIA]
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Test
+        id: ggml-ci
+        run: |
+          nvidia-smi
+          GG_BUILD_CUDA=1 bash ./ci/run.sh ~/results/llama.cpp /mnt/llama.cpp
+
+  ggml-ci-x64-nvidia-vulkan-cm:
+    runs-on: [self-hosted, Linux, X64, NVIDIA]
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Test
+        id: ggml-ci
+        run: |
+          vulkaninfo --summary
+          GG_BUILD_VULKAN=1 GGML_VK_DISABLE_COOPMAT2=1 bash ./ci/run.sh ~/results/llama.cpp /mnt/llama.cpp
+
+  ggml-ci-x64-nvidia-vulkan-cm2:
+    runs-on: [self-hosted, Linux, X64, NVIDIA, COOPMAT2]
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Test
+        id: ggml-ci
+        run: |
+          vulkaninfo --summary
+          GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp /mnt/llama.cpp
+
+  ggml-ci-x64-cpu-amx:
+    runs-on: [self-hosted, Linux, X64, CPU, AMX]
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Test
+        id: ggml-ci
+        run: |
+          bash ./ci/run.sh ~/results/llama.cpp /mnt/llama.cpp
+
+  ggml-ci-mac-metal:
+    runs-on: [self-hosted, macOS, ARM64]
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Test
+        id: ggml-ci
+        run: |
+          GG_BUILD_METAL=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
+
+  ggml-ci-mac-vulkan:
+    runs-on: [self-hosted, macOS, ARM64]
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Test
+        id: ggml-ci
+        run: |
+          vulkaninfo --summary
+          GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp

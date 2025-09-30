@@ -136,6 +136,7 @@ class TensorNameMap:
             "model.layers.{bid}.norm",                              # mamba-qbert
             "backbone.layers.{bid}.norm",                           # mamba
             "transformer.decoder_layer.{bid}.rms_norm",             # Grok
+            "model.layers.{bid}.pre_attn_norm",                     # grok-2
             "transformer.blocks.{bid}.norm_attn_norm.norm_1",       # dbrx
             "encoder.layers.{bid}.input_layernorm",                 # chatglm
             "transformer.layers.{bid}.attn_norm",                   # openelm
@@ -278,6 +279,7 @@ class TensorNameMap:
             "transformer.layer.{bid}.sa_layer_norm",           # distillbert
             "encoder.layers.{bid}.norm1",                      # nomic-bert
             "transformer.decoder_layer.{bid}.rms_norm_1",      # Grok
+            "model.layers.{bid}.post_attn_norm",               # grok-2
             "transformer.blocks.{bid}.norm_attn_norm.norm_2",  # dbrx
         ),
 
@@ -313,6 +315,7 @@ class TensorNameMap:
             "h.{bid}.ln_2",                                                  # gpt2
             "model.layers.{bid}.ffn_norm",                                   # internlm2
             "transformer.decoder_layer.{bid}.rms_norm_2",                    # Grok
+            "model.layers.{bid}.pre_moe_norm",                               # grok-2
             "encoder.layers.{bid}.post_attention_layernorm",                 # chatglm
             "transformer.layers.{bid}.ffn_norm",                             # openelm
             "model.layers.{bid}.pre_ff_layernorm",                           # jamba granite-hybrid
@@ -333,11 +336,12 @@ class TensorNameMap:
 
         # Post feed-forward norm
         MODEL_TENSOR.FFN_POST_NORM: (
-            "model.layers.{bid}.post_feedforward_layernorm", # gemma2 olmo2
-            "layers.{bid}.post_feedforward_layernorm",       # embeddinggemma
-            "model.layers.{bid}.post_mlp_layernorm", # glm-4-0414
+            "model.layers.{bid}.post_feedforward_layernorm",  # gemma2 olmo2
+            "layers.{bid}.post_feedforward_layernorm",        # embeddinggemma
+            "model.layers.{bid}.post_mlp_layernorm",          # glm-4-0414
             "model.layers.layers.{bid}.post_mlp_norm.weight", # plamo2
             "model.layers.{bid}.feed_forward.up_proj",
+            "model.layers.{bid}.post_moe_norm",               # grok-2
         ),
 
         MODEL_TENSOR.FFN_GATE_INP: (
@@ -423,6 +427,10 @@ class TensorNameMap:
             "model.layers.{bid}.mlp.shared_mlp.up_proj",             # hunyuan
         ),
 
+        MODEL_TENSOR.FFN_UP_CHEXP: (
+            "model.layers.{bid}.mlp.chunk_experts.up_proj",           # grovemoe
+        ),
+
         # AWQ-activation gate
         MODEL_TENSOR.FFN_ACT: (
             "transformer.blocks.{bid}.ffn.act",  # mpt
@@ -462,6 +470,10 @@ class TensorNameMap:
             "model.layers.{bid}.mlp.shared_experts.gate_proj",         # deepseek deepseek2
             "model.layers.{bid}.feed_forward.shared_expert.gate_proj", # llama4
             "model.layers.{bid}.mlp.shared_mlp.gate_proj",             # hunyuan
+        ),
+
+        MODEL_TENSOR.FFN_GATE_CHEXP: (
+            "model.layers.{bid}.mlp.chunk_experts.gate_proj",           # grovemoe
         ),
 
         # Feed-forward down
@@ -518,6 +530,10 @@ class TensorNameMap:
             "model.layers.{bid}.feed_forward.shared_expert.down_proj", # llama4
             "model.layers.{bid}.shared_mlp.output_linear",             # granitemoe
             "model.layers.{bid}.mlp.shared_mlp.down_proj",             # hunyuan
+        ),
+
+        MODEL_TENSOR.FFN_DOWN_CHEXP: (
+            "model.layers.{bid}.mlp.chunk_experts.down_proj",           # grovemoe
         ),
 
         MODEL_TENSOR.ATTN_Q_NORM: (

@@ -2647,8 +2647,10 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
                 .context = dev_ctx
             };
             ctx->devices.push_back(dev);
-            g_backend_device_context_holder.push_back(std::unique_ptr<ggml_backend_metalium_device_context>(dev_ctx));
-            g_backend_device_holder.push_back(std::unique_ptr<ggml_backend_device>(dev));
+            // GGML does not have free for backend_reg and devices. Will force free on exit (thanks to RAII) but Metalium
+            // already de-init at that point
+            // g_backend_device_context_holder.push_back(std::unique_ptr<ggml_backend_metalium_device_context>(dev_ctx));
+            // g_backend_device_holder.push_back(std::unique_ptr<ggml_backend_device>(dev));
         }
 
         reg = ggml_backend_reg {

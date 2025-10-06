@@ -2609,13 +2609,52 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
         // TODO: Support multiple devices (TT supports mesh configuration so it's going to be tricky)
         // but for now we just work on 1 device at a time
         static std::unique_ptr<ggml_backend_metalium_reg_context> ctx = std::make_unique<ggml_backend_metalium_reg_context>();
-        // TODO: Support using mesh devices (We will always only have one device as scaling should be handled by TTNN).
         const size_t num_devices = 1;
-        const int device_id = 0;
+        int device_id = 0;
+
+        const char* device_id_env = getenv("GGML_METALIUM_DEVICE_ID"); // example GGML_METALIUM_DEVICE_ID=0 - use device 0
+        const char* mesh_env = getenv("GGML_METALIUM_MESH_SHAPE"); // example GGML_METALIUM_MESH_SHAPE=2,4 use mesh of shape 2,4
+        ttnn::MeshShape mesh_shape;
+        if(device_id_env != NULL && mesh_env != NULL) {
+            GGML_ABORT("Both GGML_METALIUM_DEVICE_ID and GGML_METALIUM_MESH_SHAPE are set. Only one can be used at the same time");
+        }
+        if(device_id_env != NULL) {
+            try {
+                device_id = std::stoi(device_id_env);
+            }
+            catch(const std::invalid_argument& e) {
+                GGML_ABORT("Invalid device ID in GGML_METALIUM_DEVICE_ID");
+            }
+        }
+        if(mesh_env != NULL) {
+            std::string_view mesh_view(mesh_env);
+            size_t n = mesh_view.find(',');
+            if(n == std::string_view::npos) {
+                GGML_ABORT("Invalid mesh shape in GGML_METALIUM_MESH_SHAPE");
+            }
+            int y = 0;
+            int x = 0;
+            try {
+                y = std::stoi(std::string(mesh_view.substr(0, n)));
+                x = std::stoi(std::string(mesh_view.substr(n + 1)));
+            }
+            catch(const std::invalid_argument& e) {
+                GGML_ABORT("Invalid mesh shape in GGML_METALIUM_MESH_SHAPE");
+            }
+
+            GGML_ASSERT(x > 0 && y > 0 && "Invalid mesh shape in GGML_METALIUM_MESH_SHAPE");
+            mesh_shape = ttnn::MeshShape(x, y);
+        }
+
         ctx->devices.reserve(num_devices);
         ggml_backend_metalium_device_context * dev_ctx = new ggml_backend_metalium_device_context;
-        // auto device = ttnn::distributed::open_mesh_device(ttnn::MeshShape(2, 4), DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 2, tt::tt_metal::DispatchCoreType::ETH);
-        auto device = ttnn::open_mesh_device(0);
+        std::shared_ptr<ttnn::MeshDevice> device;
+        if(mesh_env == NULL) {
+            device = ttnn::open_mesh_device(0);
+        }
+        else {
+            device = ttnn::distributed::open_mesh_device(mesh_shape, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 2, tt::tt_metal::DispatchCoreType::ETH);
+        }
         if(!g_debug_flags.disable_program_cache) {
             ttnn::enable_program_cache(*device);
         }

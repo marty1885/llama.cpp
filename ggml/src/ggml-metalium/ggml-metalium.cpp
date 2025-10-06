@@ -5,6 +5,7 @@
 #include "ggml-cpu.h"
 #include "ggml-metalium.h"
 
+#include "hostdevcommon/common_values.hpp"
 #include "tt-metalium/bfloat16.hpp"
 #include "tt-metalium/host_buffer.hpp"
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
@@ -168,8 +169,8 @@ static ttnn::DeviceComputeKernelConfig make_compute_kernel_config(ttnn::IDevice*
         cfg = ttnn::WormholeComputeKernelConfig{
             .math_fidelity = MathFidelity::HiFi4,
             .math_approx_mode = false,
-            .fp32_dest_acc_en = true,
-            .packer_l1_acc = true
+            .fp32_dest_acc_en = false,
+            .packer_l1_acc = false
         };
     }
     else {
@@ -2457,7 +2458,8 @@ static struct ggml_backend_i metalium_backend_i = {
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_metalium_graph_compute,
     /* .event_record            = */ NULL,
-    /* .event_wait              = */ NULL
+    /* .event_wait              = */ NULL,
+    /* .graph_optimize          = */ NULL,
 };
 
 static ggml_guid_t ggml_backend_metalium_guid(void) {
@@ -2557,6 +2559,7 @@ static void ggml_backend_metalium_device_get_props(ggml_backend_dev_t dev, ggml_
         .memory_free = free,
         .memory_total = total,
         .type = ggml_backend_metalium_get_type(dev),
+        .device_id = NULL, // We might not be on PCIe
         .caps = ggml_backend_dev_caps {
             .async = true,
             .host_buffer = false,
@@ -2589,20 +2592,6 @@ static const ggml_backend_device_i ggml_backend_metalium_device_interface = {
     /* .event_synchronize       = */ NULL,
 };
 
-static std::string identify_tensotrrent_device(const ttnn::IDevice* device)
-{
-    auto grid_size = device->compute_with_storage_grid_size();
-    // TODO: Support mesh configurations
-    if(device->arch() == tt::ARCH::WORMHOLE_B0) {
-        if(grid_size.x == 8 && grid_size.y == 7) {
-            return "Tenstorrent Wormhole n300";
-        }
-        return "Tenstorrent Wormhole n150";
-    }
-
-    return "Unknown Tenstorrent device";
-}
-
 static std::vector<std::unique_ptr<ggml_backend_device>> g_backend_device_holder;
 static std::vector<std::unique_ptr<ggml_backend_metalium_device_context>> g_backend_device_context_holder;
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
@@ -2620,38 +2609,39 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
         // TODO: Support multiple devices (TT supports mesh configuration so it's going to be tricky)
         // but for now we just work on 1 device at a time
         static std::unique_ptr<ggml_backend_metalium_reg_context> ctx = std::make_unique<ggml_backend_metalium_reg_context>();
-        // TODO: Opening all device is the easiest way to get things initialized
-        // but TTNN devices are mutually exclusive so we will need to lazy initialize them
-        // in the future to allow multiple processes to use the same device
-        // FIXME: TTNN doesn't support opening multiple devices at the same time yet.. What?
-        const size_t num_devices = 1;//tt::tt_metal::GetNumAvailableDevices();
+        // TODO: Support using mesh devices (We will always only have one device as scaling should be handled by TTNN).
+        const size_t num_devices = 1;
+        const int device_id = 0;
         ctx->devices.reserve(num_devices);
-        for(size_t device_id = 0; device_id < num_devices; device_id++) {
-            ggml_backend_metalium_device_context * dev_ctx = new ggml_backend_metalium_device_context;
-            auto device = ttnn::open_mesh_device(device_id);
-            if(!g_debug_flags.disable_program_cache) {
-                ttnn::enable_program_cache(*device);
-            }
-            // Limit device support to the ones I own (GS is removed as TTNN dropped support)
-            GGML_ASSERT(device->arch() == tt::ARCH::WORMHOLE_B0);
-
-            dev_ctx->device = device;
-            dev_ctx->device_id = device_id;
-            dev_ctx->name = "METALIUM" + std::to_string(device_id);
-            auto* d = device->get_device(0);
-            dev_ctx->description = identify_tensotrrent_device(d) + (d->is_mmio_capable() ? " [Local]" : " [Remote]");
-
-            ggml_backend_dev_t dev = new ggml_backend_device {
-                .iface = ggml_backend_metalium_device_interface,
-                .reg = &reg,
-                .context = dev_ctx
-            };
-            ctx->devices.push_back(dev);
-            // GGML does not have free for backend_reg and devices. Will force free on exit (thanks to RAII) but Metalium
-            // already de-init at that point
-            // g_backend_device_context_holder.push_back(std::unique_ptr<ggml_backend_metalium_device_context>(dev_ctx));
-            // g_backend_device_holder.push_back(std::unique_ptr<ggml_backend_device>(dev));
+        ggml_backend_metalium_device_context * dev_ctx = new ggml_backend_metalium_device_context;
+        // auto device = ttnn::distributed::open_mesh_device(ttnn::MeshShape(2, 4), DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 2, tt::tt_metal::DispatchCoreType::ETH);
+        auto device = ttnn::open_mesh_device(0);
+        if(!g_debug_flags.disable_program_cache) {
+            ttnn::enable_program_cache(*device);
         }
+        // Limit device support to the ones I own (GS is removed as TTNN dropped support)
+        GGML_ASSERT(device->arch() == tt::ARCH::WORMHOLE_B0);
+        dev_ctx->device = device;
+        dev_ctx->device_id = device_id;
+        dev_ctx->name = "METALIUM" + std::to_string(device_id);
+        auto devshape = device->get_view().shape();
+        std::string devshape_str;
+        for(size_t i = 0; i < devshape.dims(); i++) {
+            devshape_str += std::to_string(devshape[i]) + "x";
+        }
+        devshape_str.pop_back();
+        dev_ctx->description = fmt::format("Tenstorrent {} {} mesh", device->arch(), devshape_str);
+
+        ggml_backend_dev_t dev = new ggml_backend_device {
+            .iface = ggml_backend_metalium_device_interface,
+            .reg = &reg,
+            .context = dev_ctx
+        };
+        ctx->devices.push_back(dev);
+        // GGML does not have free for backend_reg and devices. Will force free on exit (thanks to RAII) but Metalium
+        // already de-init at that point
+        // g_backend_device_context_holder.push_back(std::unique_ptr<ggml_backend_metalium_device_context>(dev_ctx));
+        // g_backend_device_holder.push_back(std::unique_ptr<ggml_backend_device>(dev));
 
         reg = ggml_backend_reg {
             /* .api_version = */ GGML_BACKEND_API_VERSION,

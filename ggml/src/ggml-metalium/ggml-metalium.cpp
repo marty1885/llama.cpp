@@ -19,6 +19,8 @@
 #include "ttnn/tensor/types.hpp"
 #include "ttnn/types.hpp"
 #include "types/arch.h"
+#include "umd/device/types/arch.hpp"
+#include "umd/device/types/cluster_descriptor_types.hpp"
 #include <sys/types.h>
 #include <algorithm>
 #include <array>
@@ -2085,9 +2087,6 @@ static ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(ggml_backend
     auto device_id = dev_ctx->device_id;
     ggml_backend_metalium_reg_context* regctx = (ggml_backend_metalium_reg_context*)(dev->reg->context);
 
-    GGML_ASSERT((size_t)device_id < tt::tt_metal::GetNumAvailableDevices());
-    GGML_ASSERT((size_t)device_id < regctx->devices.size());
-
     static std::map<int, ggml_backend_buffer_type> buffer_type_map;
     static std::set<std::unique_ptr<ggml_backend_metalium_buffer_type_context>> buffer_type_context_deleter;
     auto it = buffer_type_map.find(device_id);
@@ -2103,9 +2102,10 @@ static ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(ggml_backend
     auto* bufctx_ptr = bufctx.get();
     buffer_type_context_deleter.insert(std::move(bufctx));
 
+    // TODO: Make sure the device_id we got is valid
     buffer_type_map[device_id] = {
         /* .iface    = */ ggml_backend_metalium_buffer_type_interface,
-        /* .device   = */ regctx->devices[device_id],
+        /* .device   = */ regctx->devices[0],
         /* .context  = */ bufctx_ptr,
     };
     return &buffer_type_map[device_id];
@@ -2503,9 +2503,9 @@ static size_t ggml_backend_metalium_reg_get_device_count(ggml_backend_reg_t reg)
 }
 
 static ggml_backend_dev_t ggml_backend_metalium_reg_get_device(ggml_backend_reg_t reg, size_t index) {
+    GGML_UNUSED(index);
     ggml_backend_metalium_reg_context * ctx = (ggml_backend_metalium_reg_context *)reg->context;
-    GGML_ASSERT(index < ctx->devices.size());
-    return ctx->devices[index];
+    return ctx->devices[0];
 }
 
 static const ggml_backend_reg_i ggml_backend_metalium_reg_interface = {
@@ -2650,7 +2650,7 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
         ggml_backend_metalium_device_context * dev_ctx = new ggml_backend_metalium_device_context;
         std::shared_ptr<ttnn::MeshDevice> device;
         if(mesh_env == NULL) {
-            device = ttnn::open_mesh_device(0);
+            device = ttnn::open_mesh_device(device_id);
         }
         else {
             device = ttnn::distributed::open_mesh_device(mesh_shape, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 2, tt::tt_metal::DispatchCoreType::ETH);
@@ -2663,13 +2663,27 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
         dev_ctx->device = device;
         dev_ctx->device_id = device_id;
         dev_ctx->name = "METALIUM" + std::to_string(device_id);
-        auto devshape = device->get_view().shape();
-        std::string devshape_str;
-        for(size_t i = 0; i < devshape.dims(); i++) {
-            devshape_str += std::to_string(devshape[i]) + "x";
+        // WHY???
+        // chip_id_t MeshDevice::build_id() const { return reference_device()->id(); }
+        // Reference device should be the same... Dafaq?
+        chip_id_t id = device->get_devices().size() == 1 ? device->get_devices()[0]->id() : device->id();
+        GGML_ASSERT(id == device_id && "WTF? Metalium ID should match with asked device ID");
+        std::string arch_str = tt::arch_to_str(device->arch());
+        std::transform(arch_str.begin(), arch_str.end(), arch_str.begin(), ::toupper);
+        if(device->get_devices().size() == 1) {
+            auto* real_device = device->get_devices()[0];
+            auto grid = real_device->compute_with_storage_grid_size();
+            dev_ctx->description = fmt::format("Tenstorrent {} [grid: {}x{}, id: {}]", arch_str, grid.x, grid.y, id);
         }
-        devshape_str.pop_back();
-        dev_ctx->description = fmt::format("Tenstorrent {} {} mesh", device->arch(), devshape_str);
+        else {
+            auto devshape = device->get_view().shape();
+            std::string devshape_str;
+            for(size_t i = 0; i < devshape.dims(); i++) {
+                devshape_str += std::to_string(devshape[i]) + "x";
+            }
+            devshape_str.pop_back();
+            dev_ctx->description = fmt::format("Tenstorrent {} {} mesh [id: {}]", arch_str, devshape_str, id);
+        }
 
         ggml_backend_dev_t dev = new ggml_backend_device {
             .iface = ggml_backend_metalium_device_interface,

@@ -83,6 +83,7 @@ The following hardware are tested.
 | Tenstorrent Device            | Status  |
 |:-----------------------------:|:-------:|
 | Wormhole N300                 | Tested  |
+| Wormhole QuietBox             | Tested  |
 
 ## DataType Supports
 
@@ -131,15 +132,13 @@ Besides the standard FP32 and BFP16 floating point support. Tenstorrent processo
 
 ### Runtime variables
 
-| Variable Name | Value                                | Description                                                                     |
+| Variable Name | Value                                           | Description                                                          |
 |--------------------------|--------------------------------------|----------------------------------------------------------------------|
 | TT_METAL_HOME            | string  (mandatory)                  | Path to the root of the tt-metal repository                          |
 | GGML_METALIUM_DEVICE_ID  | integer                              | ID of the device to use (single device). 0 is assumed if not set     |
 | GGML_METALIUM_MESH_SHAPE | string                               | Shape of the device mesh for clustering                              |
 
 NOTE: `GGML_METALIUM_DEVICE_ID` and `GGML_METALIUM_MESH_SHAPE` cannot be set at the same time.
-
-
 
 ### Debug flags
 
@@ -153,4 +152,4 @@ There are several debug flags available to assist with debugging/performance of 
 
 ## Know issues
 
-- The backend cannot peacefully exit due to the lack of a proper shutdown sequence GGML's API. Forcing use of static variables thus destruction is non-deterministic.
+- The backend cannot exit without leaking some memory (gets handled by OS) due to destruction order issues.

@@ -147,8 +147,9 @@ There are several debug flags available to assist with debugging/performance of 
 | Variable Name                    | Value           | Description                                                                                                                                                              |
 |----------------------------------|-----------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | GGML_METALIUM_PRINT_REJECTED_OPS | 0(default) or 1 | Print operators GGML asked if the Metalium backend can run, and Metalium reported false                                                                                  |
-| GGML_METALIUM_PRINT_VIEW         | 0(default) or 1 | Print all view operations (VIEW, TRANSPOSE, RESHAPE, PERMUTE) that the backend's lazy view system sees                                                                      |
+| GGML_METALIUM_PRINT_VIEW         | 0(default) or 1 | Print all view operations (VIEW, TRANSPOSE, RESHAPE, PERMUTE) that the backend's lazy view system sees                                                                   |
 | GGML_METALIUM_CACHE_MM_TRANSPOSE | 0(default) or 1 | TTNN has limited support for pre-transposed matmul that GGML needs and does most on the fly. This options cache the transpose. Trades lot of memory for some performance |
+|GGML_METALIUM_DISABLE_PROGRAM_CACHE|0(default) or 1 | Disables TTNN program cacheing                                                                                                                                           |
 
 ## Know issues
 

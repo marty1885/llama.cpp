@@ -9,7 +9,8 @@
 - [DataType Supports](#datatype-supports)
 - [Environment Variable](#environment-variable)
 
-> **IMPOTANT NOTE**: Although the author is a Tenstorrent employee, this backend is not an official Tenstorrent product. It started by the author pre-joining Tenstorrent and is developed in the author's free time. It is not supported by Tenstorrent, but the author is happy to help with issues and questions on the [Tenstorrent Discord server](https://discord.gg/tenstorrent). Just don't expect official support or bug fixes from Tenstorrent.
+> [!IMPORTANT]
+> Although the author is a Tenstorrent employee, this backend is not an official Tenstorrent product. It started by the author pre-joining Tenstorrent and is developed in the author's free time. It is not supported by Tenstorrent, but the author is happy to help with issues and questions on the [Tenstorrent Discord server](https://discord.gg/tenstorrent). Just don't expect official support or bug fixes from Tenstorrent.
 
 ## Background
 
@@ -25,10 +26,11 @@ The llama.cpp Metalium backend is designed to support inference on Tenstorrent's
 
 As mentioned earlier, the Metalium backend is experimental software. Thus features will be developed and enabled over time. As of writing the documentation, the following limitations applies:
 
-* Only device 0 is used
-* No device clustering support
+* Only one device is exposed at a time
+    * Multi device scaling is handled using TTNN's native scaling
+    * See the `GGML_METALIUM_DEVICE_ID` and `GGML_METALIUM_MESH_SHAPE` environment variables below
 * KV Cache has to be stored on the CPU (via the `-nkvo` flag)
-* FP32 is emulated by internally using BFP16 (The matrix unit does not support FP32 natively, though the vector unit does)
+* FP32 tenssors is emulated by internally using BFP16 (The matrix unit does not support FP32 natively, which is the bulk of compute, though the vector unit does support FP32)
 
 ### Dependencies
 
@@ -39,7 +41,6 @@ TBD. I don't have a formal list of what is needed for now. But you need to get T
 There is no "supported" TTNN versions Metalium and TTNN is still a moving target. Instead, need and support for newer versions of TTNN is constantly updated in order to utilize new features and take in bug fixes. However, generally build the latest Metalium and TTNN from the [official repostory](https://github.com/tenstorrent/tt-metal) by following the steps
 
 1. Setup you environment/driver following the [official guide](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md)
-   * As of writing, the official guide still references an old `ARCH_NAME` variable. Which is no longer needed
 2. Build Metalium (and TTNN) with GCC and install to the build directory.
    * Officially GCC >= 12 and Clang >= 17 is supported.
 
@@ -136,20 +137,21 @@ Besides the standard FP32 and BFP16 floating point support. Tenstorrent processo
 |--------------------------|--------------------------------------|----------------------------------------------------------------------|
 | TT_METAL_HOME            | string  (mandatory)                  | Path to the root of the tt-metal repository                          |
 | GGML_METALIUM_DEVICE_ID  | integer                              | ID of the device to use (single device). 0 is assumed if not set     |
-| GGML_METALIUM_MESH_SHAPE | string                               | Shape of the device mesh for clustering                              |
+| GGML_METALIUM_MESH_SHAPE | string                               | Shape of the device mesh for clustering (ex: 2x4 for 2x4 mesh)       |
 
 NOTE: `GGML_METALIUM_DEVICE_ID` and `GGML_METALIUM_MESH_SHAPE` cannot be set at the same time.
+NOTE: Clustering is in early stage development. The option exists for development purpose.
 
 ### Debug flags
 
 There are several debug flags available to assist with debugging/performance of the backend. These flags are triggered by setting environment variables and will be removed eventually.
 
-| Variable Name                    | Value           | Description                                                                                                                                                              |
-|----------------------------------|-----------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| GGML_METALIUM_PRINT_REJECTED_OPS | 0(default) or 1 | Print operators GGML asked if the Metalium backend can run, and Metalium reported false                                                                                  |
-| GGML_METALIUM_PRINT_VIEW         | 0(default) or 1 | Print all view operations (VIEW, TRANSPOSE, RESHAPE, PERMUTE) that the backend's lazy view system sees                                                                   |
-| GGML_METALIUM_CACHE_MM_TRANSPOSE | 0(default) or 1 | TTNN has limited support for pre-transposed matmul that GGML needs and does most on the fly. This options cache the transpose. Trades lot of memory for some performance |
-|GGML_METALIUM_DISABLE_PROGRAM_CACHE|0(default) or 1 | Disables TTNN program cacheing                                                                                                                                           |
+| Variable Name                     | Value           | Description                                                                                                                                                              |
+|-----------------------------------|-----------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| GGML_METALIUM_PRINT_REJECTED_OPS  | 0(default) or 1 | Print operators GGML asked if the Metalium backend can run, and Metalium reported false                                                                                  |
+| GGML_METALIUM_PRINT_VIEW          | 0(default) or 1 | Print all view operations (VIEW, TRANSPOSE, RESHAPE, PERMUTE) that the backend's lazy view system sees                                                                   |
+| GGML_METALIUM_CACHE_MM_TRANSPOSE  | 0(default) or 1 | TTNN has limited support for pre-transposed matmul that GGML needs and does most on the fly. This options cache the transpose. Trades lot of memory for some performance |
+|GGML_METALIUM_DISABLE_PROGRAM_CACHE| 0(default) or 1 | Disables TTNN program cacheing                                                                                                                                           |
 
 ## Know issues
 

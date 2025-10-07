@@ -2628,9 +2628,9 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
         }
         if(mesh_env != NULL) {
             std::string_view mesh_view(mesh_env);
-            size_t n = mesh_view.find(',');
+            size_t n = mesh_view.find('x');
             if(n == std::string_view::npos) {
-                GGML_ABORT("Invalid mesh shape in GGML_METALIUM_MESH_SHAPE");
+                GGML_ABORT("Invalid mesh shape in GGML_METALIUM_MESH_SHAPE. Expected format WxH. ex: 2x4");
             }
             int y = 0;
             int x = 0;

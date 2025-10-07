@@ -870,6 +870,7 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
         else {
             aT = ttnn::transpose(a, -2, -1);
         }
+        GGML_ASSERT(aT.is_allocated() && "Matrix aT is not allocated");
         // TODO: Ask TT to support multiplication of pre-transposed tensors. Calling transpose here is inefficient
         // https://github.com/tenstorrent/tt-metal/issues/9709
         ttnn::operations::matmul::Matmul cfg = ttnn::operations::matmul::Matmul{
@@ -977,6 +978,9 @@ static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ct
             break;
         case GGML_UNARY_OP_EXP:
             ret = ttnn::exp(*src_tensor);
+            break;
+        case GGML_UNARY_OP_GELU_ERF:
+            ret = ttnn::gelu(ttnn::erf(*src_tensor), false);
             break;
         default:
             return false;
@@ -1176,6 +1180,16 @@ static void ggml_backend_metalium_get_rows(ggml_backend_metalium_context * ctx, 
         .ggtype = dst->type,
         .bufctx = ((TensorWithMetadata*)dst->src[0]->extra)->bufctx
     };
+}
+
+static bool ggml_backend_metalium_can_norm(const struct ggml_tensor * dst, bool rms)
+{
+    GGML_UNUSED(rms);
+    // no hard checks but this seems to work well enough
+    if(dst->ne[0] > 1024) {
+        return false;
+    }
+    return true;
 }
 
 static void ggml_backend_metalium_norm(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst, bool rms)
@@ -2147,6 +2161,7 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
                 case GGML_UNARY_OP_HARDSIGMOID:
                 case GGML_UNARY_OP_STEP:
                 case GGML_UNARY_OP_EXP:
+                case GGML_UNARY_OP_GELU_ERF:
                     ok = ggml_backend_metalium_activations(ctx, node, unary_op);
                     break;
                 default:
@@ -2371,14 +2386,16 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
                 default:
                     return false;
             }
+        case GGML_OP_NORM:
+            return ggml_backend_metalium_can_norm(op, false);
+        case GGML_OP_RMS_NORM:
+            return ggml_backend_metalium_can_norm(op, true);
         case GGML_OP_LEAKY_RELU:
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_TRANSPOSE:
         case GGML_OP_CLAMP:
         case GGML_OP_SCALE:
-        case GGML_OP_NORM:
-        case GGML_OP_RMS_NORM:
         case GGML_OP_ADD1:
         case GGML_OP_SQRT:
         case GGML_OP_SQR:
@@ -2559,7 +2576,7 @@ static void ggml_backend_metalium_device_get_props(ggml_backend_dev_t dev, ggml_
         .memory_free = free,
         .memory_total = total,
         .type = ggml_backend_metalium_get_type(dev),
-        .device_id = NULL, // We might not be on PCIe
+        .device_id = NULL, // TODO: Set this to a proper ID
         .caps = ggml_backend_dev_caps {
             .async = true,
             .host_buffer = false,

@@ -464,10 +464,10 @@ static void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, ggml_type
         if constexpr(std::is_same_v<SrcType, bfloat16>) {
             return static_cast<float>(src);
         }
-        else if constexpr (std::is_same_v<SrcType, float>) {
+        if constexpr (std::is_same_v<SrcType, float>) {
             return src;
         }
-        else if constexpr (std::is_same_v<SrcType, uint32_t>) {
+        if constexpr (std::is_same_v<SrcType, uint32_t>) {
             return src;
         }
         GGML_UNREACHABLE();
@@ -2546,10 +2546,11 @@ static void ggml_backend_metalium_get_memory(ggml_backend_dev_t dev, size_t * to
     GGML_UNUSED(dev);
     ggml_backend_metalium_device_context * ctx = (ggml_backend_metalium_device_context *)dev->context;
     size_t num_dram_channels = ctx->device->num_dram_channels();
+    size_t num_devices = ctx->device->num_devices();
     auto stats = ctx->device->allocator()->get_statistics(tt::tt_metal::BufferType::DRAM);
 
-    *total = stats.total_allocatable_size_bytes * num_dram_channels;
-    *free = stats.total_free_bytes * num_dram_channels;
+    *total = stats.total_allocatable_size_bytes * num_dram_channels * num_devices;
+    *free = stats.total_free_bytes * num_dram_channels * num_devices;
 }
 
 static enum ggml_backend_dev_type ggml_backend_metalium_get_type(ggml_backend_dev_t dev) {

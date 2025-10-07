@@ -2542,7 +2542,7 @@ static const char * ggml_backend_metalium_device_get_description(ggml_backend_de
     return ctx->description.c_str();
 }
 
-static void ggml_backend_metalium_get_memory(ggml_backend_dev_t dev, size_t * total, size_t * free) {
+static void ggml_backend_metalium_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     GGML_UNUSED(dev);
     ggml_backend_metalium_device_context * ctx = (ggml_backend_metalium_device_context *)dev->context;
     size_t num_dram_channels = ctx->device->num_dram_channels();
@@ -2570,7 +2570,7 @@ static void ggml_backend_metalium_device_get_props(ggml_backend_dev_t dev, ggml_
     ggml_backend_metalium_device_context * ctx = (ggml_backend_metalium_device_context *)dev->context;
     size_t free = 0;
     size_t total = 0;
-    ggml_backend_metalium_get_memory(dev, &total, &free);
+    ggml_backend_metalium_get_memory(dev, &free, &total);
     *props = ggml_backend_dev_props {
         .name = ctx->name.c_str(),
         .description = ctx->description.c_str(),

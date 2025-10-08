@@ -1186,7 +1186,7 @@ static bool ggml_backend_metalium_can_norm(const struct ggml_tensor * dst, bool 
 {
     GGML_UNUSED(rms);
     // no hard checks but this seems to work well enough
-    if(dst->ne[0] > 1024) {
+    if(dst->ne[0] > 4096) {
         return false;
     }
     return true;
@@ -2617,6 +2617,8 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
     static ggml_backend_reg reg;
     static std::once_flag once;
     std::call_once(once, [&]() {
+        // TODO: TTNN though not have peoper system packaging yet. Does support working in installed for (via Python packages rn)
+        // Remove this limitation
         if(getenv("TT_METAL_HOME") == NULL) {
             fmt::println(stderr, "The TT_METAL_HOME environment variables must be set to use the Metalium backend");
             abort();

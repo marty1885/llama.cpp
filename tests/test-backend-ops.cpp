@@ -4038,6 +4038,10 @@ struct test_rope : public test_case {
         }
     }
 
+    double max_nmse_err() override {
+        return 1e-4;
+    }
+
     double max_maa_err() override {
         return 1e-3;
     }

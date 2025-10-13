@@ -3,6 +3,7 @@
 #include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
 #include "compute_kernel_api/eltwise_unary/exp.h"
 #include "compute_kernel_api/eltwise_unary/recip.h"
+#include "compute_kernel_api/eltwise_unary/identity.h"
 #include "compute_kernel_api/eltwise_unary/trigonometry.h"
 #include <string.h>
 
@@ -110,7 +111,7 @@ inline vInt load_into_row(int* ptr)
     return v;
 }
 
-inline void rope_face(int pos, float inv_d, int vec_offset, int face_idx)
+inline void rope_face(int pos, int face_idx)
 {
     DeviceZoneScopedN("ROPE-FACE");
     // RoPE - we need to calculate the final rotation sin(angle) and cos(angle)
@@ -137,13 +138,12 @@ inline void rope_face(int pos, float inv_d, int vec_offset, int face_idx)
     //      vConstFloatPrg2. Reused across the kernel.
     // TODO: DIM_SIZE should be treated as a constant and this 1.f/DIM_SIZE can be
     //      evaulated at compile time.
-    int face_row = face_idx / 2;
     int face_col = face_idx % 2;
     int dst_offset = face_idx*8;
+    vFloat vpos = int32_to_float(pos);
     for (int h = 0; h < 2; h++) {
-        vFloat freq = dst_reg[64+8+face_col*2+h];
+        vFloat freq = dst_reg[64+face_col*2+h];
         for (int i = 0; i < 4; i++) {
-            vFloat vpos = int32_to_float(pos);
 
             // Standard RoPE math
             vFloat angle_phase = vpos * freq;
@@ -182,13 +182,11 @@ inline void rope_tile(int pos, float inv_d, int vec_offset)
 
         vFloat term_to_exp = -exponent * vConstFloatPrgm0 - vConstFloatPrgm1;
         vFloat freq = vector_exp(term_to_exp);
-        dst_reg[64+8+i] = freq;
+        dst_reg[64+i] = freq;
     }
 
     for (int face = 0; face < 4; face++) {
-        int internal_offset = ((face % 2 == 0) ? 0 : 16);
-        int idx_offset = face > 1 ? 16 : 0;
-        rope_face(pos, inv_d, vec_offset + internal_offset, face);
+        rope_face(pos, face);
     }
 
     math::clear_dst_reg_addr();
@@ -196,22 +194,6 @@ inline void rope_tile(int pos, float inv_d, int vec_offset)
     math::clear_addr_mod_base();
 }
 
-// inline void rope_tile_precompute_pos(int* pos)
-// {
-//     DeviceZoneScopedN("ROPE-TILE-PRECOMP-POS");
-//     math::set_dst_write_addr<DstTileLayout::Default, DstTileShape::Tile32x32>(0);
-//     math::set_addr_mod_base();
-//     TTI_STALLWAIT(p_stall::STALL_SFPU, p_stall::MATH);
-
-//     for (int i=0;i<8;i++) {
-//         vFloat vpos = int32_to_float(load_into_row(pos+i*4));
-//         dst_reg[64+i] = vpos;
-//     }
-
-//     math::clear_dst_reg_addr();
-//     TTI_STALLWAIT(p_stall::STALL_CFG, p_stall::WAIT_SFPU);
-//     math::clear_addr_mod_base();
-// }
 #endif
 
 namespace NAMESPACE {
@@ -233,20 +215,20 @@ void MAIN {
     float inv_d = 1.f/(n_tiles_width_active * (32 / 2));
     MATH(rope_tile_init(inv_d));
 
-    uint32_t last_h = (uint32_t)-1;
     int* idxs_ptr = nullptr;
     cb_wait_front(cb_in1, 1);
     cb_get_tile(cb_in1, 0, &idxs_ptr);
     idxs_ptr += 4; // Need to shift because read ptr is off by 1 << 4 bytes in BBE
 
 
+    copy_tile_init(cb_in0);
+    pack_reconfig_data_format(cb_out0);
     for(uint32_t active_id=active_begin; active_id<active_end; active_id++) {
         uint32_t b = active_id / (n_tiles_width_active/2) / n_tiles_height;
         uint32_t w = active_id % (n_tiles_width_active/2);
         cb_wait_front(cb_in0, 2);
         tile_regs_acquire();
 
-        copy_tile_init(cb_in0);
         copy_tile(cb_in0, 0, 0);
         copy_tile(cb_in0, 1, 1);
         MATH(rope_tile(idxs_ptr[b], inv_d, w*32));
@@ -254,7 +236,6 @@ void MAIN {
         tile_regs_wait();
 
         cb_reserve_back(cb_out0, 2);
-        pack_reconfig_data_format(cb_out0);
         pack_tile(0, cb_out0, 0);
         pack_tile(1, cb_out0, 1);
         tile_regs_release();

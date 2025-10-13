@@ -350,7 +350,9 @@ static tt::tt_metal::HostBuffer data2borroweded_storage(const SrcType* src, size
     // Optimization: avoid unnecessary initialization and copying like vec<float>(size) as it tanks performance
     Dst* vec = new Dst[size];
     // special case if both GGML and TT types have the same underlying type (e.g. both FP32 or BF16)
-    if constexpr(std::is_same_v<Src, Dst> || (std::is_same_v<Src, ggml_bf16_t> && std::is_same_v<Dst, bfloat16>)) {
+    if constexpr(std::is_same_v<Src, Dst>
+        || (std::is_same_v<Src, ggml_bf16_t> && std::is_same_v<Dst, bfloat16>)
+        || (std::is_same_v<Src, int> && std::is_same_v<Dst, uint32_t>)) { // we really don't care about signedness here
         static_assert(sizeof(Src) == sizeof(Dst), "Src and Dst must have the same size");
         // Make GCC shut up about writing into a class like it's flat memory
         memcpy((void*)vec, src, size * sizeof(Src));
@@ -1751,8 +1753,8 @@ static bool ggml_backend_metalium_can_rope(const struct ggml_tensor * dst)
         beta_slow
     ] = float_params;
 
-    fmt::println(stderr, "Rope params: n_past {}, n_dims {}, mode {}, n_ctx {}, n_ctx_orig {}, freq_base {}, freq_scale {}, ext_factor {}, attn_factor {}, beta_fast {}, beta_slow {}",
-        n_past, n_dims, mode, n_ctx, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    // fmt::println(stderr, "Rope params: n_past {}, n_dims {}, mode {}, n_ctx {}, n_ctx_orig {}, freq_base {}, freq_scale {}, ext_factor {}, attn_factor {}, beta_fast {}, beta_slow {}",
+    //     n_past, n_dims, mode, n_ctx, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
 
     return n_dims % 64 == 0 && mode == GGML_ROPE_TYPE_NEOX
         && freq_scale == 1.f && ext_factor == 0.f && attn_factor == 1.f
@@ -1780,7 +1782,7 @@ static void ggml_backend_metalium_rope(ggml_backend_metalium_context * ctx, stru
         n_ctx_orig ] = int_params;
 
     std::array<float, 6> float_params;
-    memcpy(float_params.data(), dst->op_params + sizeof(int_params), sizeof(float_params));
+    memcpy(float_params.data(), dst->op_params + int_params.size() , sizeof(float_params));
     auto [
         freq_base,
         freq_scale,

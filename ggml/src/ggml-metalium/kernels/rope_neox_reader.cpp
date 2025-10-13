@@ -21,7 +21,7 @@ void kernel_main() {
     const auto src = TensorAccessor(src_args, src_addr, tile_size_bytes);
 
     constexpr auto idx_args = TensorAccessorArgs<src_args.next_compile_time_args_offset()>();
-    const auto idx = TensorAccessor(idx_args, idx_addr, n_tiles_height*32*sizeof(int32_t));
+    const auto idx = TensorAccessor(idx_args, idx_addr, batch_size*sizeof(int32_t));
 
     cb_reserve_back(cb_in1, 1);
     uint32_t cb_idx_addr = get_write_ptr(cb_in1);

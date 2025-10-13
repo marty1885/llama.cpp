@@ -1,4 +1,5 @@
 #include "rope.hpp"
+#include "tt-metalium/tt_backend_api_types.hpp"
 #include <tt-metalium/work_split.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include <ttnn/operations/creation.hpp>
@@ -39,6 +40,27 @@ static CBHandle MakeCircularBufferFP32(Program& program, const CoreSpec& core, t
 static CBHandle MakeCircularBufferBFP16(Program& program, const CoreSpec& core, tt::CBIndex cb, uint32_t n_tiles) {
     constexpr uint32_t tile_size = sizeof(bfloat16) * TILE_WIDTH * TILE_HEIGHT;
     return MakeCircularBuffer(program, core, cb, n_tiles * tile_size, tile_size, tt::DataFormat::Float16_b);
+}
+
+static CBHandle MakeCircularBuffer(Program& program, const CoreSpec& core, tt::CBIndex cb, uint32_t n_tiles, tt::tt_metal::DataType dtype)
+{
+    auto dt2dt = [](tt::tt_metal::DataType dt) {
+        switch(dt) {
+            case tt::tt_metal::DataType::FLOAT32: return tt::DataFormat::Float32;
+            case tt::tt_metal::DataType::BFLOAT16: return tt::DataFormat::Float16_b;
+            case tt::tt_metal::DataType::INT32: return tt::DataFormat::Int32;
+            case tt::tt_metal::DataType::BFLOAT8_B: return tt::DataFormat::Bfp8_b;
+            case tt::tt_metal::DataType::BFLOAT4_B: return tt::DataFormat::Bfp4_b;
+            case tt::tt_metal::DataType::UINT8: return tt::DataFormat::UInt8;
+            case tt::tt_metal::DataType::UINT16: return tt::DataFormat::UInt16;
+            case tt::tt_metal::DataType::UINT32: return tt::DataFormat::UInt32;
+            default:
+                TT_FATAL(false, "Unsupported data type: {}", static_cast<int>(dt));
+        }
+    };
+
+    auto tile_size = tt::tile_size(dt2dt(dtype));
+    return MakeCircularBuffer(program, core, cb, n_tiles*tile_size, tile_size, dt2dt(dtype));
 }
 
 
@@ -157,10 +179,10 @@ tt::tt_metal::operation::ProgramWithCallbacks ttggml::RoPEDeviceOperation::creat
     // Combine the two groups of cores
     auto all_cores = all_cores_active.merge(all_cores_passive);
 
-    MakeCircularBufferFP32(program, all_cores, tt::CBIndex::c_0, 4);
-    MakeCircularBuffer(program, all_cores, tt::CBIndex::c_1, B*sizeof(int32_t), B*sizeof(int32_t), tt::DataFormat::Int32);
-    MakeCircularBufferFP32(program, all_cores, tt::CBIndex::c_16, 4);
-    MakeCircularBufferFP32(program, all_cores, tt::CBIndex::c_17, 4);
+    MakeCircularBuffer(program, all_cores, tt::CBIndex::c_0, 4, src_tensor.dtype()); // cb_in0
+    MakeCircularBuffer(program, all_cores, tt::CBIndex::c_1, B*sizeof(int32_t), B*sizeof(int32_t), tt::DataFormat::Int32); // cb_in1
+    MakeCircularBuffer(program, all_cores, tt::CBIndex::c_16, 4, output_tensor.dtype()); // cb_out
+    MakeCircularBuffer(program, all_cores, tt::CBIndex::c_17, 4, src_tensor.dtype()); // cb_bypass
 
     std::map<std::string, std::string> defines;
     defines["FREQ_BASE"] = std::to_string(freq_base);
@@ -211,9 +233,9 @@ tt::tt_metal::operation::ProgramWithCallbacks ttggml::RoPEDeviceOperation::creat
                 passive_size = work_per_core2_passive;
             }
 
-            SetRuntimeArgs(program, reader, core, std::vector<uint32_t>{(uint32_t)src->address(), D_activet, Dt, Nt, (uint32_t)idxs->address(), B, active_id, active_id+active_size, passive_id, passive_id+passive_size, N});
+            SetRuntimeArgs(program, reader, core, std::vector<uint32_t>{src->address(), D_activet, Dt, Nt, idxs->address(), B, active_id, active_id+active_size, passive_id, passive_id+passive_size, N});
             SetRuntimeArgs(program, compute, core, std::vector<uint32_t>{D_activet, Dt, Nt, B, active_id, active_id+active_size, N});
-            SetRuntimeArgs(program, writer, core, std::vector<uint32_t>{(uint32_t)dst->address(), D_activet, Dt, Nt, B, active_id, active_id+active_size, passive_id, passive_id+passive_size});
+            SetRuntimeArgs(program, writer, core, std::vector<uint32_t>{dst->address(), D_activet, Dt, Nt, B, active_id, active_id+active_size, passive_id, passive_id+passive_size});
 
             active_id += active_size;
             passive_id += passive_size;

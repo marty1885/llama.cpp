@@ -6,6 +6,7 @@ message(STATUS "Metalium found.")
 
 ggml_add_backend_library(ggml-metalium
     ggml-metalium.cpp
+    rope.cpp
 )
 
 target_include_directories(ggml-metalium PRIVATE

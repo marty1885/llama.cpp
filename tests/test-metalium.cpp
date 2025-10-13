@@ -6,7 +6,7 @@
 
 int main(void) {
     const int D = 512;
-    const int N = 1;
+    const int N = 4;
     std::vector<float> input_vec(D * N);
     for(int i = 0; i < D * N; i++) {
         input_vec[i] = (float)i;
@@ -30,10 +30,11 @@ int main(void) {
     struct ggml_context * ctx = ggml_init(params);
 
     // 2. Create tensors and set data
-    struct ggml_tensor * tensor_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, N);
+    struct ggml_tensor * tensor_a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, 1, N);
     struct ggml_tensor * tensor_b = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, N, 1);
     memcpy(tensor_a->data, input_vec.data(), ggml_nbytes(tensor_a));
     memcpy(tensor_b->data, pos.data(), ggml_nbytes(tensor_b));
+    printf("%zu, %zu\n", tensor_a->ne[2], tensor_b->ne[0]);
 
 
     struct ggml_cgraph * gf = ggml_new_graph(ctx);

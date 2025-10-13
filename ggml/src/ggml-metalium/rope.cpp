@@ -6,45 +6,34 @@
 #include <ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp>
 
 using namespace tt::tt_metal;
-constexpr uint32_t TILE_WIDTH = 32;
-constexpr uint32_t TILE_HEIGHT = 32;
 
-static std::shared_ptr<distributed::MeshBuffer> MakeBuffer(const std::shared_ptr<distributed::MeshDevice>& device, uint32_t size, uint32_t page_size, bool sram = false) {
-    distributed::DeviceLocalBufferConfig config{
-          .page_size = page_size,
-          .buffer_type = (sram ? BufferType::L1 : BufferType::DRAM)
-    };
-    distributed::ReplicatedBufferConfig buffer_config{.size = size};
-    return distributed::MeshBuffer::create(buffer_config, config, device.get());
-}
+struct RoPEDeviceOperation {
+    const tt::tt_metal::MemoryConfig output_mem_config;
+    const tt::tt_metal::DataType output_dtype{};
+    const uint32_t active_dim_size = 0;
+    const float freq_base = 10000.0f;
 
+    void validate_with_output_tensors(
+        const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
+    std::vector<ttnn::TensorSpec> compute_output_specs(
+        const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
+
+    std::vector<Tensor> create_output_tensors(
+        const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
+    tt::tt_metal::operation::ProgramWithCallbacks create_program(
+        const std::vector<Tensor>& input_tensors, std::vector<Tensor>& output_tensors) const;
+};
 
 using CoreSpec = std::variant<CoreCoord, CoreRange, CoreRangeSet>;
-template <typename T>
-static std::shared_ptr<distributed::MeshBuffer> MakeBuffer(const std::shared_ptr<distributed::MeshDevice>& device, uint32_t n_tiles, bool sram = false) {
-    const uint32_t tile_size = sizeof(T) * TILE_WIDTH * TILE_HEIGHT;
-    return MakeBuffer(device, tile_size * n_tiles, tile_size, sram);
-}
-
 static CBHandle MakeCircularBuffer(
     Program& program, const CoreSpec& core, tt::CBIndex cb, uint32_t size, uint32_t page_size, tt::DataFormat format) {
     CircularBufferConfig cb_src0_config = CircularBufferConfig(size, {{cb, format}}).set_page_size(cb, page_size);
     return CreateCircularBuffer(program, core, cb_src0_config);
 }
 
-static CBHandle MakeCircularBufferFP32(Program& program, const CoreSpec& core, tt::CBIndex cb, uint32_t n_tiles) {
-    constexpr uint32_t tile_size = sizeof(float) * TILE_WIDTH * TILE_HEIGHT;
-    return MakeCircularBuffer(program, core, cb, n_tiles * tile_size, tile_size, tt::DataFormat::Float32);
-}
-
-static CBHandle MakeCircularBufferBFP16(Program& program, const CoreSpec& core, tt::CBIndex cb, uint32_t n_tiles) {
-    constexpr uint32_t tile_size = sizeof(bfloat16) * TILE_WIDTH * TILE_HEIGHT;
-    return MakeCircularBuffer(program, core, cb, n_tiles * tile_size, tile_size, tt::DataFormat::Float16_b);
-}
-
 static CBHandle MakeCircularBuffer(Program& program, const CoreSpec& core, tt::CBIndex cb, uint32_t n_tiles, tt::tt_metal::DataType dtype)
 {
-    auto dt2dt = [](tt::tt_metal::DataType dt) {
+    auto df2dt = [](tt::tt_metal::DataType dt) {
         switch(dt) {
             case tt::tt_metal::DataType::FLOAT32: return tt::DataFormat::Float32;
             case tt::tt_metal::DataType::BFLOAT16: return tt::DataFormat::Float16_b;
@@ -59,8 +48,8 @@ static CBHandle MakeCircularBuffer(Program& program, const CoreSpec& core, tt::C
         }
     };
 
-    auto tile_size = tt::tile_size(dt2dt(dtype));
-    return MakeCircularBuffer(program, core, cb, n_tiles*tile_size, tile_size, dt2dt(dtype));
+    auto tile_size = tt::tile_size(df2dt(dtype));
+    return MakeCircularBuffer(program, core, cb, n_tiles*tile_size, tile_size, df2dt(dtype));
 }
 
 
@@ -77,7 +66,7 @@ ttnn::Tensor ttggml::RoPEOperation::invoke(const Tensor& src_tensor, const Tenso
             {})[0];
 }
 
-std::vector<ttnn::TensorSpec> ttggml::RoPEDeviceOperation::compute_output_specs(
+std::vector<ttnn::TensorSpec> RoPEDeviceOperation::compute_output_specs(
     const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const
 {
     if (!output_tensors.empty() && output_tensors[0].has_value()) {
@@ -94,7 +83,7 @@ std::vector<ttnn::TensorSpec> ttggml::RoPEDeviceOperation::compute_output_specs(
     )};
 }
 
-std::vector<ttnn::Tensor> ttggml::RoPEDeviceOperation::create_output_tensors(
+std::vector<ttnn::Tensor> RoPEDeviceOperation::create_output_tensors(
     const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const {
     if (!output_tensors.empty() && output_tensors[0].has_value()) {
         return {output_tensors[0].value()};
@@ -104,7 +93,7 @@ std::vector<ttnn::Tensor> ttggml::RoPEDeviceOperation::create_output_tensors(
     return {create_device_tensor(spec, input_tensor.device())};
 }
 
-void ttggml::RoPEDeviceOperation::validate_with_output_tensors(
+void RoPEDeviceOperation::validate_with_output_tensors(
     const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const {
     const auto& src_tensor = input_tensors.at(0);
     const auto& index_tensor = input_tensors.at(1);
@@ -134,7 +123,7 @@ void ttggml::RoPEDeviceOperation::validate_with_output_tensors(
     TT_FATAL(freq_base >= 0, "base_freq must be non-negative");
 }
 
-tt::tt_metal::operation::ProgramWithCallbacks ttggml::RoPEDeviceOperation::create_program(
+tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_program(
     const std::vector<Tensor>& input_tensors, std::vector<Tensor>& output_tensors) const
 {
     tt::tt_metal::Program program{};
@@ -248,9 +237,9 @@ tt::tt_metal::operation::ProgramWithCallbacks ttggml::RoPEDeviceOperation::creat
                                                   const std::vector<Tensor>& input_tensors,
                                                   const std::vector<std::optional<const Tensor>>&,
                                                   const std::vector<Tensor>& output_tensors) {
-            auto src_buffer = input_tensors.at(0).buffer();
-            auto idx_buffer = input_tensors.at(1).buffer();
-            auto dst_buffer = output_tensors.at(0).buffer();
+            auto* src_buffer = input_tensors.at(0).buffer();
+            auto* idx_buffer = input_tensors.at(1).buffer();
+            auto* dst_buffer = output_tensors.at(0).buffer();
 
             for(const auto& range : all_cores.ranges()) {
                 for (const auto& core : range) {

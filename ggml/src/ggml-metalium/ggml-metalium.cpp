@@ -1758,7 +1758,8 @@ static bool ggml_backend_metalium_can_rope(const struct ggml_tensor * dst)
 
     return n_dims % 64 == 0 && mode == GGML_ROPE_TYPE_NEOX
         && freq_scale == 1.f && ext_factor == 0.f && attn_factor == 1.f
-        && beta_fast == beta_slow;
+        && beta_fast == beta_slow
+        && dst->src[2] == nullptr; // Don't support freq factor yet
 }
 
 

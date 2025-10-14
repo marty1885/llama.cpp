@@ -1757,8 +1757,7 @@ static bool ggml_backend_metalium_can_rope(const struct ggml_tensor * dst)
     //     n_past, n_dims, mode, n_ctx, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
 
     return n_dims % 64 == 0 && mode == GGML_ROPE_TYPE_NEOX
-        && freq_scale == 1.f && ext_factor == 0.f && attn_factor == 1.f
-        && beta_fast == beta_slow
+        && freq_scale == 1.f && ext_factor == 0.f
         && dst->src[2] == nullptr; // Don't support freq factor yet
 }
 
@@ -1779,7 +1778,7 @@ static void ggml_backend_metalium_rope(ggml_backend_metalium_context * ctx, stru
         n_past,
         n_dims,
         mode,
-        n_ctx, 
+        n_ctx,
         n_ctx_orig ] = int_params;
 
     std::array<float, 6> float_params;
@@ -1797,7 +1796,8 @@ static void ggml_backend_metalium_rope(ggml_backend_metalium_context * ctx, stru
         *realize_ggml_view(dst->src[0]),
         *realize_ggml_view(dst->src[1]),
         n_dims,
-        freq_base);
+        freq_base,
+        attn_factor);
     *dst_meta = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(res)),
         .ggtype = dst->type,
@@ -2366,7 +2366,7 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
             case GGML_OP_GLU:
                 ggml_backend_metalium_glu(ctx, node);
                 break;
-            
+
             case GGML_OP_ROPE:
                 ggml_backend_metalium_rope(ctx, node);
                 break;

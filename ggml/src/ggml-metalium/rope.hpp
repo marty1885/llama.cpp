@@ -8,7 +8,7 @@ namespace ttggml {
 using namespace ttnn;
 
 struct RoPEOperation {
-    static ttnn::Tensor invoke(const Tensor& src_tensor, const Tensor& index_tensor, uint32_t active_dim_size, float freq_base = 10000.0f);
+    static ttnn::Tensor invoke(const Tensor& src_tensor, const Tensor& index_tensor, uint32_t active_dim_size, float freq_base = 10000.0f, float attn_factor = 1.f);
 };
 constexpr auto rope = ttnn::register_operation<"ttggml::rope", ttggml::RoPEOperation>();
 }

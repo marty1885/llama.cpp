@@ -13,6 +13,7 @@ struct RoPEDeviceOperation {
     const tt::tt_metal::DataType output_dtype{};
     const uint32_t active_dim_size = 0;
     const float freq_base = 10000.0f;
+    const float attn_factor = 1.f;
 
     void validate_with_output_tensors(
         const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
@@ -25,13 +26,14 @@ struct RoPEDeviceOperation {
         const std::vector<Tensor>& input_tensors, std::vector<Tensor>& output_tensors) const;
 };
 
-ttnn::Tensor ttggml::RoPEOperation::invoke(const Tensor& src_tensor, const Tensor& index_tensor, uint32_t active_dim_size, float freq_base) {
+ttnn::Tensor ttggml::RoPEOperation::invoke(const Tensor& src_tensor, const Tensor& index_tensor, uint32_t active_dim_size, float freq_base, float attn_factor) {
     return tt::tt_metal::operation::run(
             RoPEDeviceOperation{
                 src_tensor.memory_config(),
                 src_tensor.dtype(),
                 active_dim_size,
-                freq_base
+                freq_base,
+                attn_factor
             },
             {src_tensor, index_tensor},
             {},
@@ -148,6 +150,9 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
     std::map<std::string, std::string> defines;
     defines["FREQ_BASE"] = to_string_precise(freq_base);
     defines["FREQ_BASE_LOG"] = to_string_precise(std::log(freq_base));
+    if(attn_factor != 1.f) {
+        defines["ATTN_FACTOR"] = to_string_precise(attn_factor);
+    }
     // defines["INV_D_ACTIVE_2"] = float(2.f / D_active); // don't know why this make things slower.
 
 

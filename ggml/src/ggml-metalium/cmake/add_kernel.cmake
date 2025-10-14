@@ -5,7 +5,7 @@
 function(add_kernel target kernel_name)
     set(KERNEL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/kernels/${kernel_name}.cpp")
     set(GEN_DIR "${CMAKE_BINARY_DIR}/generated/kernels")
-    set(GEN_CPP "${GEN_DIR}/${kernel_name}.cpp")
+    set(GEN_CPP "${GEN_DIR}/__embed_${kernel_name}.cpp")
 
     file(MAKE_DIRECTORY "${GEN_DIR}")
 

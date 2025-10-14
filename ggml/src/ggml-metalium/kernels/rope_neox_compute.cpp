@@ -150,6 +150,11 @@ inline void rope_face(int pos, int face_idx)
             vFloat sin_value = vector_sin_phase(angle_phase);
             vFloat cos_value = vector_sin_phase(0.5f - angle_phase);
 
+            #ifdef ATTN_FACTOR
+                sin_value = sin_value * ATTN_FACTOR;
+                cos_value = cos_value * ATTN_FACTOR;
+            #endif
+
             int idx = i*2+h;
             vFloat x = dst_reg[dst_offset+idx];
             vFloat y = dst_reg[dst_offset+idx+32];

@@ -87,7 +87,21 @@ inline vFloat vector_sin_phase(vFloat x)
     return v;
 }
 
-inline void rope_face(int pos, int face_idx)
+#ifdef EXT_FACTOR
+sfpi_inline vFloat rope_yarn_ramp(vFloat vec_pos) {
+    vFloat y = (vec_pos - CORR_DIMS0) * (1.f / std::max(0.001f, float(CORR_DIMS1 - CORR_DIMS0)));
+    v_if(y < 0.f) {
+        y = 0;
+    }
+    v_elseif(y > 1.f) {
+        y = 1;
+    }
+    v_endif;
+    return 1.f - y;
+}
+#endif
+
+inline void rope_face(int pos, int face_idx, int pos_in_vector)
 {
     // RoPE - we need to calculate the final rotation sin(angle) and cos(angle)
     // Where andgle = pos * freq
@@ -118,18 +132,13 @@ inline void rope_face(int pos, int face_idx)
     vFloat vpos = int32_to_float(pos);
     for (int h = 0; h < 2; h++) {
         vFloat freq = dst_reg[64+face_col*2+h];
+        vFloat mscale = dst_reg[64+face_col*2+h+4];
+
+        // Standard RoPE math
+        vFloat angle_phase = vpos * freq;
+        vFloat sin_value = vector_sin_phase(angle_phase) * mscale;
+        vFloat cos_value = vector_sin_phase(0.5f - angle_phase) * mscale;
         for (int i = 0; i < 4; i++) {
-
-            // Standard RoPE math
-            vFloat angle_phase = vpos * freq;
-            vFloat sin_value = vector_sin_phase(angle_phase);
-            vFloat cos_value = vector_sin_phase(0.5f - angle_phase);
-
-            #ifdef ATTN_FACTOR
-                sin_value = sin_value * ATTN_FACTOR;
-                cos_value = cos_value * ATTN_FACTOR;
-            #endif
-
             int idx = i*2+h;
             vFloat x = dst_reg[dst_offset+idx];
             vFloat y = dst_reg[dst_offset+idx+32];
@@ -161,14 +170,30 @@ inline void rope_tile(int pos, float inv_d, int vec_offset)
 
         vFloat term_to_exp = -exponent * vConstFloatPrgm0 - vConstFloatPrgm1;
         vFloat freq = vector_exp(term_to_exp);
+
+        vFloat freq_scaled = freq;
+        vFloat mscale = 1.f;
+        vFloat theta = freq_scaled;
         #ifdef FREQ_SCALE
-        freq = freq * FREQ_SCALE;
+            freq_scaled = freq * FREQ_SCALE;
         #endif
-        dst_reg[64+i] = freq;
+        #ifdef ATTN_FACTOR
+            mscale = ATTN_FACTOR;
+        #endif
+        #ifdef EXT_FACTOR
+            vFloat ramp_mix = rope_yarn_ramp(block_lane_id) * EXT_FACTOR;
+            theta = freq_scaled * (1 - ramp_mix) + freq * ramp_mix;
+            #ifdef LOG_1_FREQ_SCALE
+                mscale *= 1.0f + 0.1f * LOG_1_FREQ_SCALE;
+            #endif // else mscahe *= 1 (the other half collasps to 0) - does nothing
+        #endif
+        dst_reg[64+i] = theta;
+        dst_reg[64+i+4] = mscale;
     }
 
     for (int face = 0; face < 4; face++) {
-        rope_face(pos, face);
+        int pos_in_vector = vec_offset + ((face % 2 == 0) ? 0 : 16);
+        rope_face(pos, face, pos_in_vector);
     }
 
     math::clear_dst_reg_addr();

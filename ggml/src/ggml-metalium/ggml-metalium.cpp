@@ -1743,23 +1743,10 @@ static bool ggml_backend_metalium_can_rope(const struct ggml_tensor * dst)
         n_ctx,
         n_ctx_orig
     ] = int_params;
-
-    std::array<float, 6> float_params;
-    memcpy(float_params.data(), dst->op_params + int_params.size(), sizeof(float_params));
-    auto [
-        freq_base,
-        freq_scale,
-        ext_factor,
-        attn_factor,
-        beta_fast,
-        beta_slow
-    ] = float_params;
-
     // fmt::println(stderr, "Rope params: n_past {}, n_dims {}, mode {}, n_ctx {}, n_ctx_orig {}, freq_base {}, freq_scale {}, ext_factor {}, attn_factor {}, beta_fast {}, beta_slow {}",
     //     n_past, n_dims, mode, n_ctx, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
 
     return n_dims % 64 == 0 && mode == GGML_ROPE_TYPE_NEOX
-        && ext_factor == 0.f && beta_fast == beta_slow
         && dst->src[2] == nullptr; // Don't support freq factor yet
 }
 
@@ -1798,9 +1785,13 @@ static void ggml_backend_metalium_rope(ggml_backend_metalium_context * ctx, stru
         *realize_ggml_view(dst->src[0]),
         *realize_ggml_view(dst->src[1]),
         n_dims,
+        n_ctx_orig,
         freq_base,
         freq_scale,
-        attn_factor);
+        ext_factor,
+        attn_factor,
+        beta_fast,
+        beta_slow);
     *dst_meta = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(res)),
         .ggtype = dst->type,

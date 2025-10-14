@@ -2,19 +2,39 @@
 #include "tt-metalium/host_api.hpp"
 #include "tt-metalium/kernel_types.hpp"
 #include "tt-metalium/tt_backend_api_types.hpp"
+#include <cmath>
 #include <tt-metalium/work_split.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include "utils.hpp"
 
 using namespace tt::tt_metal;
 
+// Yanked and adapted from other places in GGML
+static float rope_yarn_corr_factor(int n_dims, int n_ctx_orig, float n_rot, float base) {
+    return n_dims * std::log(n_ctx_orig / (n_rot * 2 * M_PI)) / (2 * std::log(base));
+}
+
+static std::array<float, 2> rope_yarn_corr_dims(
+    int n_dims, int n_ctx_orig, float freq_base, float beta_fast, float beta_slow
+) {
+    // start and end correction dims
+    return std::array<float, 2>{
+        std::max(0.0f,         std::floor(rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_fast, freq_base))),
+        std::min(n_dims - 1.0f, std::ceil(rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_slow, freq_base)))
+    };
+}
+
 struct RoPEDeviceOperation {
     const tt::tt_metal::MemoryConfig output_mem_config;
     const tt::tt_metal::DataType output_dtype{};
     const uint32_t active_dim_size = 0;
+    const uint32_t n_ctx_orig = 512;
     const float freq_base = 10000.0f;
     const float freq_scale = 1.f;
+    const float ext_factor = 0.f;
     const float attn_factor = 1.f;
+    const float beta_fast = 0.f;
+    const float beta_slow = 0.f;
 
     void validate_with_output_tensors(
         const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
@@ -27,19 +47,24 @@ struct RoPEDeviceOperation {
         const std::vector<Tensor>& input_tensors, std::vector<Tensor>& output_tensors) const;
 };
 
-ttnn::Tensor ttggml::RoPEOperation::invoke(const Tensor& src_tensor, const Tensor& index_tensor, uint32_t active_dim_size, float freq_base, float freq_scale, float attn_factor) {
+ttnn::Tensor ttggml::RoPEOperation::invoke(const Tensor& src_tensor, const Tensor& index_tensor, uint32_t active_dim_size, uint32_t n_ctx_orig, float freq_base,
+    float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
     return tt::tt_metal::operation::run(
-            RoPEDeviceOperation{
-                src_tensor.memory_config(),
-                src_tensor.dtype(),
-                active_dim_size,
-                freq_base,
-                freq_scale,
-                attn_factor
-            },
-            {src_tensor, index_tensor},
-            {},
-            {})[0];
+        RoPEDeviceOperation{
+            src_tensor.memory_config(),
+            src_tensor.dtype(),
+            active_dim_size,
+            n_ctx_orig,
+            freq_base,
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow
+        },
+        {src_tensor, index_tensor},
+        {},
+        {})[0];
 }
 
 std::vector<ttnn::TensorSpec> RoPEDeviceOperation::compute_output_specs(
@@ -157,6 +182,19 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
     }
     if(freq_scale != 1.f) {
         defines["FREQ_SCALE"] = to_string_precise(freq_scale);
+        defines["LOG_1_FREQ_SCALE"] = to_string_precise(std::log(1.0f / freq_scale));
+    }
+    if(ext_factor != 0.f) {
+        defines["EXT_FACTOR"] = to_string_precise(ext_factor);
+        auto corr_dims = rope_yarn_corr_dims(D_active, n_ctx_orig, freq_base, beta_fast, beta_slow);
+        if(isinf(corr_dims[0]) || isnan(corr_dims[0])) {
+            corr_dims[0] = 0;
+        }
+        if(isinf(corr_dims[1]) || isnan(corr_dims[1])) {
+            corr_dims[1] = 0;
+        }
+        defines["CORR_DIMS0"] = to_string_precise(corr_dims[0]);
+        defines["CORR_DIMS1"] = to_string_precise(corr_dims[1]);
     }
     // defines["INV_D_ACTIVE_2"] = float(2.f / D_active); // don't know why this make things slower.
 

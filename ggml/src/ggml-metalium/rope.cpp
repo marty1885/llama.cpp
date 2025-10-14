@@ -146,8 +146,8 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_17, 4, src_tensor.dtype()); // cb_bypass
 
     std::map<std::string, std::string> defines;
-    defines["FREQ_BASE"] = std::to_string(freq_base);
-    defines["FREQ_BASE_LOG"] = std::to_string(std::log(freq_base));
+    defines["FREQ_BASE"] = to_string_precise(freq_base);
+    defines["FREQ_BASE_LOG"] = to_string_precise(std::log(freq_base));
     // defines["INV_D_ACTIVE_2"] = float(2.f / D_active); // don't know why this make things slower.
 
 

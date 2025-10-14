@@ -16,3 +16,5 @@ tt::tt_metal::KernelHandle CreateMetaliumKernel(
     const std::string& str, // could be path or actual kenrel
     const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
     const std::variant<tt::tt_metal::DataMovementConfig, tt::tt_metal::ComputeConfig, tt::tt_metal::EthernetConfig>& config);
+
+std::string to_string_precise(float value);

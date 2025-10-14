@@ -94,3 +94,10 @@ KernelHandle CreateMetaliumKernel(
 
     throw std::runtime_error("Kernel " + str + " not found in any search path nor itself looks like a kernel");
 }
+
+std::string to_string_precise(float value)
+{
+    std::stringstream ss;
+    ss << std::hexfloat << value;
+    return ss.str();
+}

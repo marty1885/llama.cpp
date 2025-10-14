@@ -133,11 +133,12 @@ Besides the standard FP32 and BFP16 floating point support. Tenstorrent processo
 
 ### Runtime variables
 
-| Variable Name | Value                                           | Description                                                          |
-|--------------------------|--------------------------------------|----------------------------------------------------------------------|
-| TT_METAL_HOME            | string  (mandatory)                  | Path to the root of the tt-metal repository                          |
-| GGML_METALIUM_DEVICE_ID  | integer                              | ID of the device to use (single device). 0 is assumed if not set     |
-| GGML_METALIUM_MESH_SHAPE | string                               | Shape of the device mesh for clustering (ex: 2x4 for 2x4 mesh)       |
+| Variable Name             | Value                                | Description                                                          |
+|---------------------------|--------------------------------------|----------------------------------------------------------------------|
+| TT_METAL_HOME             | string  (mandatory)                  | Path to the root of the tt-metal repository                          |
+| GGML_METALIUM_DEVICE_ID   | integer                              | ID of the device to use (single device). 0 is assumed if not set     |
+| GGML_METALIUM_MESH_SHAPE  | string                               | Shape of the device mesh for clustering (ex: 2x4 for 2x4 mesh)       |
+| GGML_METALIUM_KERNEL_ROOT | string                               | Root of the Metalium kernel library in case running from weird places|
 
 NOTE: `GGML_METALIUM_DEVICE_ID` and `GGML_METALIUM_MESH_SHAPE` cannot be set at the same time.
 NOTE: Clustering is in early stage development. The option exists for development purpose.

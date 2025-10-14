@@ -1,7 +1,10 @@
 #include "rope.hpp"
+#include "tt-metalium/host_api.hpp"
+#include "tt-metalium/kernel_types.hpp"
 #include "tt-metalium/tt_backend_api_types.hpp"
 #include <tt-metalium/work_split.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
+#include <filesystem>
 #include <ttnn/operations/creation.hpp>
 #include <ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp>
 
@@ -52,6 +55,58 @@ static CBHandle MakeCircularBuffer(Program& program, const CoreSpec& core, tt::C
     return MakeCircularBuffer(program, core, cb, n_tiles*tile_size, tile_size, df2dt(dtype));
 }
 
+static KernelHandle CreateMetaliumKernel(
+    Program& program,
+    const std::string& str, // could be path or actual kenrel
+    const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
+    const std::variant<DataMovementConfig, ComputeConfig, EthernetConfig>& config) {
+
+    if(strchr(str.c_str(), '\n')) {
+        return tt::tt_metal::CreateKernelFromString(program, str, core_spec, config);
+    }
+
+    namespace fs = std::filesystem;
+    if(fs::exists(str)) {
+        return tt::tt_metal::CreateKernel(program, str, core_spec, config);
+    }
+
+    if(!fs::path(str).is_absolute()) {
+        // We are at root of GGML dir
+        fs::path p = fs::current_path() / "ggml/src/ggml-metalium/kernels/" / str;
+        if(fs::exists(p)) {
+            return tt::tt_metal::CreateKernel(program, p.string(), core_spec, config);
+        }
+        if(p.extension() != ".cpp") {
+            p = (fs::current_path() / "ggml/src/ggml-metalium/kernels/" / str).generic_string() + ".cpp";
+            if(fs::exists(p)) {
+                return tt::tt_metal::CreateKernel(program, p.string(), core_spec, config);
+            }
+        }
+
+        // we are at the build folder of llama.cpp
+        p = fs::current_path() / "../ggml/src/ggml-metalium/kernels/" / str;
+        if(fs::exists(p)) {
+            return tt::tt_metal::CreateKernel(program, p.string(), core_spec, config);
+        }
+        if(p.extension() != ".cpp") {
+            p = (fs::current_path() / "../ggml/src/ggml-metalium/kernels/" / str).generic_string() + ".cpp";
+            if(fs::exists(p)) {
+                return tt::tt_metal::CreateKernel(program, p.string(), core_spec, config);
+            }
+        }
+
+        const char* metalium_kernel_root = getenv("GGML_METALIUM_KERNEL_ROOT");
+        if(metalium_kernel_root != nullptr) {
+            p = fs::path(metalium_kernel_root) / str;
+            if(fs::exists(p)) {
+                return tt::tt_metal::CreateKernel(program, p.string(), core_spec, config);
+            }
+        }
+    }
+
+    throw std::runtime_error("Kernel " + str + " not found in any search path nor itself looks like a kernel");
+}
+
 
 ttnn::Tensor ttggml::RoPEOperation::invoke(const Tensor& src_tensor, const Tensor& index_tensor, uint32_t active_dim_size, float freq_base) {
     return tt::tt_metal::operation::run(
@@ -99,14 +154,14 @@ void RoPEDeviceOperation::validate_with_output_tensors(
     const auto& index_tensor = input_tensors.at(1);
 
     // expect src to have shape [batch, n_token, vec_dim]
-    // expect index to have shape [batch, n_token]
+    // expect index to have shape [batch]
     const auto& src_shape = src_tensor.logical_shape();
     const auto& index_shape = index_tensor.logical_shape();
     TT_FATAL(src_shape[-3] == index_shape[-1],
         "Shape mismatch: src_shape = {}, index_shape = {}. Expect format [batch, n_token, vec_dim] and [batch]", src_shape, index_shape);
 
     TT_FATAL(index_tensor.dtype() == tt::tt_metal::DataType::INT32 ||
-        index_tensor.dtype() == tt::tt_metal::DataType::UINT32, "Index tensor must be of type INT32");
+        index_tensor.dtype() == tt::tt_metal::DataType::UINT32, "Index tensor must be of type (U)INT32");
     TT_FATAL(src_tensor.layout() == tt::tt_metal::Layout::TILE,  "Source tensor must be of layout TILE");
     TT_FATAL(index_tensor.layout() == tt::tt_metal::Layout::ROW_MAJOR,  "Index tensor must be of layout ROW_MAJOR");
     TT_FATAL(index_tensor.storage_type() == tt::tt_metal::StorageType::DEVICE, "Index tensor must be on device");
@@ -170,7 +225,7 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
 
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_0, 4, src_tensor.dtype()); // cb_in0
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_1, B*sizeof(int32_t), B*sizeof(int32_t), tt::DataFormat::Int32); // cb_in1
-    MakeCircularBuffer(program, all_cores, tt::CBIndex::c_16, 4, output_tensor.dtype()); // cb_out
+    MakeCircularBuffer(program, all_cores, tt::CBIndex::c_16, 2, output_tensor.dtype()); // cb_out
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_17, 4, src_tensor.dtype()); // cb_bypass
 
     std::map<std::string, std::string> defines;
@@ -182,7 +237,7 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
     std::vector<uint32_t> reader_compile_time_args;
     TensorAccessorArgs(*src).append_to(reader_compile_time_args);
     TensorAccessorArgs(*idxs).append_to(reader_compile_time_args);
-    KernelHandle reader = CreateKernel(program, "../ggml/src/ggml-metalium/kernels/rope_neox_reader.cpp", all_cores, DataMovementConfig{
+    KernelHandle reader = CreateMetaliumKernel(program, "rope_neox_reader", all_cores, DataMovementConfig{
         .processor = DataMovementProcessor::RISCV_0,
         .noc = NOC::RISCV_0_default,
         .compile_args = reader_compile_time_args
@@ -190,13 +245,13 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
 
     std::vector<uint32_t> writer_compile_time_args;
     TensorAccessorArgs(*dst).append_to(writer_compile_time_args);
-    KernelHandle writer = CreateKernel(program, "../ggml/src/ggml-metalium/kernels/rope_neox_writer.cpp", all_cores, DataMovementConfig{
+    KernelHandle writer = CreateMetaliumKernel(program, "rope_neox_writer", all_cores, DataMovementConfig{
         .processor = DataMovementProcessor::RISCV_1,
         .noc = NOC::RISCV_1_default,
         .compile_args = writer_compile_time_args
     });
 
-    KernelHandle compute = CreateKernel(program, "../ggml/src/ggml-metalium/kernels/rope_neox_compute.cpp", all_cores, ComputeConfig{
+    KernelHandle compute = CreateMetaliumKernel(program, "rope_neox_compute", all_cores, ComputeConfig{
         .fp32_dest_acc_en = true,
         .defines = defines
     });
@@ -237,6 +292,7 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
                                                   const std::vector<Tensor>& input_tensors,
                                                   const std::vector<std::optional<const Tensor>>&,
                                                   const std::vector<Tensor>& output_tensors) {
+            (void)operation;
             auto* src_buffer = input_tensors.at(0).buffer();
             auto* idx_buffer = input_tensors.at(1).buffer();
             auto* dst_buffer = output_tensors.at(0).buffer();

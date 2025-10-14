@@ -4,9 +4,7 @@
 #include "tt-metalium/tt_backend_api_types.hpp"
 #include <tt-metalium/work_split.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
-#include <filesystem>
-#include <ttnn/operations/creation.hpp>
-#include <ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp>
+#include "utils.hpp"
 
 using namespace tt::tt_metal;
 
@@ -26,87 +24,6 @@ struct RoPEDeviceOperation {
     tt::tt_metal::operation::ProgramWithCallbacks create_program(
         const std::vector<Tensor>& input_tensors, std::vector<Tensor>& output_tensors) const;
 };
-
-using CoreSpec = std::variant<CoreCoord, CoreRange, CoreRangeSet>;
-static CBHandle MakeCircularBuffer(
-    Program& program, const CoreSpec& core, tt::CBIndex cb, uint32_t size, uint32_t page_size, tt::DataFormat format) {
-    CircularBufferConfig cb_src0_config = CircularBufferConfig(size, {{cb, format}}).set_page_size(cb, page_size);
-    return CreateCircularBuffer(program, core, cb_src0_config);
-}
-
-static CBHandle MakeCircularBuffer(Program& program, const CoreSpec& core, tt::CBIndex cb, uint32_t n_tiles, tt::tt_metal::DataType dtype)
-{
-    auto df2dt = [](tt::tt_metal::DataType dt) {
-        switch(dt) {
-            case tt::tt_metal::DataType::FLOAT32: return tt::DataFormat::Float32;
-            case tt::tt_metal::DataType::BFLOAT16: return tt::DataFormat::Float16_b;
-            case tt::tt_metal::DataType::INT32: return tt::DataFormat::Int32;
-            case tt::tt_metal::DataType::BFLOAT8_B: return tt::DataFormat::Bfp8_b;
-            case tt::tt_metal::DataType::BFLOAT4_B: return tt::DataFormat::Bfp4_b;
-            case tt::tt_metal::DataType::UINT8: return tt::DataFormat::UInt8;
-            case tt::tt_metal::DataType::UINT16: return tt::DataFormat::UInt16;
-            case tt::tt_metal::DataType::UINT32: return tt::DataFormat::UInt32;
-            default:
-                TT_FATAL(false, "Unsupported data type: {}", static_cast<int>(dt));
-        }
-    };
-
-    auto tile_size = tt::tile_size(df2dt(dtype));
-    return MakeCircularBuffer(program, core, cb, n_tiles*tile_size, tile_size, df2dt(dtype));
-}
-
-static KernelHandle CreateMetaliumKernel(
-    Program& program,
-    const std::string& str, // could be path or actual kenrel
-    const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
-    const std::variant<DataMovementConfig, ComputeConfig, EthernetConfig>& config) {
-
-    if(strchr(str.c_str(), '\n')) {
-        return tt::tt_metal::CreateKernelFromString(program, str, core_spec, config);
-    }
-
-    namespace fs = std::filesystem;
-    if(fs::exists(str)) {
-        return tt::tt_metal::CreateKernel(program, str, core_spec, config);
-    }
-
-    if(!fs::path(str).is_absolute()) {
-        // We are at root of GGML dir
-        fs::path p = fs::current_path() / "ggml/src/ggml-metalium/kernels/" / str;
-        if(fs::exists(p)) {
-            return tt::tt_metal::CreateKernel(program, p.string(), core_spec, config);
-        }
-        if(p.extension() != ".cpp") {
-            p = (fs::current_path() / "ggml/src/ggml-metalium/kernels/" / str).generic_string() + ".cpp";
-            if(fs::exists(p)) {
-                return tt::tt_metal::CreateKernel(program, p.string(), core_spec, config);
-            }
-        }
-
-        // we are at the build folder of llama.cpp
-        p = fs::current_path() / "../ggml/src/ggml-metalium/kernels/" / str;
-        if(fs::exists(p)) {
-            return tt::tt_metal::CreateKernel(program, p.string(), core_spec, config);
-        }
-        if(p.extension() != ".cpp") {
-            p = (fs::current_path() / "../ggml/src/ggml-metalium/kernels/" / str).generic_string() + ".cpp";
-            if(fs::exists(p)) {
-                return tt::tt_metal::CreateKernel(program, p.string(), core_spec, config);
-            }
-        }
-
-        const char* metalium_kernel_root = getenv("GGML_METALIUM_KERNEL_ROOT");
-        if(metalium_kernel_root != nullptr) {
-            p = fs::path(metalium_kernel_root) / str;
-            if(fs::exists(p)) {
-                return tt::tt_metal::CreateKernel(program, p.string(), core_spec, config);
-            }
-        }
-    }
-
-    throw std::runtime_error("Kernel " + str + " not found in any search path nor itself looks like a kernel");
-}
-
 
 ttnn::Tensor ttggml::RoPEOperation::invoke(const Tensor& src_tensor, const Tensor& index_tensor, uint32_t active_dim_size, float freq_base) {
     return tt::tt_metal::operation::run(

@@ -7,6 +7,7 @@ message(STATUS "Metalium found.")
 ggml_add_backend_library(ggml-metalium
     ggml-metalium.cpp
     rope.cpp
+    utils.cpp
 )
 
 target_include_directories(ggml-metalium PRIVATE
@@ -51,6 +52,20 @@ target_link_libraries(ggml-metalium PRIVATE
 
     ggml-base
 )
+
+if(GGML_METALIUM_EMBED_KERNELS)
+    add_library(ggml-metalium-kernels STATIC)
+    set(GGML_METALIUM_EMBED_KERNELS
+            rope_neox_reader
+            rope_neox_compute
+            rope_neox_writer
+    )
+    include(cmake/add_kernel.cmake)
+    foreach(kernel IN ITEMS ${GGML_METALIUM_EMBED_KERNELS})
+        add_kernel(ggml-metalium-kernels ${kernel})
+    endforeach()
+    target_link_libraries(ggml-metalium PRIVATE ggml-metalium-kernels)
+endif()
 
 
 target_compile_definitions(

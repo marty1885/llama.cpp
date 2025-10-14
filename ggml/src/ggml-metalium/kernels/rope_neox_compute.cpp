@@ -87,33 +87,8 @@ inline vFloat vector_sin_phase(vFloat x)
     return v;
 }
 
-// Each vInt is really treated as if it's a 8x4(width=8, height=4) block in SFPU and interacting with Dst
-// This function takes in a pointer `ptr` and load each integer into one of the rows of a vInt
-// int*      vInt
-// a         aaaaaaaa
-// b         bbbbbbbb
-// c    ->   cccccccc
-// d         dddddddd
-inline vInt load_into_row(int* ptr)
-{
-    vInt row_mask = vConstTileId & (~15);
-    vInt v = ptr[0];
-    v_if(row_mask == 16) {
-        v = ptr[1];
-    }
-    v_elseif(row_mask == 32) {
-        v = ptr[2];
-    }
-    v_elseif(row_mask == 48) {
-        v = ptr[3];
-    }
-    v_endif;
-    return v;
-}
-
 inline void rope_face(int pos, int face_idx)
 {
-    DeviceZoneScopedN("ROPE-FACE");
     // RoPE - we need to calculate the final rotation sin(angle) and cos(angle)
     // Where andgle = pos * freq
     // and freq = pow(100000, 2.0f * i / DIM_SIZE)
@@ -174,7 +149,6 @@ inline void rope_tile_init(float inv_d)
 inline void rope_tile(int pos, float inv_d, int vec_offset)
 {
     (void)inv_d; // Unused
-    DeviceZoneScopedN("ROPE-TILE");
     math::set_dst_write_addr<DstTileLayout::Default, DstTileShape::Tile32x32>(0);
     math::set_addr_mod_base();
     TTI_STALLWAIT(p_stall::STALL_SFPU, p_stall::MATH);

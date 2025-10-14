@@ -365,332 +365,338 @@ int main()
         GGML_TYPE_Q4_0
     };
 
+    for(auto type : supported_types) {
+        for(auto op : supported_unary_ops) {
+            tests.push_back(make_test([op](ggml_context* ctx) {
+                ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+                return ggml_unary(ctx, a, op);
+            }, "Basic activation function for " + type_name(type), 1e-2));
+        }
+    }
+
     tests.push_back(make_test([](ggml_context* ctx) {
-        // ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1024, 16, 2);
-        ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2048, 16, 2); // Doesn't work
-        ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
-        return ggml_rope(ctx, a, b, 128, GGML_ROPE_TYPE_NEOX);
-    }, "RoPE NEOX"));
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 96, 96);
+        ggml_tensor* v = ggml_view_2d(ctx, a, 64, 64, a->nb[1], 0);
+        return ggml_unary(ctx, v, GGML_UNARY_OP_ABS);
+    }, "Activation of view"));
 
-    // for(auto type : supported_types) {
-    //     for(auto op : supported_unary_ops) {
-    //         tests.push_back(make_test([op](ggml_context* ctx) {
-    //             ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
-    //             return ggml_unary(ctx, a, op);
-    //         }, "Basic activation function for " + type_name(type), 1e-2));
-    //     }
-    // }
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* b = ggml_cont(ctx, a);
+        return b;
+    }, "CONT on real tesnor"));
 
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 96, 96);
-    //     ggml_tensor* v = ggml_view_2d(ctx, a, 64, 64, a->nb[1], 0);
-    //     return ggml_unary(ctx, v, GGML_UNARY_OP_ABS);
-    // }, "Activation of view"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 64, 64);
+        ggml_tensor* b = ggml_cont(ctx, a);
+        return b;
+    }, "CONT on integer tesnor"));
 
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
-    //     ggml_tensor* b = ggml_cont(ctx, a);
-    //     return b;
-    // }, "CONT on real tesnor"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* view = ggml_view_2d(ctx, a, 64, 64, a->nb[1], 0);
+        ggml_tensor* b = ggml_cont(ctx, view);
+        return b;
+    }, "No-op view"));
 
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 64, 64);
-    //     ggml_tensor* b = ggml_cont(ctx, a);
-    //     return b;
-    // }, "CONT on integer tesnor"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* view = ggml_view_2d(ctx, a, 32, 32, a->nb[1], 0);
+        ggml_tensor* b = ggml_cont(ctx, view);
+        return b;
+    }, "View into 2D matrix"));
 
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
-    //     ggml_tensor* view = ggml_view_2d(ctx, a, 64, 64, a->nb[1], 0);
-    //     ggml_tensor* b = ggml_cont(ctx, view);
-    //     return b;
-    // }, "No-op view"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32*32);
+        ggml_tensor* view = ggml_view_1d(ctx, a, 32*32, 0);
+        ggml_tensor* b = ggml_cont(ctx, view);
+        return b;
+    }, "View flat buffer into 2D matrix"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32*32);
+        ggml_tensor* view = ggml_view_2d(ctx, a, 32, 32, 32 * sizeof(float), 0);
+        ggml_tensor* b = ggml_cont(ctx, view);
+        return b;
+    }, "View flat buffer into 2D matrix"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32*32);
+        ggml_tensor* view = ggml_view_2d(ctx, a, 32, 32, 32 * sizeof(float), 0);
+        ggml_tensor* transposed = ggml_transpose(ctx, view);
+        ggml_tensor* b = ggml_cont(ctx, transposed);
+        return b;
+    }, "Transposed flat buffer into 2D matrix"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32 * 32 * 64);
+        ggml_tensor* view = ggml_view_3d(ctx, a, 32, 32, 32, 32 * sizeof(float), 32 * 32 * sizeof(float), 0);
+        ggml_tensor* b = ggml_cont(ctx, view);
+        return b;
+    }, "View flat buffer into 3D tensor"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32 * 32 * 64);
+        ggml_tensor* view = ggml_view_3d(ctx, a, 32, 32, 32, 32 * sizeof(float), 32 * 32 * sizeof(float), 32 * sizeof(float));
+        ggml_tensor* b = ggml_cont(ctx, view);
+        return b;
+    }, "View flat buffer into 3D tensor with offset"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32 * 32 * 64);
+        ggml_tensor* view = ggml_view_3d(ctx, a, 32, 32, 32, 32 * sizeof(float), 32 * 32 * sizeof(float), 0);
+        ggml_tensor* transposed = ggml_transpose(ctx, view);
+        ggml_tensor* b = ggml_cont(ctx, transposed);
+        return b;
+    }, "View flat buffer into 3D tensor transposed"));
 
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
-    //     ggml_tensor* view = ggml_view_2d(ctx, a, 32, 32, a->nb[1], 0);
-    //     ggml_tensor* b = ggml_cont(ctx, view);
-    //     return b;
-    // }, "View into 2D matrix"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* view = ggml_view_2d(ctx, a, 30, 30, a->nb[1], 0);
+        ggml_tensor* b = ggml_cont(ctx, view);
+        return b;
+    }, "View into 2D matrix, non tile aligned"));
 
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32*32);
-    //     ggml_tensor* view = ggml_view_1d(ctx, a, 32*32, 0);
-    //     ggml_tensor* b = ggml_cont(ctx, view);
-    //     return b;
-    // }, "View flat buffer into 2D matrix"));
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32*32);
-    //     ggml_tensor* view = ggml_view_2d(ctx, a, 32, 32, 32 * sizeof(float), 0);
-    //     ggml_tensor* b = ggml_cont(ctx, view);
-    //     return b;
-    // }, "View flat buffer into 2D matrix"));
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32*32);
-    //     ggml_tensor* view = ggml_view_2d(ctx, a, 32, 32, 32 * sizeof(float), 0);
-    //     ggml_tensor* transposed = ggml_transpose(ctx, view);
-    //     ggml_tensor* b = ggml_cont(ctx, transposed);
-    //     return b;
-    // }, "Transposed flat buffer into 2D matrix"));
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32 * 32 * 64);
-    //     ggml_tensor* view = ggml_view_3d(ctx, a, 32, 32, 32, 32 * sizeof(float), 32 * 32 * sizeof(float), 0);
-    //     ggml_tensor* b = ggml_cont(ctx, view);
-    //     return b;
-    // }, "View flat buffer into 3D tensor"));
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32 * 32 * 64);
-    //     ggml_tensor* view = ggml_view_3d(ctx, a, 32, 32, 32, 32 * sizeof(float), 32 * 32 * sizeof(float), 32 * sizeof(float));
-    //     ggml_tensor* b = ggml_cont(ctx, view);
-    //     return b;
-    // }, "View flat buffer into 3D tensor with offset"));
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32 * 32 * 64);
-    //     ggml_tensor* view = ggml_view_3d(ctx, a, 32, 32, 32, 32 * sizeof(float), 32 * 32 * sizeof(float), 0);
-    //     ggml_tensor* transposed = ggml_transpose(ctx, view);
-    //     ggml_tensor* b = ggml_cont(ctx, transposed);
-    //     return b;
-    // }, "View flat buffer into 3D tensor transposed"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* view = ggml_view_2d(ctx, a, 32, 32, a->nb[1], ggml_type_size(GGML_TYPE_F32));
+        ggml_tensor* b = ggml_cont(ctx, view);
+        return b;
+    }, "View into 2D matrix with offset"));
 
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
-    //     ggml_tensor* view = ggml_view_2d(ctx, a, 30, 30, a->nb[1], 0);
-    //     ggml_tensor* b = ggml_cont(ctx, view);
-    //     return b;
-    // }, "View into 2D matrix, non tile aligned"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* view = ggml_view_2d(ctx, a, 48, 1, a->nb[1], 0);
+        ggml_tensor* b = ggml_cont(ctx, view);
+        return b;
+    }, "1D view into 2D matrix"));
 
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
-    //     ggml_tensor* view = ggml_view_2d(ctx, a, 32, 32, a->nb[1], ggml_type_size(GGML_TYPE_F32));
-    //     ggml_tensor* b = ggml_cont(ctx, view);
-    //     return b;
-    // }, "View into 2D matrix with offset"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* view = ggml_view_2d(ctx, a, 30, 28, a->nb[1], 0);
+        ggml_tensor* b = ggml_cont(ctx, view);
+        return b;
+    }, "Rectangular view into 2D matrix"));
 
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
-    //     ggml_tensor* view = ggml_view_2d(ctx, a, 48, 1, a->nb[1], 0);
-    //     ggml_tensor* b = ggml_cont(ctx, view);
-    //     return b;
-    // }, "1D view into 2D matrix"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        return ggml_transpose(ctx, a);
+    }, "transpose 2D square matrix"));
 
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
-    //     ggml_tensor* view = ggml_view_2d(ctx, a, 30, 28, a->nb[1], 0);
-    //     ggml_tensor* b = ggml_cont(ctx, view);
-    //     return b;
-    // }, "Rectangular view into 2D matrix"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 28);
+        return ggml_transpose(ctx, a);
+    }, "transpose 2D rectangular matrix"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 2);
+        return ggml_transpose(ctx, a);
+    }, "transpose 2D small matrix"));
 
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
-    //     return ggml_transpose(ctx, a);
-    // }, "transpose 2D square matrix"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 64, 64);
+        return ggml_transpose(ctx, a);
+    }, "transpose 3D square matrix"));
 
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 28);
-    //     return ggml_transpose(ctx, a);
-    // }, "transpose 2D rectangular matrix"));
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 2);
-    //     return ggml_transpose(ctx, a);
-    // }, "transpose 2D small matrix"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 64, 64);
+        return ggml_cont(ctx, ggml_transpose(ctx, a));
+    }, "transpose 3D square matrix"));
 
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 64, 64);
-    //     return ggml_transpose(ctx, a);
-    // }, "transpose 3D square matrix"));
-
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 64, 64);
-    //     return ggml_cont(ctx, ggml_transpose(ctx, a));
-    // }, "transpose 3D square matrix"));
-
+    // Failing - need to support tensor copy
     // tests.push_back(make_test([](ggml_context* ctx) {
     //     ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 4, 4, 4);
     //     ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_BF16, 256, 4, 4, 4);
     //     return ggml_cpy(ctx, a, b);
     // }, "4D tensor copy"));
 
+    // Failing - need to support sum
     // tests.push_back(make_test([](ggml_context* ctx) {
     //     ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 14, 2, 3);
     //     return ggml_sum(ctx, a);
     // }, "sum"));
 
+    // Failing - need to support sum_rows
     // tests.push_back(make_test([](ggml_context* ctx) {
     //     ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 14, 2, 3);
     //     return ggml_sum_rows(ctx, a);
     // }, "sum rows"));
 
-    // // Failing
-    // // tests.push_back(make_test([](ggml_context* ctx) {
-    // //     ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 4, 4, 4);
-    // //     ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 16, 1, 4);
-    // //     return ggml_cpy(ctx, a, b);
-    // // }, "Copy tensor into tensor of different shape"));
+    // Failing
+    // tests.push_back(make_test([](ggml_context* ctx) {
+    //     ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 4, 4, 4);
+    //     ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 16, 1, 4);
+    //     return ggml_cpy(ctx, a, b);
+    // }, "Copy tensor into tensor of different shape"));
 
+    // FIXME: This sould work but is failing
     // tests.push_back(make_test([](ggml_context* ctx) {
     //     ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 4, 4, 4);
     //     return ggml_view_2d(ctx, ggml_transpose(ctx, a), 4, 12, 4 * 4, 0);
     // }, "View of transposed 4D tensor"));
 
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, 64, 4, 1);
-    //     return ggml_reshape_4d(ctx, a, 32, 128, 4, 1);
-    // }, "Reshape to tile aligned tensor"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, 64, 4, 1);
+        return ggml_reshape_4d(ctx, a, 32, 128, 4, 1);
+    }, "Reshape to tile aligned tensor"));
 
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 32, 1, 1);
-    //     return ggml_reshape_4d(ctx, a, 16, 32, 2, 1);
-    // }, "Reshape to non tile aligned tensor"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 32, 1, 1);
+        return ggml_reshape_4d(ctx, a, 16, 32, 2, 1);
+    }, "Reshape to non tile aligned tensor"));
 
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
+        return ggml_dup(ctx, a);
+    }, "Tensor duplication"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
+        return ggml_dup(ctx, ggml_view_tensor(ctx, a));
+    }, "Tensor duplication via view"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
+        ggml_tensor* view = ggml_view_tensor(ctx, a);
+        ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
+        return ggml_cpy(ctx, view, b);
+    }, "Write via view"));
+    // Not working yet. Need write support for views
     // tests.push_back(make_test([](ggml_context* ctx) {
     //     ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
-    //     return ggml_dup(ctx, a);
-    // }, "Tensor duplication"));
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
-    //     return ggml_dup(ctx, ggml_view_tensor(ctx, a));
-    // }, "Tensor duplication via view"));
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
-    //     ggml_tensor* view = ggml_view_tensor(ctx, a);
-    //     ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
+    //     ggml_tensor* view = ggml_view_2d(ctx, a, 8, 12, a->nb[1], 1);
+    //     ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 12);
     //     return ggml_cpy(ctx, view, b);
-    // }, "Write via view"));
-    // // Not working yet. Need write support for views
-    // // tests.push_back(make_test([](ggml_context* ctx) {
-    // //     ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 24, 2, 1);
-    // //     ggml_tensor* view = ggml_view_2d(ctx, a, 8, 12, a->nb[1], 1);
-    // //     ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 12);
-    // //     return ggml_cpy(ctx, view, b);
-    // // }, "partial write via view"));
-    // // TODO: Expend this to attempt all permutations possible
+    // }, "partial write via view"));
+    // TODO: Expend this to attempt all permutations possible
 
-    // std::array<int, GGML_MAX_DIMS> permute_order;
-    // for(int i = 0;i<GGML_MAX_DIMS;i++) {
-    //     permute_order[i] = i;
-    // }
-    // do {
-    //     std::string name = "Permutation, order=[";
-    //     for(int i = 0;i<GGML_MAX_DIMS;i++) {
-    //         name += std::to_string(permute_order[i]) + " ";
-    //     }
-    //     name.pop_back();
-    //     name += "]";
-    //     tests.push_back(make_test([permute_order](ggml_context* ctx) {
-    //         ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 32, 8, 4);
-    //         return ggml_permute(ctx, a, permute_order[0], permute_order[1], permute_order[2], permute_order[3]);
-    //     }, name));
-    // } while(std::next_permutation(permute_order.begin(), permute_order.end()));
+    std::array<int, GGML_MAX_DIMS> permute_order;
+    for(int i = 0;i<GGML_MAX_DIMS;i++) {
+        permute_order[i] = i;
+    }
+    do {
+        std::string name = "Permutation, order=[";
+        for(int i = 0;i<GGML_MAX_DIMS;i++) {
+            name += std::to_string(permute_order[i]) + " ";
+        }
+        name.pop_back();
+        name += "]";
+        tests.push_back(make_test([permute_order](ggml_context* ctx) {
+            ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 32, 8, 4);
+            return ggml_permute(ctx, a, permute_order[0], permute_order[1], permute_order[2], permute_order[3]);
+        }, name));
+    } while(std::next_permutation(permute_order.begin(), permute_order.end()));
 
-    // // (Basics of) what we need to get KV cache working
-    // // TODO: Map GGML operations into TTNN nlp_kv_cache_load_slice and update_cache_multi_core
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 24);
-    //     ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32);
-    //     return ggml_set_2d(ctx, a, b, b->nb[1], 0);
-    // }, "Set row of 2D matrix"));
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 24);
-    //     ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32);
-    //     return ggml_set_2d(ctx, a, b, b->nb[1], a->nb[1]);
-    // }, "Set row of 2D matrix with offset"));
+    // (Basics of) what we need to get KV cache working
+    // TODO: Map GGML operations into TTNN nlp_kv_cache_load_slice and update_cache_multi_core
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 24);
+        ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32);
+        return ggml_set_2d(ctx, a, b, b->nb[1], 0);
+    }, "Set row of 2D matrix"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 24);
+        ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32);
+        return ggml_set_2d(ctx, a, b, b->nb[1], a->nb[1]);
+    }, "Set row of 2D matrix with offset"));
 
-    // // Matrix multiplication
+    // Matrix multiplication
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 64);
+        ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 64);
+        return ggml_mul_mat(ctx, a, b);
+    }, "2D matrix multiplication"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 64);
+        ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 128);
+        return ggml_mul_mat(ctx, a, b);
+    }, "2D matrix multiplication (result non square)"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 38, 64);
+        ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 38, 72);
+        return ggml_mul_mat(ctx, a, b);
+    }, "2D matrix multiplication (result non square, non tile aligned)"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 64, 1, 10);
+        ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 64, 1, 10);
+        return ggml_mul_mat(ctx, a, b);
+    }, "4D matrix multiplication"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 64, 1, 1);
+        ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 64, 1, 10);
+        return ggml_mul_mat(ctx, a, b);
+    }, "4D matrix multiplication with broadcast"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 32);
+        ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+        return ggml_mul_mat(ctx, a, b);
+    }, "matrix-vector multiplication"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 24, 18);
+        ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 24);
+        return ggml_mul_mat(ctx, a, b);
+    }, "matrix-vector multiplication non tile aligned"));
+
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2048, 64);
+        ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2048);
+        return ggml_add(ctx, a, b);
+    }, "Add broadcasted vector to matrix"));
+
+    // TODO: TTNN does not support the style of broadcasting GGML wants
+    // Failing
     // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 64);
-    //     ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 64);
+    //     ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 64, 20);
+    //     ggml_tensor* b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 64, 10);
     //     return ggml_mul_mat(ctx, a, b);
-    // }, "2D matrix multiplication"));
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 64);
-    //     ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 128);
-    //     return ggml_mul_mat(ctx, a, b);
-    // }, "2D matrix multiplication (result non square)"));
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 38, 64);
-    //     ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 38, 72);
-    //     return ggml_mul_mat(ctx, a, b);
-    // }, "2D matrix multiplication (result non square, non tile aligned)"));
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 64, 1, 10);
-    //     ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 64, 1, 10);
-    //     return ggml_mul_mat(ctx, a, b);
-    // }, "4D matrix multiplication"));
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 64, 1, 1);
-    //     ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 64, 1, 10);
-    //     return ggml_mul_mat(ctx, a, b);
-    // }, "4D matrix multiplication with broadcast"));
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 32);
-    //     ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
-    //     return ggml_mul_mat(ctx, a, b);
-    // }, "matrix-vector multiplication"));
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 24, 18);
-    //     ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 24);
-    //     return ggml_mul_mat(ctx, a, b);
-    // }, "matrix-vector multiplication non tile aligned"));
+    // }, "3D matrix multiplication (broadcast)"));
 
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2048, 64);
-    //     ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2048);
-    //     return ggml_add(ctx, a, b);
-    // }, "Add broadcasted vector to matrix"));
+    // Misc
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 38, 64, 3, 26);
+        return ggml_clamp(ctx, a, -0.1, 0.25);
+    }, "Clamp"));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 38, 64, 3, 26);
+        return ggml_scale(ctx, a, 2.0);
+    }, "Scale"));
+    // ???? This should not have worked since I haven't implemented inplace operations
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 38, 64, 3, 26);
+        return ggml_scale_inplace(ctx, a, 1.5);
+    }, "Scale in place"));
 
-    // // TODO: TTNN does not support the style of broadcasting GGML wants
-    // // Failing
-    // // tests.push_back(make_test([](ggml_context* ctx) {
-    // //     ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 64, 20);
-    // //     ggml_tensor* b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 64, 10);
-    // //     return ggml_mul_mat(ctx, a, b);
-    // // }, "3D matrix multiplication (broadcast)"));
+    // RoPE
+    for(auto type : {GGML_TYPE_F32, GGML_TYPE_F16}) { // Really a limitation of GGML's CPU implementation - we support more
+        tests.push_back(make_test([type](ggml_context* ctx) {
+            ggml_tensor* a = ggml_new_tensor_3d(ctx, type, 2048, 16, 2);
+            ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
+            return ggml_rope(ctx, a, b, 128, GGML_ROPE_TYPE_NEOX);
+        }, "RoPE NEOX " + std::string(ggml_type_name(type))));
+    }
 
-    // // Misc
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 38, 64, 3, 26);
-    //     return ggml_clamp(ctx, a, -0.1, 0.25);
-    // }, "Clamp"));
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 38, 64, 3, 26);
-    //     return ggml_scale(ctx, a, 2.0);
-    // }, "Scale"));
-    // // ???? This should not have worked since I haven't implemented inplace operations
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 38, 64, 3, 26);
-    //     return ggml_scale_inplace(ctx, a, 1.5);
-    // }, "Scale in place"));
+    // more complex tests
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 18);
+        ggml_tensor* w1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 64);
+        ggml_tensor* b1 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+        ggml_tensor* w2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 48);
+        ggml_tensor* b2 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 48);
 
-    // // more complex tests
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     ggml_tensor* x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 18);
-    //     ggml_tensor* w1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 64);
-    //     ggml_tensor* b1 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
-    //     ggml_tensor* w2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 48);
-    //     ggml_tensor* b2 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 48);
+        ggml_tensor* h1 = ggml_relu(ctx, ggml_add(ctx, ggml_mul_mat(ctx, w1, x), b1));
+        ggml_tensor* h2 = ggml_relu(ctx, ggml_add(ctx, ggml_mul_mat(ctx, w2, h1), b2));
 
-    //     ggml_tensor* h1 = ggml_relu(ctx, ggml_add(ctx, ggml_mul_mat(ctx, w1, x), b1));
-    //     ggml_tensor* h2 = ggml_relu(ctx, ggml_add(ctx, ggml_mul_mat(ctx, w2, h1), b2));
+        return h2;
+    }, "Multi layer perceptron"));
 
-    //     return h2;
-    // }, "Multi layer perceptron"));
-
-    // tests.push_back(make_test([](ggml_context* ctx) {
-    //     // A smaller and stripped down version of the MLP Mixer model
-    //     ggml_tensor* in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
-    //     ggml_tensor* w1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 32);
-    //     std::array<ggml_tensor*, 4> h;
-    //     for (int y = 0; y < 2; y++) {
-    //         for (int x = 0; x < 2; x++) {
-    //             ggml_tensor* patch = ggml_view_2d(ctx, in, 32, 32, in->nb[1], 32 * y + x * 32);
-    //             h[y * 2 + x] = ggml_relu(ctx, ggml_mul_mat(ctx, w1, patch));
-    //         }
-    //     }
-    //     ggml_tensor* h1 = ggml_concat(ctx, h[0], h[1], 1);
-    //     ggml_tensor* h2 = ggml_concat(ctx, h[2], h[3], 1);
-    //     ggml_tensor* h_all = ggml_concat(ctx, h1, h2, 1);
-    //     return ggml_transpose(ctx, h_all);
-    // }, "MLP mixer", 1e-3));
+    tests.push_back(make_test([](ggml_context* ctx) {
+        // A smaller and stripped down version of the MLP Mixer model
+        ggml_tensor* in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_tensor* w1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 32);
+        std::array<ggml_tensor*, 4> h;
+        for (int y = 0; y < 2; y++) {
+            for (int x = 0; x < 2; x++) {
+                ggml_tensor* patch = ggml_view_2d(ctx, in, 32, 32, in->nb[1], 32 * y + x * 32);
+                h[y * 2 + x] = ggml_relu(ctx, ggml_mul_mat(ctx, w1, patch));
+            }
+        }
+        ggml_tensor* h1 = ggml_concat(ctx, h[0], h[1], 1);
+        ggml_tensor* h2 = ggml_concat(ctx, h[2], h[3], 1);
+        ggml_tensor* h_all = ggml_concat(ctx, h1, h2, 1);
+        return ggml_transpose(ctx, h_all);
+    }, "MLP mixer", 1e-3));
 
     size_t total_tests = 0;
     size_t passed_tests = 0;

@@ -187,6 +187,9 @@ inline void rope_tile(int pos, float inv_d, int vec_offset)
 
         vFloat term_to_exp = -exponent * vConstFloatPrgm0 - vConstFloatPrgm1;
         vFloat freq = vector_exp(term_to_exp);
+        #ifdef FREQ_SCALE
+        freq = freq * FREQ_SCALE;
+        #endif
         dst_reg[64+i] = freq;
     }
 

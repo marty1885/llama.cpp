@@ -1757,7 +1757,7 @@ static bool ggml_backend_metalium_can_rope(const struct ggml_tensor * dst)
     //     n_past, n_dims, mode, n_ctx, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
 
     return n_dims % 64 == 0 && mode == GGML_ROPE_TYPE_NEOX
-        && freq_scale == 1.f && ext_factor == 0.f
+        && ext_factor == 0.f && beta_fast == beta_slow
         && dst->src[2] == nullptr; // Don't support freq factor yet
 }
 
@@ -1797,6 +1797,7 @@ static void ggml_backend_metalium_rope(ggml_backend_metalium_context * ctx, stru
         *realize_ggml_view(dst->src[1]),
         n_dims,
         freq_base,
+        freq_scale,
         attn_factor);
     *dst_meta = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(res)),

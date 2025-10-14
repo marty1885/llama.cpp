@@ -755,8 +755,12 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         for(int i=0;i<GGML_MAX_DIMS;i++) {
             permute_tt[i] = GGML_MAX_DIMS - permute[GGML_MAX_DIMS - i - 1] - 1;
         }
+        ttsl::SmallVector<int64_t> permute_tt_real(GGML_MAX_DIMS);
+        for(int i=0;i<GGML_MAX_DIMS;i++) {
+            permute_tt_real[permute_tt[i]] = i;
+        }
 
-        auto res = ttnn::permute(*t, permute_tt);
+        auto res = ttnn::permute(*t, permute_tt_real);
         return std::make_shared<tt::tt_metal::Tensor>(std::move(res));
     }
 
@@ -2432,7 +2436,6 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
         switch(tt_type) {
             case tt::tt_metal::DataType::BFLOAT16:
             case tt::tt_metal::DataType::UINT16:
-                return tensor->ne[0] % 2 == 0 && tensor->ne[0] != 0; // NOTE: This should be enablable by now (Was a limitation of ancient TTNN versions)
             case tt::tt_metal::DataType::FLOAT32:
             case tt::tt_metal::DataType::UINT32:
             case tt::tt_metal::DataType::INT32:

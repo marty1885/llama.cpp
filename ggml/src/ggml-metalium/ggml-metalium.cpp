@@ -427,11 +427,14 @@ static void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, ggml_type
     static_assert(std::is_same_v<SrcType, float> || std::is_same_v<SrcType, bfloat16> || std::is_same_v<SrcType, uint32_t>);
     GGML_ASSERT(tensor.layout() == ttnn::Layout::TILE);
 
-    tt::tt_metal::Tensor row_major_tensor = ttnn::untilize(tensor).cpu();
+    // FIXME: untilize is cursed. Causes _MANY_ corruption errors. Replacing it with to_layout
+    // Fixes the majority of accuracy and corruption errors in test-backend-ops
+    // tt::tt_metal::Tensor row_major_tensor = ttnn::untilize(tensor).cpu();
+    // Ofc this is slower so we really want to enable untilize on device
+    tt::tt_metal::Tensor row_major_tensor = tensor.cpu().to_layout(ttnn::ROW_MAJOR_LAYOUT);
     GGML_ASSERT(row_major_tensor.storage_type() == tt::tt_metal::StorageType::HOST);
-    GGML_ASSERT(std::holds_alternative<tt::tt_metal::HostStorage>(row_major_tensor.storage()));
 
-    const tt::tt_metal::HostStorage& storage = std::get<tt::tt_metal::HostStorage>(row_major_tensor.storage());
+    const tt::tt_metal::HostStorage& storage = row_major_tensor.host_storage();
     const auto buffer = storage.buffer().get_shard({0, 0}).value();
     auto view = buffer.view_as<SrcType>();
     const SrcType* buf = &view[0];

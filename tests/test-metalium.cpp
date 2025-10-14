@@ -366,8 +366,8 @@ int main()
     };
 
     tests.push_back(make_test([](ggml_context* ctx) {
-        ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1024, 16, 2);
-        // ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2048, 16, 2); // Doesn't work
+        // ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1024, 16, 2);
+        ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2048, 16, 2); // Doesn't work
         ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
         return ggml_rope(ctx, a, b, 128, GGML_ROPE_TYPE_NEOX);
     }, "RoPE NEOX"));

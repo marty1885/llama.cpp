@@ -180,6 +180,7 @@ inline void rope_tile(int pos, float inv_d, int vec_offset)
         #ifdef ATTN_FACTOR
             mscale = ATTN_FACTOR;
         #endif
+        // enable YaRN if needed
         #ifdef EXT_FACTOR
             vFloat ramp_mix = rope_yarn_ramp(block_lane_id) * EXT_FACTOR;
             theta = freq_scaled * (1 - ramp_mix) + freq * ramp_mix;

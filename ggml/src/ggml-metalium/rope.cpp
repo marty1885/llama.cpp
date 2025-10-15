@@ -29,6 +29,7 @@ struct RoPEDeviceOperation {
     const tt::tt_metal::DataType output_dtype{};
     const uint32_t active_dim_size = 0;
     const uint32_t n_ctx_orig = 512;
+    const ttggml::RoPEType rope_type = ttggml::RoPEType::Normal;
     const float freq_base = 10000.0f;
     const float freq_scale = 1.f;
     const float ext_factor = 0.f;
@@ -47,7 +48,7 @@ struct RoPEDeviceOperation {
         const std::vector<Tensor>& input_tensors, std::vector<Tensor>& output_tensors) const;
 };
 
-ttnn::Tensor ttggml::RoPEOperation::invoke(const Tensor& src_tensor, const Tensor& index_tensor, uint32_t active_dim_size, uint32_t n_ctx_orig, float freq_base,
+ttnn::Tensor ttggml::RoPEOperation::invoke(const Tensor& src_tensor, const Tensor& index_tensor, uint32_t active_dim_size, ttggml::RoPEType rope_type, uint32_t n_ctx_orig, float freq_base,
     float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
     return tt::tt_metal::operation::run(
         RoPEDeviceOperation{
@@ -55,6 +56,7 @@ ttnn::Tensor ttggml::RoPEOperation::invoke(const Tensor& src_tensor, const Tenso
             src_tensor.dtype(),
             active_dim_size,
             n_ctx_orig,
+            rope_type,
             freq_base,
             freq_scale,
             ext_factor,
@@ -119,7 +121,11 @@ void RoPEDeviceOperation::validate_with_output_tensors(
         TT_FATAL(out_tensor.padded_shape() == src_tensor.padded_shape(), "Output tensor padded shape must match source tensor padded shape");
     }
 
-    TT_FATAL(active_dim_size % 64 == 0, "active_dim must be a multiple of 64 (2 tiles)");
+    if(rope_type == ttggml::RoPEType::NeoX) {
+        TT_FATAL(active_dim_size % 64 == 0, "For NeoX RoPE, active_dim must be a multiple of 64");
+    } else {
+        TT_FATAL(active_dim_size % 32 == 0, "For Normal RoPE, active_dim must be a multiple of 32");
+    }
     TT_FATAL(active_dim_size <= src_tensor.padded_shape()[-1], "active_dim must be less than the last dimension of the source tensor");
     TT_FATAL(freq_base >= 0, "base_freq must be non-negative");
     TT_FATAL(freq_scale > 0, "freq_scale must be positive");
@@ -150,7 +156,7 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
 
     auto core_grid = device->compute_with_storage_grid_size();
 
-    uint32_t active_tiles = D_activet/2 * Nt * B;
+    uint32_t active_tiles = rope_type == ttggml::RoPEType::NeoX ? D_activet/2 * Nt * B : D_activet * Nt * B;
     uint32_t passive_tiles = (Dt - D_activet) * Nt * B;
     auto [num_cores_active,
         all_cores_active,
@@ -203,7 +209,8 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
     std::vector<uint32_t> reader_compile_time_args;
     TensorAccessorArgs(*src).append_to(reader_compile_time_args);
     TensorAccessorArgs(*idxs).append_to(reader_compile_time_args);
-    KernelHandle reader = CreateMetaliumKernel(program, "rope_neox_reader", all_cores, DataMovementConfig{
+    std::string variant = rope_type == ttggml::RoPEType::NeoX ? "neox" : "normal";
+    KernelHandle reader = CreateMetaliumKernel(program, fmt::format("rope_{}_reader", variant), all_cores, DataMovementConfig{
         .processor = DataMovementProcessor::RISCV_0,
         .noc = NOC::RISCV_0_default,
         .compile_args = reader_compile_time_args
@@ -211,13 +218,13 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
 
     std::vector<uint32_t> writer_compile_time_args;
     TensorAccessorArgs(*dst).append_to(writer_compile_time_args);
-    KernelHandle writer = CreateMetaliumKernel(program, "rope_neox_writer", all_cores, DataMovementConfig{
+    KernelHandle writer = CreateMetaliumKernel(program, fmt::format("rope_{}_writer", variant), all_cores, DataMovementConfig{
         .processor = DataMovementProcessor::RISCV_1,
         .noc = NOC::RISCV_1_default,
         .compile_args = writer_compile_time_args
     });
 
-    KernelHandle compute = CreateMetaliumKernel(program, "rope_neox_compute", all_cores, ComputeConfig{
+    KernelHandle compute = CreateMetaliumKernel(program, fmt::format("rope_{}_compute", variant), all_cores, ComputeConfig{
         .fp32_dest_acc_en = true,
         .defines = defines
     });

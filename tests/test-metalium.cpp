@@ -676,7 +676,19 @@ int main()
             ggml_tensor* a = ggml_new_tensor_3d(ctx, type, 2048, 16, 2);
             ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
             return ggml_rope_ext(ctx, a, b, NULL, 128, GGML_ROPE_TYPE_NEOX, 512, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
-        }, "RoPE NEOX YaRN" + std::string(ggml_type_name(type)) + " with YaRN", 1e-5f));
+        }, "RoPE NEOX " + std::string(ggml_type_name(type)) + " with YaRN", 1e-5f));
+
+        tests.push_back(make_test([type](ggml_context* ctx) {
+            ggml_tensor* a = ggml_new_tensor_3d(ctx, type, 512, 32, 1);
+            ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+            return ggml_rope(ctx, a, b, 512, GGML_ROPE_TYPE_NEOX);
+        }, "RoPE NEOX in Gemma " + std::string(ggml_type_name(type)), 1e-5f));
+
+        tests.push_back(make_test([type](ggml_context* ctx) {
+            ggml_tensor* a = ggml_new_tensor_3d(ctx, type, 2048, 16, 2);
+            ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
+            return ggml_rope(ctx, a, b, 128, GGML_ROPE_TYPE_NORMAL);
+        }, "RoPE Normal " + std::string(ggml_type_name(type)), 1e-5f));
     }
 
     // more complex tests

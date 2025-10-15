@@ -65,6 +65,8 @@
 
 #include "rope.hpp"
 
+extern void metalium_register_all_kernel();
+
 struct ggml_backend_metalium_context {
     ttnn::IDevice* device = nullptr;
     int device_id = 0;
@@ -1747,10 +1749,27 @@ static bool ggml_backend_metalium_can_rope(const struct ggml_tensor * dst)
         n_ctx,
         n_ctx_orig
     ] = int_params;
-    // fmt::println(stderr, "Rope params: n_past {}, n_dims {}, mode {}, n_ctx {}, n_ctx_orig {}, freq_base {}, freq_scale {}, ext_factor {}, attn_factor {}, beta_fast {}, beta_slow {}",
-    //     n_past, n_dims, mode, n_ctx, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+#if 0 // Debug print
+    std::array<float, 6> float_params;
+    memcpy(float_params.data(), dst->op_params + int_params.size() , sizeof(float_params));
+    auto [
+        freq_base,
+        freq_scale,
+        ext_factor,
+        attn_factor,
+        beta_fast,
+        beta_slow
+    ] = float_params;
 
-    return n_dims % 64 == 0 && mode == GGML_ROPE_TYPE_NEOX
+    fmt::println(stderr, "Rope params: n_past {}, n_dims {}, mode {}, n_ctx {}, n_ctx_orig {}, freq_base {}, freq_scale {}, ext_factor {}, attn_factor {}, beta_fast {}, beta_slow {}",
+        n_past, n_dims, mode, n_ctx, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    fmt::println(stderr, "Rope src0 shape: {} {} {} {}, src1 shape: {} {} {} {}",
+        dst->src[0]->ne[0], dst->src[0]->ne[1], dst->src[0]->ne[2], dst->src[0]->ne[3],
+        dst->src[1]->ne[0], dst->src[1]->ne[1], dst->src[1]->ne[2], dst->src[1]->ne[3]);
+#endif
+
+    return ((n_dims % 64 == 0 && mode == GGML_ROPE_TYPE_NEOX)
+        || (n_dims % 32 == 0 && mode == GGML_ROPE_TYPE_NORMAL))
         && dst->src[2] == nullptr; // Don't support freq factor yet
 }
 
@@ -1789,6 +1808,7 @@ static void ggml_backend_metalium_rope(ggml_backend_metalium_context * ctx, stru
         *realize_ggml_view(dst->src[0]),
         *realize_ggml_view(dst->src[1]),
         n_dims,
+        mode == GGML_ROPE_TYPE_NEOX ? ttggml::RoPEType::NeoX : ttggml::RoPEType::Normal,
         n_ctx_orig,
         freq_base,
         freq_scale,
@@ -2716,6 +2736,7 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
     static ggml_backend_reg reg;
     static std::once_flag once;
     std::call_once(once, [&]() {
+        metalium_register_all_kernel();
         // TODO: TTNN though not have peoper system packaging yet. Does support working in installed for (via Python packages rn)
         // Remove this limitation
         if(getenv("TT_METAL_HOME") == NULL) {

@@ -30,3 +30,24 @@ function(add_kernel target kernel_name)
     # Track kernel name for registration
     set_property(TARGET ${target} APPEND PROPERTY KERNEL_LIST "${kernel_name}")
 endfunction()
+
+function(register_kernels target kernel_names)
+    set(OUTPUT "${CMAKE_BINARY_DIR}/generated/kernels/__register_all_kernels.cpp")
+
+    # Generate the registration source file
+    set(KERNEL_NAMES "${kernel_names}")
+    add_custom_command(
+        OUTPUT "${OUTPUT}"
+        COMMAND ${CMAKE_COMMAND} -E echo "Generating Metalium kernel registration source"
+        COMMAND ${CMAKE_COMMAND}
+                -DOUTPUT=${OUTPUT}
+                "-DKERNEL_NAMES=${KERNEL_NAMES}"
+                -P ${CMAKE_CURRENT_LIST_DIR}/cmake/kernel_register.cmake
+
+        DEPENDS ${CMAKE_CURRENT_LIST_DIR}/cmake/kernel_register.cmake
+        COMMENT "Generating kernel registration source"
+        VERBATIM
+    )
+
+    target_sources(${target} PRIVATE "${OUTPUT}")
+endfunction()

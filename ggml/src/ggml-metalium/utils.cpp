@@ -43,14 +43,17 @@ KernelHandle CreateMetaliumKernel(
     const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
     const std::variant<DataMovementConfig, ComputeConfig, EthernetConfig>& config) {
 
+    if(str.find_first_of(" \n\t") != std::string::npos) {   
+        return tt::tt_metal::CreateKernelFromString(program, str, core_spec, config);
+    }
+
     // if it looks like a name
-    if(str.find_first_not_of(" \n\t")) {
+    if(str.find_first_of(" \n\t") == std::string::npos) {
         auto& kernel_map = ggml_metalium_get_kernel_map();
         auto it = kernel_map.find(str);
         if(it != kernel_map.end()) {
             return tt::tt_metal::CreateKernelFromString(program, it->second, core_spec, config);
         }
-        return tt::tt_metal::CreateKernelFromString(program, str, core_spec, config);
     }
 
     namespace fs = std::filesystem;

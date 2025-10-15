@@ -87,75 +87,29 @@ inline vFloat vector_sin_phase(vFloat x)
     return v;
 }
 
-#ifdef EXT_FACTOR
-sfpi_inline vFloat rope_yarn_ramp(vFloat vec_pos) {
-    vFloat y = (vec_pos - CORR_DIMS0) * (1.f / std::max(0.001f, float(CORR_DIMS1 - CORR_DIMS0)));
-    v_if(y < 0.f) {
-        y = 0;
-    }
-    v_elseif(y > 1.f) {
-        y = 1;
-    }
-    v_endif;
-    return 1.f - y;
-}
-#endif
-
-inline void rope_face(int pos, int face_idx)
+inline void rope_face(int pos, int D, int vec_offset, int face)
 {
-    // RoPE - we need to calculate the final rotation sin(angle) and cos(angle)
-    // Where andgle = pos * freq
-    // and freq = pow(100000, 2.0f * i / DIM_SIZE)
-    //
-    // To improve SFPU accuracy (and better prformance), we can rewrite the
-    // compute as the following using a few identities:
-    // evaulate sin_phase(angle_phase) and cos_phase(angle_phase)
-    // angle_phase = pos * pow(10000, 2.0f * i / DIM_SIZE) / PI
-    //             = pos * exp(-(2.0f * i / DIM_SIZE) * log(10000)) / PI
-    //             = pos * exp(-(2.0f * i / DIM_SIZE) * log(10000) + log(1/PI))
-    // where we compute
-    //     exponent = 2.0f * i / DIM_SIZE
-    // and
-    //     log(10000) = 9.21034037, log(1/PI) = -1.14472988585
-    // thus
-    // angle_phase = pos * exp(-exponent * 9.21034037f - 1.14472988585f)
-    // and
-    //      we preload 9.21034037f and 1.14472988585f into vConstFloatPrgm{0,1}
-    //      to avoid loading values into LReg in runtime
-    // NOTE: SFPU does not have a / operator. Scalars can be done on RISC-V (softfp)
-    //      which is slow. So the value is computed once and loaded into
-    //      vConstFloatPrg2. Reused across the kernel.
-    // TODO: DIM_SIZE should be treated as a constant and this 1.f/DIM_SIZE can be
-    //      evaulated at compile time.
-    int face_col = face_idx % 2;
-    int dst_offset = face_idx*8;
-    vFloat vpos = int32_to_float(pos);
-    vFloat freq = dst_reg[64+face_col];
-    vFloat mscale = dst_reg[64+face_col+2];
-
-    // Standard RoPE math
-    vFloat angle_phase = vpos * freq;
-    vFloat sin_value = vector_sin_phase(angle_phase) * mscale;
-    vFloat cos_value = vector_sin_phase(0.5f - angle_phase) * mscale;
+    vFloat freq = dst_reg[64+face%2];
+    vFloat mscale = dst_reg[64+face%2+2];
+    int dst_offset = face * 8;
     for (int i = 0; i < 4; i++) {
-        int idx = i*2;
-        vFloat x = dst_reg[dst_offset+idx];
-        vFloat y = dst_reg[dst_offset+idx+1];
-        dst_reg[dst_offset+idx] = x * cos_value - y * sin_value;
-        dst_reg[dst_offset+idx+1] = x * sin_value + y * cos_value;
+        // Standard RoPE math
+        vFloat angle = int32_to_float(pos) * freq;
+        vFloat sin_angle = vector_sin_phase(angle) * mscale;
+        vFloat cos_angle = vector_sin_phase(0.5f - angle) * mscale;
+
+        // Thanks that dst interleaves lanes by default
+        vFloat x = dst_reg[dst_offset+i*2];
+        vFloat y = dst_reg[dst_offset+i*2+1];
+
+        dst_reg[dst_offset+i*2] = x * cos_angle - y * sin_angle;
+        dst_reg[dst_offset+i*2+1] = x * sin_angle + y * cos_angle;
     }
 }
 
-inline void rope_tile_init(float inv_d)
+inline void rope_tile(int pos, int D, int vec_offset)
 {
-    vConstFloatPrgm0 = float(FREQ_BASE_LOG);
-    vConstFloatPrgm1 = 1.14472988585f;
-    vConstFloatPrgm2 = inv_d;
-}
 
-inline void rope_tile(int pos, float inv_d, int vec_offset)
-{
-    (void)inv_d; // Unused
     math::set_dst_write_addr<DstTileLayout::Default, DstTileShape::Tile32x32>(0);
     math::set_addr_mod_base();
     TTI_STALLWAIT(p_stall::STALL_SFPU, p_stall::MATH);
@@ -163,7 +117,7 @@ inline void rope_tile(int pos, float inv_d, int vec_offset)
     for(int i=0;i<2;i++) {
         int internal_offset = i * 16;
         int pos_in_vector = vec_offset + internal_offset;
-        vFloat block_lane_id = int32_to_float((vConstTileId & 15 + pos_in_vector)); // No mod operator on SFPI, use bit hack
+        vFloat block_lane_id = int32_to_float((vConstTileId & 15) + pos_in_vector); // No mod operator on SFPI, use bit hack
         vFloat exponent = block_lane_id * vConstFloatPrgm2;
 
         vFloat term_to_exp = -exponent * vConstFloatPrgm0 - vConstFloatPrgm1;
@@ -184,14 +138,14 @@ inline void rope_tile(int pos, float inv_d, int vec_offset)
             theta = freq_scaled * (1 - ramp_mix) + freq * ramp_mix;
             #ifdef LOG_1_FREQ_SCALE
                 mscale *= 1.0f + 0.1f * LOG_1_FREQ_SCALE;
-            #endif // else mscale *= 1 (the other half collasps to 0) - does nothing
+            #endif // else mscahe *= 1 (the other half collasps to 0) - does nothing
         #endif
         dst_reg[64+i] = theta;
         dst_reg[64+i+2] = mscale;
     }
 
     for (int face = 0; face < 4; face++) {
-        rope_face(pos, face);
+        rope_face(pos, D, vec_offset + ((face % 2 == 0) ? 0 : 16), face);
     }
 
     math::clear_dst_reg_addr();
@@ -199,6 +153,12 @@ inline void rope_tile(int pos, float inv_d, int vec_offset)
     math::clear_addr_mod_base();
 }
 
+inline void rope_tile_init(float inv_d)
+{
+    vConstFloatPrgm0 = float(FREQ_BASE_LOG);
+    vConstFloatPrgm1 = 1.14472988585f;
+    vConstFloatPrgm2 = inv_d;
+}
 #endif
 
 namespace NAMESPACE {
@@ -217,7 +177,7 @@ void MAIN {
     constexpr uint32_t cb_out0 = tt::CBIndex::c_16;
 
     init_sfpu(tt::CBIndex::c_0, tt::CBIndex::c_16);
-    float inv_d = 1.f/(n_tiles_width_active * (32 / 2));
+    float inv_d = 1.f/(n_tiles_width_active * 32);
     MATH(rope_tile_init(inv_d));
 
     int* idxs_ptr = nullptr;

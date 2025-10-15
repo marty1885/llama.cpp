@@ -19,8 +19,8 @@ void kernel_main() {
     const auto dst = TensorAccessor(dst_args, dst_addr, tile_size_bytes);
 
     for(uint32_t active_id=active_begin; active_id<active_end; active_id++) {
-        uint32_t h = active_id / (n_tiles_width_active/2);
-        uint32_t w = active_id % (n_tiles_width_active/2);
+        uint32_t h = active_id / n_tiles_width_active;
+        uint32_t w = active_id % n_tiles_width_active;
 
         cb_wait_front(cb_out0, 1);
         uint32_t tile_idx = h * n_tiles_width + w;

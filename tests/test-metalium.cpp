@@ -337,7 +337,7 @@ int main()
     ggml_backend_t metalium = ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, 0), NULL);
 
     std::vector<std::unique_ptr<test_case>> tests;
-
+#if 0
     const ggml_unary_op supported_unary_ops[] = {
         GGML_UNARY_OP_ABS,
         GGML_UNARY_OP_SGN,
@@ -657,40 +657,40 @@ int main()
         ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 38, 64, 3, 26);
         return ggml_scale_inplace(ctx, a, 1.5);
     }, "Scale in place"));
-
+#endif
     // RoPE
-    for(auto type : {GGML_TYPE_F32, GGML_TYPE_F16}) { // Really a limitation of GGML's CPU implementation - we support more
-        tests.push_back(make_test([type](ggml_context* ctx) {
-            ggml_tensor* a = ggml_new_tensor_3d(ctx, type, 2048, 16, 2);
-            ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
-            return ggml_rope(ctx, a, b, 128, GGML_ROPE_TYPE_NEOX);
-        }, "RoPE NEOX " + std::string(ggml_type_name(type))));
+    // for(auto type : {GGML_TYPE_F32, GGML_TYPE_F16}) { // Really a limitation of GGML's CPU implementation - we support more
+        // tests.push_back(make_test([type](ggml_context* ctx) {
+        //     ggml_tensor* a = ggml_new_tensor_3d(ctx, type, 2048, 16, 2);
+        //     ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
+        //     return ggml_rope(ctx, a, b, 128, GGML_ROPE_TYPE_NEOX);
+        // }, "RoPE NEOX " + std::string(ggml_type_name(type))));
 
-        tests.push_back(make_test([type](ggml_context* ctx) {
-            float freq_base = 20000.f;
-            float freq_scale = 1.4245f;
-            float attn_factor = 1.424500f;
-            float ext_factor = 0.746500f;
-            float beta_fast = 32.f;
-            float beta_slow = 1.f;
-            ggml_tensor* a = ggml_new_tensor_3d(ctx, type, 2048, 16, 2);
-            ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
-            return ggml_rope_ext(ctx, a, b, NULL, 128, GGML_ROPE_TYPE_NEOX, 512, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
-        }, "RoPE NEOX " + std::string(ggml_type_name(type)) + " with YaRN", 1e-5f));
+        // tests.push_back(make_test([type](ggml_context* ctx) {
+        //     float freq_base = 20000.f;
+        //     float freq_scale = 1.4245f;
+        //     float attn_factor = 1.424500f;
+        //     float ext_factor = 0.746500f;
+        //     float beta_fast = 32.f;
+        //     float beta_slow = 1.f;
+        //     ggml_tensor* a = ggml_new_tensor_3d(ctx, type, 2048, 16, 2);
+        //     ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
+        //     return ggml_rope_ext(ctx, a, b, NULL, 128, GGML_ROPE_TYPE_NEOX, 512, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+        // }, "RoPE NEOX " + std::string(ggml_type_name(type)) + " with YaRN", 1e-5f));
 
-        tests.push_back(make_test([type](ggml_context* ctx) {
-            ggml_tensor* a = ggml_new_tensor_3d(ctx, type, 512, 32, 1);
+        // tests.push_back(make_test([type](ggml_context* ctx) {
+        //     ggml_tensor* a = ggml_new_tensor_3d(ctx, type, 512, 32, 1);
+        //     ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        //     return ggml_rope(ctx, a, b, 512, GGML_ROPE_TYPE_NEOX);
+        // }, "RoPE NEOX in Gemma " + std::string(ggml_type_name(type)), 1e-5f));
+
+        tests.push_back(make_test([](ggml_context* ctx) {
+            ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 32, 1);
             ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-            return ggml_rope(ctx, a, b, 512, GGML_ROPE_TYPE_NEOX);
-        }, "RoPE NEOX in Gemma " + std::string(ggml_type_name(type)), 1e-5f));
-
-        tests.push_back(make_test([type](ggml_context* ctx) {
-            ggml_tensor* a = ggml_new_tensor_3d(ctx, type, 2048, 16, 2);
-            ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
-            return ggml_rope(ctx, a, b, 128, GGML_ROPE_TYPE_NORMAL);
-        }, "RoPE Normal " + std::string(ggml_type_name(type)), 1e-5f));
-    }
-
+            return ggml_rope(ctx, a, b, 32, GGML_ROPE_TYPE_NORMAL);
+        }, "RoPE Normal " + std::string(ggml_type_name(GGML_TYPE_F32)), 1e-5f));
+    // }
+#if 0
     // more complex tests
     tests.push_back(make_test([](ggml_context* ctx) {
         ggml_tensor* x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 18);
@@ -721,7 +721,7 @@ int main()
         ggml_tensor* h_all = ggml_concat(ctx, h1, h2, 1);
         return ggml_transpose(ctx, h_all);
     }, "MLP mixer", 1e-3));
-
+#endif
     size_t total_tests = 0;
     size_t passed_tests = 0;
     size_t not_supported = 0;

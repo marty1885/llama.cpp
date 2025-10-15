@@ -87,6 +87,20 @@ inline vFloat vector_sin_phase(vFloat x)
     return v;
 }
 
+#ifdef EXT_FACTOR
+sfpi_inline vFloat rope_yarn_ramp(vFloat vec_pos) {
+    vFloat y = (vec_pos - CORR_DIMS0) * (1.f / std::max(0.001f, float(CORR_DIMS1 - CORR_DIMS0)));
+    v_if(y < 0.f) {
+        y = 0;
+    }
+    v_elseif(y > 1.f) {
+        y = 1;
+    }
+    v_endif;
+    return 1.f - y;
+}
+#endif
+
 inline void rope_face(int pos, int D, int vec_offset, int face)
 {
     vFloat freq = dst_reg[64+face%2];

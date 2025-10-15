@@ -9,21 +9,6 @@
 
 using namespace tt::tt_metal;
 
-// Yanked and adapted from other places in GGML
-static float rope_yarn_corr_factor(int n_dims, int n_ctx_orig, float n_rot, float base) {
-    return n_dims * std::log(n_ctx_orig / (n_rot * 2 * M_PI)) / (2 * std::log(base));
-}
-
-static std::array<float, 2> rope_yarn_corr_dims(
-    int n_dims, int n_ctx_orig, float freq_base, float beta_fast, float beta_slow
-) {
-    // start and end correction dims
-    return std::array<float, 2>{
-        std::max(0.0f,         std::floor(rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_fast, freq_base))),
-        std::min(n_dims - 1.0f, std::ceil(rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_slow, freq_base)))
-    };
-}
-
 struct RoPEDeviceOperation {
     const tt::tt_metal::MemoryConfig output_mem_config;
     const tt::tt_metal::DataType output_dtype{};
@@ -193,7 +178,8 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
     }
     if(ext_factor != 0.f) {
         defines["EXT_FACTOR"] = to_string_precise(ext_factor);
-        auto corr_dims = rope_yarn_corr_dims(D_active, n_ctx_orig, freq_base, beta_fast, beta_slow);
+        float corr_dims[2];
+        ggml_rope_yarn_corr_dims(D_active, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
         if(isinf(corr_dims[0]) || isnan(corr_dims[0])) {
             corr_dims[0] = 0;
         }

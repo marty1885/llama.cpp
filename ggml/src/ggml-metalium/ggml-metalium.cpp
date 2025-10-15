@@ -193,6 +193,7 @@ struct ggml_backend_metalium_debug_flags {
     bool print_view = false;                // Print details when a VIEW op is being realized
     bool cache_mm_transpose = false;        // Cache the transpose kernel for matmul
     bool disable_program_cache = false;     // Disables the program cache
+    bool experimental_ops = false;          // Enable experimental ops that is known to cause trouble
 };
 
 static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
@@ -213,6 +214,7 @@ static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
         .print_view = func("GGML_METALIUM_PRINT_VIEW"),
         .cache_mm_transpose = func("GGML_METALIUM_CACHE_MM_TRANSPOSE"), // GGML uses pre-transposed weights. Remove this flag when TT implements it
         .disable_program_cache = func("GGML_METALIUM_DISABLE_PROGRAM_CACHE")
+        .experimental_ops = func("GGML_METALIUM_EXPERIMENTAL_OPS")
     };
 }();
 
@@ -1740,6 +1742,9 @@ static void ggml_backend_metalium_glu(ggml_backend_metalium_context * ctx, struc
 
 static bool ggml_backend_metalium_can_rope(const struct ggml_tensor * dst)
 {
+    if(!g_debug_flags.experimental_ops) {
+        return false;
+    }
     std::array<int32_t, 5> int_params;
     memcpy(int_params.data(), dst->op_params, sizeof(int_params));
     auto [

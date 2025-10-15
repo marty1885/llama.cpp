@@ -235,7 +235,7 @@ void MAIN {
         tile_regs_acquire();
 
         copy_tile(cb_in0, 0, 0);
-        MATH(rope_tile(idxs_ptr[b], inv_d, w*32/2));
+        MATH(rope_tile(idxs_ptr[b], inv_d, w*32));
         tile_regs_commit();
         tile_regs_wait();
 

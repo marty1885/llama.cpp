@@ -2744,6 +2744,7 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
             abort();
         }
         if(!g_debug_flags.disable_program_cache) {
+            fmt::println("Disabling persistent kernel cache. Things will be slower");
             tt::tt_metal::detail::EnablePersistentKernelCache();
         }
         // TODO: Support multiple devices (TT supports mesh configuration so it's going to be tricky)

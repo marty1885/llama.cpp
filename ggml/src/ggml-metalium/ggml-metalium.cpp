@@ -213,7 +213,7 @@ static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
         .print_rejected_ops = func("GGML_METALIUM_PRINT_REJECTED_OPS"),
         .print_view = func("GGML_METALIUM_PRINT_VIEW"),
         .cache_mm_transpose = func("GGML_METALIUM_CACHE_MM_TRANSPOSE"), // GGML uses pre-transposed weights. Remove this flag when TT implements it
-        .disable_program_cache = func("GGML_METALIUM_DISABLE_PROGRAM_CACHE")
+        .disable_program_cache = func("GGML_METALIUM_DISABLE_PROGRAM_CACHE"),
         .experimental_ops = func("GGML_METALIUM_EXPERIMENTAL_OPS")
     };
 }();

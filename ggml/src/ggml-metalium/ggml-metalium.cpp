@@ -751,7 +751,15 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         GGML_ASSERT(ndiff != 1); // Logically impossible
 
         auto t = realize_ggml_view(src0);
-        if(ndiff == 0) {
+
+        bool all_zero = true;
+        for(int i=0;i<GGML_MAX_DIMS;i++) {
+            if(permute[i] != 0) {
+                all_zero = false;
+                break;
+            }
+        }
+        if(ndiff == 0 || all_zero) {
             return t;
         }
 

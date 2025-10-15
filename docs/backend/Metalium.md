@@ -131,13 +131,22 @@ Besides the standard FP32 and BFP16 floating point support. Tenstorrent processo
 
 ## Environment Variable
 
+### (CMake) Build flags
+
+| Variable Name               | Default Value                        | Description                                                          |
+|-----------------------------|--------------------------------------|----------------------------------------------------------------------|
+| GGML_METALIUM               | OFF                                  | Enable building the Metalium backend                                 |
+| GGML_METALIUM_EMBED_KERNELS | ON                                   | If compute kernels should be embeded into the executable             |
+
+
 ### Runtime variables
 
-| Variable Name | Value                                           | Description                                                          |
-|--------------------------|--------------------------------------|----------------------------------------------------------------------|
-| TT_METAL_HOME            | string  (mandatory)                  | Path to the root of the tt-metal repository                          |
-| GGML_METALIUM_DEVICE_ID  | integer                              | ID of the device to use (single device). 0 is assumed if not set     |
-| GGML_METALIUM_MESH_SHAPE | string                               | Shape of the device mesh for clustering (ex: 2x4 for 2x4 mesh)       |
+| Variable Name             | Value                                | Description                                                                                                |
+|---------------------------|--------------------------------------|------------------------------------------------------------------------------------------------------------|
+| TT_METAL_HOME             | string  (mandatory)                  | Path to the root of the tt-metal repository                                                                |
+| GGML_METALIUM_DEVICE_ID   | integer                              | ID of the device to use (single device). 0 is assumed if not set                                           |
+| GGML_METALIUM_MESH_SHAPE  | string                               | Shape of the device mesh for clustering (ex: 2x4 for 2x4 mesh)                                             |
+| GGML_METALIUM_KERNEL_ROOT | string                               | Root of the Metalium kernel library in case running from weird places and you don't have embedded kernels  |
 
 NOTE: `GGML_METALIUM_DEVICE_ID` and `GGML_METALIUM_MESH_SHAPE` cannot be set at the same time.
 NOTE: Clustering is in early stage development. The option exists for development purpose.
@@ -152,6 +161,7 @@ There are several debug flags available to assist with debugging/performance of 
 | GGML_METALIUM_PRINT_VIEW          | 0(default) or 1 | Print all view operations (VIEW, TRANSPOSE, RESHAPE, PERMUTE) that the backend's lazy view system sees                                                                   |
 | GGML_METALIUM_CACHE_MM_TRANSPOSE  | 0(default) or 1 | TTNN has limited support for pre-transposed matmul that GGML needs and does most on the fly. This options cache the transpose. Trades lot of memory for some performance |
 |GGML_METALIUM_DISABLE_PROGRAM_CACHE| 0(default) or 1 | Disables TTNN program cacheing                                                                                                                                           |
+| GGML_METALIUM_EXPERIMENTAL_OPS    | 0(default) or 1 | Enables experimental ops that is known to cause trouble                                                                                                                  |
 
 ## Know issues
 

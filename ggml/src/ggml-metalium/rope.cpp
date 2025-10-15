@@ -122,6 +122,7 @@ void RoPEDeviceOperation::validate_with_output_tensors(
     TT_FATAL(active_dim_size % 64 == 0, "active_dim must be a multiple of 64 (2 tiles)");
     TT_FATAL(active_dim_size <= src_tensor.padded_shape()[-1], "active_dim must be less than the last dimension of the source tensor");
     TT_FATAL(freq_base >= 0, "base_freq must be non-negative");
+    TT_FATAL(freq_scale > 0, "freq_scale must be positive");
 }
 
 tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_program(

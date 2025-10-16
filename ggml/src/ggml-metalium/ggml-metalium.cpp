@@ -1766,9 +1766,6 @@ static void ggml_backend_metalium_glu(ggml_backend_metalium_context * ctx, struc
 
 static bool ggml_backend_metalium_can_rope(const struct ggml_tensor * dst)
 {
-    if(!g_debug_flags.experimental_ops) {
-        return false;
-    }
     std::array<int32_t, 5> int_params;
     memcpy(int_params.data(), dst->op_params, sizeof(int_params));
     auto [
@@ -1778,25 +1775,6 @@ static bool ggml_backend_metalium_can_rope(const struct ggml_tensor * dst)
         n_ctx,
         n_ctx_orig
     ] = int_params;
-#if 0 // Debug print
-    std::array<float, 6> float_params;
-    memcpy(float_params.data(), dst->op_params + int_params.size() , sizeof(float_params));
-    auto [
-        freq_base,
-        freq_scale,
-        ext_factor,
-        attn_factor,
-        beta_fast,
-        beta_slow
-    ] = float_params;
-
-    fmt::println(stderr, "Rope params: n_past {}, n_dims {}, mode {}, n_ctx {}, n_ctx_orig {}, freq_base {}, freq_scale {}, ext_factor {}, attn_factor {}, beta_fast {}, beta_slow {}, has_c {}",
-        n_past, n_dims, mode, n_ctx, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, dst->src[2] != nullptr);
-    fmt::println(stderr, "Rope src0 shape: {} {} {} {}, src1 shape: {} {} {} {}",
-        dst->src[0]->ne[0], dst->src[0]->ne[1], dst->src[0]->ne[2], dst->src[0]->ne[3],
-        dst->src[1]->ne[0], dst->src[1]->ne[1], dst->src[1]->ne[2], dst->src[1]->ne[3]);
-#endif
-
     return ((n_dims % 64 == 0 && mode == GGML_ROPE_TYPE_NEOX)
         || (n_dims % 32 == 0 && mode == GGML_ROPE_TYPE_NORMAL))
         && dst->src[2] == nullptr; // Don't support freq factor yet

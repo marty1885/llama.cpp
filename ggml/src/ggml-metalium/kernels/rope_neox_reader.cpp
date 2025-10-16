@@ -25,7 +25,7 @@ void kernel_main() {
 
     cb_reserve_back(cb_in1, 1);
     uint32_t cb_idx_addr = get_write_ptr(cb_in1);
-    uint64_t read_addr = idx.get_noc_addr(0, sizeof(int)*batch_size);
+    uint64_t read_addr = idx.get_noc_addr(0, 0);
     noc_async_read(read_addr, cb_idx_addr, batch_size*sizeof(int));
     noc_async_read_barrier();
     cb_push_back(cb_in1, 1);

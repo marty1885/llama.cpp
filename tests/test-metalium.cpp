@@ -727,11 +727,12 @@ int main(int argc, char ** argv)
     ///////////////// put experiment code here /////////////////
     // easier on the eye to find it (also one line to disable UT)
     tests.push_back(make_test([](ggml_context* ctx) {
-        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 4, 4, 4);
-        return ggml_transpose(ctx, ggml_transpose(ctx, a));
-    }, "Double transpose"));
+        ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 32, 8);
+        ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 8);
+        return ggml_rope(ctx, a, b, 32, GGML_ROPE_TYPE_NORMAL);
+    }, "RoPE NEOX test"));
     ///////////////// end of experiment code /////////////////
-    
+
     size_t total_tests = 0;
     size_t passed_tests = 0;
     size_t not_supported = 0;

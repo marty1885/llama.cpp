@@ -277,7 +277,7 @@ struct test_case
 
             double err = ud->loss(f1.data(), f2.data(), f1.size());
             if (err > ud->max_err) {
-                printf("[%s] loss = %.9f > %.9f ", ggml_op_desc(t1), err, ud->max_err);
+                printf("[%s / %s] loss = %.9f > %.9f ", ggml_op_desc(t1), t1->name, err, ud->max_err);
                 //for (int i = 0; i < (int) f1.size(); i++) {
                 //    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
                 //}
@@ -321,22 +321,8 @@ std::string type_name(ggml_type type)
     return ggml_get_type_traits(type)->type_name;
 }
 
-int main()
+void add_unittests(std::vector<std::unique_ptr<test_case>>& tests)
 {
-    ggml_backend_t cpu = ggml_backend_cpu_init();
-
-    ggml_backend_reg_t reg = ggml_backend_reg_by_name("Metalium");
-    if(reg == NULL) {
-        fprintf(stderr, "Cannot find the Metalium backend. Is the Meralium backend disabled?\n");
-        return 1;
-    }
-    if(ggml_backend_reg_dev_count(reg) == 0) {
-        fprintf(stderr, "No devices found for Metalium backend. Is the kernel driver working?\n");
-        return 1;
-    }
-    ggml_backend_t metalium = ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, 0), NULL);
-
-    std::vector<std::unique_ptr<test_case>> tests;
     const ggml_unary_op supported_unary_ops[] = {
         GGML_UNARY_OP_ABS,
         GGML_UNARY_OP_SGN,
@@ -718,6 +704,34 @@ int main()
         ggml_tensor* h_all = ggml_concat(ctx, h1, h2, 1);
         return ggml_transpose(ctx, h_all);
     }, "MLP mixer", 1e-3));
+}
+
+int main(int argc, char ** argv)
+{
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("Metalium");
+    if(reg == NULL) {
+        fprintf(stderr, "Cannot find the Metalium backend. Is the Meralium backend disabled?\n");
+        return 1;
+    }
+    if(ggml_backend_reg_dev_count(reg) == 0) {
+        fprintf(stderr, "No devices found for Metalium backend. Is the kernel driver working?\n");
+        return 1;
+    }
+    ggml_backend_t metalium = ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, 0), NULL);
+
+    std::vector<std::unique_ptr<test_case>> tests;
+    // add_unittests(tests);
+
+    ///////////////// put experiment code here /////////////////
+    // easier on the eye to find it (also one line to disable UT)
+    tests.push_back(make_test([](ggml_context* ctx) {
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 4, 4, 4);
+        return ggml_transpose(ctx, ggml_transpose(ctx, a));
+    }, "Double transpose"));
+    ///////////////// end of experiment code /////////////////
+    
     size_t total_tests = 0;
     size_t passed_tests = 0;
     size_t not_supported = 0;

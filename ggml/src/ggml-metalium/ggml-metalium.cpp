@@ -21,6 +21,7 @@
 #include "types/arch.h"
 #include "umd/device/types/arch.hpp"
 #include "umd/device/types/cluster_descriptor_types.hpp"
+#include <string.h>
 #include <sys/types.h>
 #include <algorithm>
 #include <array>
@@ -935,6 +936,21 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
     auto res = realize_ggml_view(src0);
     if(!ggml_tt_tensors_shape_equal(dst, *res)) {
         res = std::make_shared<tt::tt_metal::Tensor>(reshape_tt_tensor_into_ggml(*res, dst));
+    }
+    auto result_type = ggml2tt_type(dst->type, res->device()->arch());
+    if(res->dtype() != result_type) {
+        res = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*res, result_type));
+    }
+    if(dst->op == GGML_OP_CPY) {
+        auto* src1 = dst->src[1];
+        GGML_ASSERT(src1 != NULL);
+        GGML_ASSERT(src1->extra != NULL);
+        TensorWithMetadata* src1_meta = (TensorWithMetadata*)src1->extra;
+        *src1_meta = {
+            .tensor = res,
+            .ggtype = src0->type,
+            .bufctx = src1_meta->bufctx
+        };
     }
 
     *dst_meta = {
@@ -2047,7 +2063,7 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
         //      Which means if we try to copy a transposed tensor. We should not transpose it. Else the other
         //      backend would transpose it again.
         ggml_tensor* src = tensor->src[0];
-        bool do_transpose = false;
+        bool do_transpose = true;
         while(src->op == GGML_OP_TRANSPOSE) {
             do_transpose = !do_transpose;
             src = src->src[0];

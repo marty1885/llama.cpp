@@ -103,15 +103,10 @@ sfpi_inline vFloat rope_yarn_ramp(vFloat vec_pos) {
 
 inline void rope_face(int pos, int D, int vec_offset, int face)
 {
-    vFloat freq = dst_reg[64+face%2];
-    vFloat mscale = dst_reg[64+face%2+2];
+    vFloat sin_angle = dst_reg[64+face%2];
+    vFloat cos_angle = dst_reg[64+face%2+2];
     int dst_offset = face * 8;
     for (int i = 0; i < 4; i++) {
-        // Standard RoPE math
-        vFloat angle = int32_to_float(pos) * freq;
-        vFloat sin_angle = vector_sin_phase(angle) * mscale;
-        vFloat cos_angle = vector_sin_phase(0.5f - angle) * mscale;
-
         // Thanks that dst interleaves lanes by default
         vFloat x = dst_reg[dst_offset+i*2];
         vFloat y = dst_reg[dst_offset+i*2+1];
@@ -154,8 +149,13 @@ inline void rope_tile(int pos, int D, int vec_offset)
                 mscale *= 1.0f + 0.1f * LOG_1_FREQ_SCALE;
             #endif // else mscahe *= 1 (the other half collasps to 0) - does nothing
         #endif
-        dst_reg[64+i] = theta;
-        dst_reg[64+i+2] = mscale;
+
+        vFloat vpos = int32_to_float(pos);
+        vFloat angle_phase = vpos * theta;
+        vFloat sin_value = vector_sin_phase(angle_phase) * mscale;
+        vFloat cos_value = vector_sin_phase(0.5f - angle_phase) * mscale;
+        dst_reg[64+i] = sin_value;
+        dst_reg[64+i+2] = cos_value;
     }
 
     for (int face = 0; face < 4; face++) {

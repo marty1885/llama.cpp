@@ -129,15 +129,9 @@ inline void rope_face(int pos, int face_idx, int pos_in_vector)
     //      evaulated at compile time.
     int face_col = face_idx % 2;
     int dst_offset = face_idx*8;
-    vFloat vpos = int32_to_float(pos);
     for (int h = 0; h < 2; h++) {
-        vFloat freq = dst_reg[64+face_col*2+h];
-        vFloat mscale = dst_reg[64+face_col*2+h+4];
-
-        // Standard RoPE math
-        vFloat angle_phase = vpos * freq;
-        vFloat sin_value = vector_sin_phase(angle_phase) * mscale;
-        vFloat cos_value = vector_sin_phase(0.5f - angle_phase) * mscale;
+        vFloat sin_value = dst_reg[64+face_col*2+h];
+        vFloat cos_value = dst_reg[64+face_col*2+h+4];
         for (int i = 0; i < 4; i++) {
             int idx = i*2+h;
             vFloat x = dst_reg[dst_offset+idx];
@@ -188,8 +182,13 @@ inline void rope_tile(int pos, float inv_d, int vec_offset)
                 mscale *= 1.0f + 0.1f * LOG_1_FREQ_SCALE;
             #endif // else mscahe *= 1 (the other half collasps to 0) - does nothing
         #endif
-        dst_reg[64+i] = theta;
-        dst_reg[64+i+4] = mscale;
+
+        vFloat vpos = int32_to_float(pos);
+        vFloat angle_phase = vpos * theta;
+        vFloat sin_value = vector_sin_phase(angle_phase) * mscale;
+        vFloat cos_value = vector_sin_phase(0.5f - angle_phase) * mscale;
+        dst_reg[64+i] = sin_value;
+        dst_reg[64+i+4] = cos_value;
     }
 
     for (int face = 0; face < 4; face++) {

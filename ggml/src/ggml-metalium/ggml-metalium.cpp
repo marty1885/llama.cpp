@@ -2427,11 +2427,13 @@ static bool ggml_backend_metalium_device_supports_op(ggml_backend_dev_t device, 
     // debug print to log rejected ops
     if(!ok && g_debug_flags.print_rejected_ops) {
         fprintf(stderr, "REJECT op %s (%s)\n", ggml_op_name(op->op), op->name);
-        if(op->src[0]) {
-            fprintf(stderr, "  src0 shape [%ld %ld %ld %ld], dtype = %s\n", op->src[0]->ne[0], op->src[0]->ne[1], op->src[0]->ne[2], op->src[0]->ne[3], ggml_type_name(op->src[0]->type));
-        }
-        if(op->src[1]) {
-            fprintf(stderr, "  src1 shape [%ld %ld %ld %ld], dtype = %s\n", op->src[1]->ne[0], op->src[1]->ne[1], op->src[1]->ne[2], op->src[1]->ne[3], ggml_type_name(op->src[1]->type));
+        for(int i = 0; i < GGML_MAX_SRC; i++) {
+            if(op->src[i]) {
+                fprintf(stderr, "  src%d shape [%ld %ld %ld %ld], dtype = %s\n", i, op->src[i]->ne[0], op->src[i]->ne[1], op->src[i]->ne[2], op->src[i]->ne[3], ggml_type_name(op->src[i]->type));
+            }
+            else {
+                break;
+            }
         }
     }
     return ok;

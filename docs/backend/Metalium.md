@@ -18,6 +18,8 @@ Tenstorrent produces a range of ASICs with very scalable design that enables eff
 
 **Metalium and TTNN** is the default low level and operator library developed by Tenstorrent (analogous to CUDA and cuDNN + ATen). They are the critical part of executing neural network computation on Tenstorrent devices and provides high level primitives for scaling to multiple connected Tenstorrent processors.
 
+This backend tries to call operators in TTNN when possible. If an operator is not supported by TTNN, custom kernels in Metalium are implemented to keep operations and data on-device.
+
 ### llama.cpp + Metalium
 
 The llama.cpp Metalium backend is designed to support inference on Tenstorrent's Wormhole or later processors. It is experimental software in it's early days. The earlier Grayskull generation processors have their support removed from current versions of TTNN, thus also unsupported by this backend.

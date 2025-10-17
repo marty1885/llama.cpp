@@ -4,8 +4,6 @@
 #include "tt-metalium/kernel_types.hpp"
 #include "tt-metalium/tt_backend_api_types.hpp"
 
-std::unordered_map<std::string, std::string>& ggml_metalium_get_kernel_map();
-
 using CoreSpec = std::variant<CoreCoord, CoreRange, CoreRangeSet>;
 tt::tt_metal::CBHandle MakeCircularBuffer(
     tt::tt_metal::Program& program, const CoreSpec& core, tt::CBIndex cb, uint32_t size, uint32_t page_size, tt::DataFormat format);

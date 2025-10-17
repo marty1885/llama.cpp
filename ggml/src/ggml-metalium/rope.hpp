@@ -1,6 +1,4 @@
 #include <ttnn/decorators.hpp>
-#include <ttnn/run_operation.hpp>
-#include <ttnn/tensor/layout/layout.hpp>
 #include <ttnn/tensor/tensor.hpp>
 #include <ttnn/tensor/types.hpp>
 

@@ -65,6 +65,7 @@
 #include <vector>
 
 #include "rope.hpp"
+#include "mul_mat.hpp"
 
 extern void metalium_register_all_kernel();
 
@@ -834,6 +835,18 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC1_SANITY_CHECK(dst);
 
+    TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
+    TensorWithMetadata* src0_meta = (TensorWithMetadata*)dst->src[0]->extra;
+
+    auto res = ttggml::mul_mat(*realize_ggml_view(dst->src[0]), *realize_ggml_view(dst->src[1]));
+
+    *dst_meta = TensorWithMetadata{
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(res),
+        .ggtype = dst->type,
+        .bufctx = src0_meta->bufctx,
+    };
+
+    #if 0
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
@@ -912,6 +925,7 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     }
     GGML_ASSERT(cm->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE);
     GGML_UNUSED(ctx);
+    #endif
 }
 
 static bool ggml_backend_metalium_can_cpy(const struct ggml_tensor * dst)

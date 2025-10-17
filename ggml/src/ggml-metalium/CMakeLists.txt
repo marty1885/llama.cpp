@@ -6,8 +6,9 @@ message(STATUS "Metalium found.")
 
 ggml_add_backend_library(ggml-metalium
     ggml-metalium.cpp
-    rope.cpp
     utils.cpp
+    rope.cpp
+    mul_mat.cpp
 
     ${CMAKE_BINARY_DIR}/generated/kernels/__register_all_kernels.cpp
 )
@@ -64,6 +65,9 @@ if(GGML_METALIUM_EMBED_KERNELS)
             rope_normal_reader
             rope_normal_compute
             rope_normal_writer
+            mul_mat_reader
+            mul_mat_compute
+            mul_mat_writer
     )
     include(cmake/add_kernel.cmake)
     foreach(kernel IN ITEMS ${GGML_METALIUM_EMBED_KERNELS})
@@ -71,6 +75,8 @@ if(GGML_METALIUM_EMBED_KERNELS)
     endforeach()
     register_kernels(ggml-metalium "${GGML_METALIUM_EMBED_KERNELS}")
     target_link_libraries(ggml-metalium PRIVATE ggml-metalium-kernels)
+    target_compile_definitions(ggml-metalium PRIVATE GGML_METALIUM_EMBED_KERNELS)
+set_target_properties(ggml-metalium-kernels PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
 

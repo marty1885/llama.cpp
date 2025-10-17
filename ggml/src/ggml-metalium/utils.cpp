@@ -2,11 +2,9 @@
 #include <filesystem>
 #include "utils.hpp"
 
-static std::unordered_map<std::string, std::string> kernel_map;
-
-std::unordered_map<std::string, std::string>& ggml_metalium_get_kernel_map() {
-    return kernel_map;
-}
+#ifdef GGML_METALIUM_EMBED_KERNELS
+std::unordered_map<std::string, std::string>& ggml_metalium_get_kernel_map();
+#endif
 
 using namespace tt::tt_metal;
 
@@ -43,10 +41,10 @@ KernelHandle CreateMetaliumKernel(
     const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
     const std::variant<DataMovementConfig, ComputeConfig, EthernetConfig>& config) {
 
-    if(str.find_first_of(" \n\t") != std::string::npos) {   
+    if(str.find_first_of(" \n\t") != std::string::npos) {
         return tt::tt_metal::CreateKernelFromString(program, str, core_spec, config);
     }
-
+#ifdef GGML_METALIUM_EMBED_KERNELS
     // if it looks like a name
     if(str.find_first_of(" \n\t") == std::string::npos) {
         auto& kernel_map = ggml_metalium_get_kernel_map();
@@ -55,6 +53,7 @@ KernelHandle CreateMetaliumKernel(
             return tt::tt_metal::CreateKernelFromString(program, it->second, core_spec, config);
         }
     }
+#endif
 
     namespace fs = std::filesystem;
     if(fs::exists(str)) {

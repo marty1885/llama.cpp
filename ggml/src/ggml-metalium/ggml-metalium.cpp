@@ -835,6 +835,8 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC1_SANITY_CHECK(dst);
 
+#if 0
+    // WIP implementation of MUL_MAT using direct kernels
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
     TensorWithMetadata* src0_meta = (TensorWithMetadata*)dst->src[0]->extra;
 
@@ -846,7 +848,7 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
         .bufctx = src0_meta->bufctx,
     };
 
-    #if 0
+#else
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 

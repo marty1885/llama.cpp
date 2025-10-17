@@ -1,10 +1,10 @@
 # Usage: add_kernel(target kernel_name)
 # Looks for ${CMAKE_CURRENT_SOURCE_DIR}/kernels/${kernel_name}.cpp
-# Generates ${CMAKE_BINARY_DIR}/generated/kernels/${kernel_name}.cpp
+# Generates ${CMAKE_BINARY_DIR}/generated/metalium/${kernel_name}.cpp
 
 function(add_kernel target kernel_name)
     set(KERNEL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/kernels/${kernel_name}.cpp")
-    set(GEN_DIR "${CMAKE_BINARY_DIR}/generated/kernels")
+    set(GEN_DIR "${CMAKE_BINARY_DIR}/generated/metalium")
     set(GEN_CPP "${GEN_DIR}/__embed_${kernel_name}.cpp")
 
     file(MAKE_DIRECTORY "${GEN_DIR}")
@@ -32,7 +32,7 @@ function(add_kernel target kernel_name)
 endfunction()
 
 function(register_kernels target kernel_names)
-    set(OUTPUT "${CMAKE_BINARY_DIR}/generated/kernels/__register_all_kernels.cpp")
+    set(OUTPUT "${CMAKE_BINARY_DIR}/generated/metalium/__register_all_kernels.cpp")
 
     # Generate the registration source file
     set(KERNEL_NAMES "${kernel_names}")

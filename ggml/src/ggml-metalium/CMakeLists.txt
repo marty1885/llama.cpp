@@ -9,8 +9,6 @@ ggml_add_backend_library(ggml-metalium
     utils.cpp
     rope.cpp
     mul_mat.cpp
-
-    ${CMAKE_BINARY_DIR}/generated/kernels/__register_all_kernels.cpp
 )
 
 target_include_directories(ggml-metalium PRIVATE
@@ -76,7 +74,7 @@ if(GGML_METALIUM_EMBED_KERNELS)
     register_kernels(ggml-metalium "${GGML_METALIUM_EMBED_KERNELS}")
     target_link_libraries(ggml-metalium PRIVATE ggml-metalium-kernels)
     target_compile_definitions(ggml-metalium PRIVATE GGML_METALIUM_EMBED_KERNELS)
-set_target_properties(ggml-metalium-kernels PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    set_target_properties(ggml-metalium-kernels PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
 

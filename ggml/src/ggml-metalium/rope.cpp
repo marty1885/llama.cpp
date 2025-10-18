@@ -13,7 +13,6 @@ using namespace tt::tt_metal;
 
 struct RoPEDeviceOperation {
     const tt::tt_metal::MemoryConfig output_mem_config;
-    const tt::tt_metal::DataType output_dtype{};
     const uint32_t active_dim_size = 0;
     const uint32_t n_ctx_orig = 512;
     const ttggml::RoPEType rope_type = ttggml::RoPEType::Normal;
@@ -40,7 +39,6 @@ ttnn::Tensor ttggml::RoPEOperation::invoke(const Tensor& src_tensor, const Tenso
     return tt::tt_metal::operation::run(
         RoPEDeviceOperation{
             src_tensor.memory_config(),
-            src_tensor.dtype(),
             active_dim_size,
             n_ctx_orig,
             rope_type,
@@ -67,7 +65,7 @@ std::vector<ttnn::TensorSpec> RoPEDeviceOperation::compute_output_specs(
     return {TensorSpec(
         input_tensor.logical_shape(),
         tt::tt_metal::TensorLayout(
-            output_dtype,
+            input_tensor.dtype(),
             tt::tt_metal::PageConfig(input_tensor.layout()),
             output_mem_config)
     )};

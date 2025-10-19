@@ -1792,8 +1792,7 @@ static bool ggml_backend_metalium_can_rope(const struct ggml_tensor * dst)
         n_ctx_orig
     ] = int_params;
     return ((n_dims % 64 == 0 && mode == GGML_ROPE_TYPE_NEOX)
-        || (n_dims % 32 == 0 && mode == GGML_ROPE_TYPE_NORMAL))
-        && dst->src[2] == nullptr; // Don't support freq factor yet
+        || (n_dims % 32 == 0 && mode == GGML_ROPE_TYPE_NORMAL && dst->src[2] == NULL));
 }
 
 
@@ -1827,18 +1826,35 @@ static void ggml_backend_metalium_rope(ggml_backend_metalium_context * ctx, stru
         beta_slow
     ] = float_params;
 
-    auto res = ttggml::rope(
-        *realize_ggml_view(dst->src[0]),
-        *realize_ggml_view(dst->src[1]),
-        n_dims,
-        mode == GGML_ROPE_TYPE_NEOX ? ttggml::RoPEType::NeoX : ttggml::RoPEType::Normal,
-        n_ctx_orig,
-        freq_base,
-        freq_scale,
-        ext_factor,
-        attn_factor,
-        beta_fast,
-        beta_slow);
+    auto res = [&](){
+        if(dst->src[2]) {
+            return ttggml::rope(
+                *realize_ggml_view(dst->src[0]),
+                *realize_ggml_view(dst->src[1]),
+                *realize_ggml_view(dst->src[2]),
+                n_dims,
+                mode == GGML_ROPE_TYPE_NEOX ? ttggml::RoPEType::NeoX : ttggml::RoPEType::Normal,
+                n_ctx_orig,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                beta_fast,
+                beta_slow);
+        }
+        return ttggml::rope(
+            *realize_ggml_view(dst->src[0]),
+            *realize_ggml_view(dst->src[1]),
+            n_dims,
+            mode == GGML_ROPE_TYPE_NEOX ? ttggml::RoPEType::NeoX : ttggml::RoPEType::Normal,
+            n_ctx_orig,
+            freq_base,
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow);
+    }();
     *dst_meta = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(res)),
         .ggtype = dst->type,
@@ -2764,11 +2780,11 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
         metalium_register_all_kernel();
         // TODO: TTNN though not have peoper system packaging yet. Does support working in installed for (via Python packages rn)
         // Remove this limitation
-        if(getenv("TT_METAL_HOME") == NULL) {
-            fmt::println(stderr, "The TT_METAL_HOME environment variables must be set to use the Metalium backend");
+        if(getenv("TT_METAL_RUNTIME_ROOT") == NULL) {
+            fmt::println(stderr, "The TT_METAL_RUNTIME_ROOT environment variables must be set to use the Metalium backend");
             abort();
         }
-        if(!g_debug_flags.disable_program_cache) {
+        if(g_debug_flags.disable_program_cache) {
             fmt::println("Disabling persistent kernel cache. Things will be slower");
             tt::tt_metal::detail::EnablePersistentKernelCache();
         }

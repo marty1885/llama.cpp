@@ -7,6 +7,7 @@
 #include <cmath>
 #include <tt-metalium/work_split.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
+#include "ttnn/tensor/tensor.hpp"
 #include "utils.hpp"
 
 using namespace tt::tt_metal;
@@ -22,6 +23,7 @@ struct RoPEDeviceOperation {
     const float attn_factor = 1.f;
     const float beta_fast = 0.f;
     const float beta_slow = 0.f;
+    const bool has_freq_factor = false;
 
     void validate_with_output_tensors(
         const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
@@ -47,12 +49,35 @@ ttnn::Tensor ttggml::RoPEOperation::invoke(const Tensor& src_tensor, const Tenso
             ext_factor,
             attn_factor,
             beta_fast,
-            beta_slow
+            beta_slow,
+            false
         },
         {src_tensor, index_tensor},
         {},
         {})[0];
 }
+
+ttnn::Tensor ttggml::RoPEOperation::invoke(const Tensor& src_tensor, const Tensor& index_tensor, const Tensor& freq_factor, uint32_t active_dim_size, ttggml::RoPEType rope_type, uint32_t n_ctx_orig, float freq_base,
+    float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
+    return tt::tt_metal::operation::run(
+        RoPEDeviceOperation{
+            src_tensor.memory_config(),
+            active_dim_size,
+            n_ctx_orig,
+            rope_type,
+            freq_base,
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow,
+            true
+        },
+        {src_tensor, index_tensor, freq_factor},
+        {},
+        {})[0];
+}
+
 
 std::vector<ttnn::TensorSpec> RoPEDeviceOperation::compute_output_specs(
     const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const
@@ -100,6 +125,15 @@ void RoPEDeviceOperation::validate_with_output_tensors(
     TT_FATAL(index_tensor.storage_type() == tt::tt_metal::StorageType::DEVICE, "Index tensor must be on device");
     TT_FATAL(src_tensor.storage_type() == tt::tt_metal::StorageType::DEVICE, "Source tensor must be on device");
 
+    if(input_tensors.size() >= 3) {
+        const auto& freq_factor = input_tensors.at(2);
+        const auto& freq_factor_shape = freq_factor.logical_shape();
+        TT_FATAL(freq_factor_shape[-1] == active_dim_size/2, "Frequency factor must have the same size as active dimension");
+        for(size_t i=0;i<freq_factor_shape.size()-1;i++) {
+            TT_FATAL(freq_factor_shape[i] == 1, "Frequency factor shape must have shape [active_dim_size/2], got {}", freq_factor_shape);
+        }
+    }
+
     if (!output_tensors.empty() && output_tensors.at(0).has_value()) {
         const auto& out_tensor = output_tensors.at(0).value();
         TT_FATAL(out_tensor.logical_shape() == src_shape, "Output tensor shape must match source tensor shape");
@@ -128,6 +162,11 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
     const uint32_t D = src_tensor.logical_shape()[-1];
     const uint32_t D_active = active_dim_size;
     const uint32_t N = src_tensor.logical_shape()[-2];
+
+    std::optional<Tensor> freq_factor;
+    if(input_tensors.size() >= 3) {
+        freq_factor = std::make_optional(input_tensors.at(2));
+    }
 
     tt::tt_metal::IDevice* device = src_tensor.device();
 
@@ -165,7 +204,11 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_1, B*sizeof(int32_t), B*sizeof(int32_t), tt::DataFormat::Int32); // cb_in1
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_16, 2, output_tensor.dtype()); // cb_out
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_17, 4, src_tensor.dtype()); // cb_bypass
+    if(freq_factor) {
+        MakeCircularBuffer(program, all_cores, tt::CBIndex::c_2, 4, freq_factor->dtype()); // cb_in2
+    }
 
+    std::map<std::string, std::string> reader_defines;
     std::map<std::string, std::string> defines;
     defines["FREQ_BASE"] = to_string_precise(freq_base);
     defines["FREQ_BASE_LOG"] = to_string_precise(std::log(freq_base));
@@ -189,17 +232,25 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
         defines["CORR_DIMS0"] = to_string_precise(corr_dims[0]);
         defines["CORR_DIMS1"] = to_string_precise(corr_dims[1]);
     }
-    // defines["INV_D_ACTIVE_2"] = float(2.f / D_active); // don't know why this make things slower.
+    if(freq_factor) {
+        defines["HAS_FREQ_FACTOR"] = "1";
+        reader_defines["HAS_FREQ_FACTOR"] = "1";
+    }
 
 
     std::vector<uint32_t> reader_compile_time_args;
     TensorAccessorArgs(*src).append_to(reader_compile_time_args);
     TensorAccessorArgs(*idxs).append_to(reader_compile_time_args);
+    if(freq_factor) {
+        const auto* freq_fact = freq_factor->buffer();
+        TensorAccessorArgs(*freq_fact).append_to(reader_compile_time_args);
+    }
     std::string variant = rope_type == ttggml::RoPEType::NeoX ? "neox" : "normal";
     KernelHandle reader = CreateMetaliumKernel(program, fmt::format("rope_{}_reader", variant), all_cores, DataMovementConfig{
         .processor = DataMovementProcessor::RISCV_0,
         .noc = NOC::RISCV_0_default,
-        .compile_args = reader_compile_time_args
+        .compile_args = reader_compile_time_args,
+        .defines = reader_defines
     });
 
     std::vector<uint32_t> writer_compile_time_args;
@@ -207,7 +258,8 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
     KernelHandle writer = CreateMetaliumKernel(program, fmt::format("rope_{}_writer", variant), all_cores, DataMovementConfig{
         .processor = DataMovementProcessor::RISCV_1,
         .noc = NOC::RISCV_1_default,
-        .compile_args = writer_compile_time_args
+        .compile_args = writer_compile_time_args,
+        .defines = {}
     });
 
     KernelHandle compute = CreateMetaliumKernel(program, fmt::format("rope_{}_compute", variant), all_cores, ComputeConfig{
@@ -217,6 +269,7 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
 
     uint32_t active_id = 0;
     uint32_t passive_id = 0;
+    auto freq_factor_addr = freq_factor ? freq_factor->buffer()->address() : 0;
     for(const auto& range : all_cores.ranges()) {
         for(const auto& core : range) {
             uint32_t active_size = 0;
@@ -236,7 +289,7 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
                 passive_size = work_per_core2_passive;
             }
 
-            SetRuntimeArgs(program, reader, core, std::vector<uint32_t>{src->address(), D_activet, Dt, Nt, idxs->address(), B, active_id, active_id+active_size, passive_id, passive_id+passive_size, N});
+            SetRuntimeArgs(program, reader, core, std::vector<uint32_t>{src->address(), D_activet, Dt, Nt, idxs->address(), B, active_id, active_id+active_size, passive_id, passive_id+passive_size, N, freq_factor_addr});
             SetRuntimeArgs(program, compute, core, std::vector<uint32_t>{D_activet, Dt, Nt, B, active_id, active_id+active_size, N});
             SetRuntimeArgs(program, writer, core, std::vector<uint32_t>{dst->address(), D_activet, Dt, Nt, B, active_id, active_id+active_size, passive_id, passive_id+passive_size});
 
@@ -245,13 +298,19 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
         }
     }
 
-    auto override_runtime_args_callback = [reader, writer, all_cores](
+    auto override_runtime_args_callback = [reader, writer, all_cores, has_freq_factor=bool(freq_factor)](
                                                   const void* operation,
                                                   Program& program,
                                                   const std::vector<Tensor>& input_tensors,
                                                   const std::vector<std::optional<const Tensor>>&,
                                                   const std::vector<Tensor>& output_tensors) {
             (void)operation;
+            if(has_freq_factor) {
+                TT_FATAL(input_tensors.size() >= 3, "Expecting frequency factor, did not get it from TTNN");
+            }
+            else {
+                TT_FATAL(input_tensors.size() == 2, "Expecting two input tensors w/o freqnency factor, got too much from TTNN");
+            }
             auto* src_buffer = input_tensors.at(0).buffer();
             auto* idx_buffer = input_tensors.at(1).buffer();
             auto* dst_buffer = output_tensors.at(0).buffer();
@@ -262,6 +321,9 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
                         auto& runtime_args = GetRuntimeArgs(program, reader, core);
                         runtime_args[0] = src_buffer->address();
                         runtime_args[4] = idx_buffer->address();
+                        if(has_freq_factor) {
+                            runtime_args[11] = input_tensors.at(2).buffer()->address();
+                        }
                     }
 
                     {

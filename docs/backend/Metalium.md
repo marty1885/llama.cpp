@@ -59,10 +59,11 @@ ninja
 ninja install
 ```
 
-3. Build llama.cpp with `GGML_METALIUM=ON`. It will read the `TT_METAL_HOME` variable above and error if not  detected. Likewise, the backend needs the environmental variables to function.
+3. Build llama.cpp with `GGML_METALIUM=ON`. It will read the `TT_METAL_RUNTIME_ROOT` variable above and error if not  detected. Likewise, the backend needs the environmental variables to function.
 
 ```bash
 cd /path/to/your/llama.cpp
+export TT_METAL_RUNTIME_ROOT="${TT_METAL_HOME}"
 mkdir build
 cd build
 cmake .. -DGGML_METALIUM=ON -DCMAKE_BUILD_TYPE=Release
@@ -146,6 +147,7 @@ Besides the standard FP32 and BFP16 floating point support. Tenstorrent processo
 | Variable Name             | Value                                | Description                                                                                                |
 |---------------------------|--------------------------------------|------------------------------------------------------------------------------------------------------------|
 | TT_METAL_HOME             | string  (mandatory)                  | Path to the root of the tt-metal repository                                                                |
+| TT_METAL_RUNTIME_ROOT     | string  (mandatory)                  | Path to the root of the root of the runtime directory (or, the repo dir)                                   |
 | GGML_METALIUM_DEVICE_ID   | integer                              | ID of the device to use (single device). 0 is assumed if not set                                           |
 | GGML_METALIUM_MESH_SHAPE  | string                               | Shape of the device mesh for clustering (ex: 2x4 for 2x4 mesh)                                             |
 | GGML_METALIUM_KERNEL_ROOT | string                               | Root of the Metalium kernel library in case running from weird places and you don't have embedded kernels  |

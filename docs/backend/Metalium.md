@@ -170,3 +170,7 @@ There are several debug flags available to assist with debugging/performance of 
 ## Know issues
 
 - The backend cannot exit without leaking some memory (gets handled by OS) due to destruction order issues.
+
+## For developers
+
+The following is a very brief and evolving deisgn doc as things develop. Generally.

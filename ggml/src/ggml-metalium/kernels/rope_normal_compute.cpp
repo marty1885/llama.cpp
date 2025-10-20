@@ -275,7 +275,6 @@ void MAIN {
         uint32_t w = active_id % n_tiles_width_active;
         cb_wait_front(cb_in0, 1);
         #ifdef HAS_FREQ_FACTOR
-        DPRINT << "w: " << w << " n_tiles_width_active: " << n_tiles_width_active << ENDL();
         uint32_t ff_idx = w/2;
         bool process_ff = last_ff_idx != ff_idx;
         if(last_ff_idx != ff_idx) {

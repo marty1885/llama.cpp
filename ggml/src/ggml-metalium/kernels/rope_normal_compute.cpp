@@ -8,7 +8,6 @@
 #include <string.h>
 
 #include <tools/profiler/kernel_profiler.hpp>
-#include <debug/dprint_tensix.h>
 
 #ifdef TRISC_MATH
 using namespace sfpi;
@@ -169,7 +168,6 @@ inline void rope_tile(int pos, int D, int vec_offset)
     // failing to allocate registers
     for(int i=0;i<2;i++) {
         int ff_idx = 96+((vec_offset/32)%2)*8+i;
-        DPRINT << "ff_idx: " << ff_idx << ENDL();
         vFloat ff = vFloat(dst_reg[ff_idx]);
         vFloat d0 = ff;
         vFloat d1 = ff;
@@ -293,15 +291,11 @@ void MAIN {
         #ifdef HAS_FREQ_FACTOR
         copy_tile_init(cb_in2);
         copy_tile(cb_in2, 0, 3);
-        dprint_tensix_dest_reg(3);
         #endif
 
         copy_tile_init(cb_in0);
         copy_tile(cb_in0, 0, 0);
         MATH(rope_tile(idxs_ptr[b], inv_d, w*32));
-        #ifdef HAS_FREQ_FACTOR
-        dprint_tensix_dest_reg(3);
-        #endif
         tile_regs_commit();
         tile_regs_wait();
 

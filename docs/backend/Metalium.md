@@ -173,4 +173,6 @@ There are several debug flags available to assist with debugging/performance of 
 
 ## For developers
 
-The following is a very brief and evolving deisgn doc as things develop. Generally.
+The following is a very brief and evolving deisgn doc as things develop. Generally:
+
+All tensors

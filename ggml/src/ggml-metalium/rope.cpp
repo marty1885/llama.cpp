@@ -23,7 +23,6 @@ struct RoPEDeviceOperation {
     const float attn_factor = 1.f;
     const float beta_fast = 0.f;
     const float beta_slow = 0.f;
-    const bool has_freq_factor = false;
 
     void validate_with_output_tensors(
         const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
@@ -49,8 +48,7 @@ ttnn::Tensor ttggml::RoPEOperation::invoke(const Tensor& src_tensor, const Tenso
             ext_factor,
             attn_factor,
             beta_fast,
-            beta_slow,
-            false
+            beta_slow
         },
         {src_tensor, index_tensor},
         {},
@@ -70,8 +68,7 @@ ttnn::Tensor ttggml::RoPEOperation::invoke(const Tensor& src_tensor, const Tenso
             ext_factor,
             attn_factor,
             beta_fast,
-            beta_slow,
-            true
+            beta_slow
         },
         {src_tensor, index_tensor, freq_factor},
         {},

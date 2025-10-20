@@ -727,10 +727,11 @@ int main(int argc, char ** argv)
     ///////////////// put experiment code here /////////////////
     // easier on the eye to find it (also one line to disable UT)
     tests.push_back(make_test([](ggml_context* ctx) {
-        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 64);
-        ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 64);
-        return ggml_mul_mat(ctx, a, b);
-    }, "2D matrix multiplication"));
+        ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 32, 1);
+        ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_tensor* ff = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32);
+        return ggml_rope_ext(ctx, a, b, ff, 64, GGML_ROPE_TYPE_NORMAL, 512, 10000, 1, 0, 1, 1, 1);
+    }, "RoPE Normal " + std::string(ggml_type_name(GGML_TYPE_F32))));
     ///////////////// end of experiment code /////////////////
 
     size_t total_tests = 0;

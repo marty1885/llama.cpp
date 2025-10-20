@@ -53,6 +53,7 @@ void kernel_main() {
         noc_async_read_tile(tile_idx2, src, cb_src_addr + tile_size_bytes);
 
         #ifdef HAS_FREQ_FACTOR
+            cb_reserve_back(cb_in2, 1);
             uint32_t ff_idx = w;
             uint32_t cb_ff_addr = get_write_ptr(cb_in2);
             noc_async_read_tile(ff_idx, ff, cb_ff_addr);

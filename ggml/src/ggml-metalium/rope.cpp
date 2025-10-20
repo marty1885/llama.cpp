@@ -132,6 +132,11 @@ void RoPEDeviceOperation::validate_with_output_tensors(
         for(size_t i=0;i<freq_factor_shape.size()-1;i++) {
             TT_FATAL(freq_factor_shape[i] == 1, "Frequency factor shape must have shape [active_dim_size/2], got {}", freq_factor_shape);
         }
+
+        if(rope_type == ttggml::RoPEType::Normal) {
+            TT_FATAL(freq_factor.dtype() == tt::tt_metal::DataType::BFLOAT16,
+                    "Frequency factor tensor must be of type BFLOAT16 for Normal RoPE");
+        }
     }
 
     if (!output_tensors.empty() && output_tensors.at(0).has_value()) {

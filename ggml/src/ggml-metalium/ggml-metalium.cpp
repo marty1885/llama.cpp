@@ -1791,8 +1791,18 @@ static bool ggml_backend_metalium_can_rope(const struct ggml_tensor * dst)
         n_ctx,
         n_ctx_orig
     ] = int_params;
-    return ((n_dims % 64 == 0 && mode == GGML_ROPE_TYPE_NEOX)
-        || (n_dims % 32 == 0 && mode == GGML_ROPE_TYPE_NORMAL && dst->src[2] == NULL));
+
+    if(mode == GGML_ROPE_TYPE_NEOX) {
+        return n_dims % 64 == 0;
+    }
+    if(mode == GGML_ROPE_TYPE_NORMAL) {
+        if(dst->src[2]) {
+            return dst->src[2]->ne[0] % 32 == 0 && n_dims % 32 == 0; // XXX: This case fails
+        }
+        return n_dims % 32 == 0;
+    }
+
+    return false;
 }
 
 
@@ -1800,7 +1810,6 @@ static void ggml_backend_metalium_rope(ggml_backend_metalium_context * ctx, stru
 {
     GGML_METALIUM_OP_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
-    // GGML_METALIUM_OP_SRC1_SANITY_CHECK(dst);
     GGML_UNUSED(ctx);
 
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
@@ -2784,9 +2793,11 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
             fmt::println(stderr, "The TT_METAL_RUNTIME_ROOT environment variables must be set to use the Metalium backend");
             abort();
         }
-        if(g_debug_flags.disable_program_cache) {
-            fmt::println("Disabling persistent kernel cache. Things will be slower");
+        if(!g_debug_flags.disable_program_cache) {
             tt::tt_metal::detail::EnablePersistentKernelCache();
+        }
+        else {
+            fmt::println("Disabling persistent kernel cache. Things will be slower");
         }
         // TODO: Support multiple devices (TT supports mesh configuration so it's going to be tricky)
         // but for now we just work on 1 device at a time

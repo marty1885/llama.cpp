@@ -203,12 +203,18 @@ inline void rope_tile(int pos, float inv_d, int vec_offset)
     // failing to allocate registers
     for(int i=0;i<4;i++) {
         int ff_idx = 96+(i%2)+(i/2*8);
-        vFloat ff = _reciprocal_compat_<4>(vFloat(dst_reg[ff_idx]));
+        vFloat ff = vFloat(dst_reg[ff_idx]);
+        vFloat d0 = ff;
         vFloat d1 = ff;
         vFloat d2 = ff;
         vFloat d3 = ff;
-        sfpi::subvec_transp(ff, d1, d2, d3);
-        dst_reg[ff_idx] = ff;
+        sfpi::subvec_transp(d0, d1, d2, d3);
+        vFloat r = _reciprocal_compat_<4>(d0);
+        v_if(ff < 0) {
+            r = -r;
+        }
+        v_endif;
+        dst_reg[ff_idx] = r;
     }
     #endif
 

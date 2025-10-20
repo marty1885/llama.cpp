@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include <tools/profiler/kernel_profiler.hpp>
+#include <debug/dprint_tensix.h>
 
 #ifdef TRISC_MATH
 using namespace sfpi;
@@ -101,6 +102,46 @@ sfpi_inline vFloat rope_yarn_ramp(vFloat vec_pos) {
 }
 #endif
 
+template <int max_iter = 3>
+sfpi_inline sfpi::vFloat _reciprocal_compat_(const sfpi::vFloat in)
+{
+    // Force sign to 1 (make number negative)
+    sfpi::vFloat val = sfpi::setsgn(in, 1);
+
+    val = setexp(val, 126); // Set exponent to 126 to make the number in 0.5-1
+    // Use 1.44 as first guess at x, ideal value would be 1.33.
+    // Grayskull has hardwired 1.44 and uses it to avoid a load.
+    // We use it here for consistency.
+    sfpi::vFloat vConstLn2Recip = 1.442695f;
+    sfpi::vFloat two            = 2.0f;
+    sfpi::vFloat result         = vConstLn2Recip * (val * vConstLn2Recip + two);
+
+    for (int s_iter = 0; s_iter < (max_iter - 1); s_iter++)
+    {
+        result = result * (val * result + two);
+    }
+
+    sfpi::vInt orig_exp = exexp(in);
+    sfpi::vInt new_exp  = exexp(result);
+
+    // "Subtract" exponents, and re-bias.
+    // Execute: -1 - exp, then exp += 127
+    new_exp -= orig_exp;
+    new_exp += 126;
+
+    v_if (new_exp < 0)
+    {
+        // If rebiased exponent is negative, we need to saturate at 0.
+        // This means the initial number was too big so reciprocal result should be 0
+        result  = 0.0F;
+        new_exp = 0;
+    }
+    v_endif;
+
+    // Set newly denormalized exponent to result exponent field
+    return setexp(result, new_exp);
+}
+
 inline void rope_face(int pos, int D, int vec_offset, int face)
 {
     vFloat sin_angle = dst_reg[64+face%2];
@@ -123,6 +164,27 @@ inline void rope_tile(int pos, int D, int vec_offset)
     math::set_addr_mod_base();
     TTI_STALLWAIT(p_stall::STALL_SFPU, p_stall::MATH);
 
+    #ifdef HAS_FREQ_FACTOR
+    // Seperate computation of inverse of freq_factor as otherwise SFPI fails to compile due to
+    // failing to allocate registers
+    for(int i=0;i<2;i++) {
+        int ff_idx = 96+((vec_offset/32)%2)*8+i;
+        DPRINT << "ff_idx: " << ff_idx << ENDL();
+        vFloat ff = vFloat(dst_reg[ff_idx]);
+        vFloat d0 = ff;
+        vFloat d1 = ff;
+        vFloat d2 = ff;
+        vFloat d3 = ff;
+        sfpi::subvec_transp(d0, d1, d2, d3);
+        vFloat r = _reciprocal_compat_<4>(d0);
+        v_if(ff < 0) {
+            r = -r;
+        }
+        v_endif;
+        dst_reg[ff_idx] = r;
+    }
+    #endif
+
     for(int i=0;i<2;i++) {
         int internal_offset = i * 16;
         int pos_in_vector = vec_offset + internal_offset;
@@ -131,6 +193,10 @@ inline void rope_tile(int pos, int D, int vec_offset)
 
         vFloat term_to_exp = -exponent * vConstFloatPrgm0 - vConstFloatPrgm1;
         vFloat freq = vector_exp(term_to_exp);
+        #ifdef HAS_FREQ_FACTOR
+            int ff_idx = 96+((vec_offset/32)%2)*8+i;
+            freq = freq * vFloat(dst_reg[ff_idx]);
+        #endif
 
         vFloat freq_scaled = freq;
         vFloat mscale = 1.f;
@@ -188,6 +254,7 @@ void MAIN {
 
     constexpr uint32_t cb_in0 = tt::CBIndex::c_0;
     constexpr uint32_t cb_in1 = tt::CBIndex::c_1;
+    constexpr uint32_t cb_in2 = tt::CBIndex::c_2;
     constexpr uint32_t cb_out0 = tt::CBIndex::c_16;
 
     init_sfpu(tt::CBIndex::c_0, tt::CBIndex::c_16);
@@ -199,17 +266,42 @@ void MAIN {
     cb_get_tile(cb_in1, 0, &idxs_ptr);
     idxs_ptr += 4; // Need to shift because read ptr is off by 1 << 4 bytes in BBE
 
+    #ifdef HAS_FREQ_FACTOR
+    uint32_t last_ff_idx = -1;
+    #endif
 
-    copy_tile_init(cb_in0);
+
     pack_reconfig_data_format(cb_out0);
     for(uint32_t active_id=active_begin; active_id<active_end; active_id++) {
         uint32_t b = active_id / n_tiles_width_active / n_tiles_height;
         uint32_t w = active_id % n_tiles_width_active;
         cb_wait_front(cb_in0, 1);
+        #ifdef HAS_FREQ_FACTOR
+        DPRINT << "w: " << w << " n_tiles_width_active: " << n_tiles_width_active << ENDL();
+        uint32_t ff_idx = w/2;
+        bool process_ff = last_ff_idx != ff_idx;
+        if(last_ff_idx != ff_idx) {
+            if(last_ff_idx != uint32_t(-1)) {
+                cb_pop_front(cb_in2, 1);
+            }
+            cb_wait_front(cb_in2, 1);
+        }
+        last_ff_idx = ff_idx;
+        #endif
         tile_regs_acquire();
 
+        #ifdef HAS_FREQ_FACTOR
+        copy_tile_init(cb_in2);
+        copy_tile(cb_in2, 0, 3);
+        dprint_tensix_dest_reg(3);
+        #endif
+
+        copy_tile_init(cb_in0);
         copy_tile(cb_in0, 0, 0);
         MATH(rope_tile(idxs_ptr[b], inv_d, w*32));
+        #ifdef HAS_FREQ_FACTOR
+        dprint_tensix_dest_reg(3);
+        #endif
         tile_regs_commit();
         tile_regs_wait();
 
@@ -221,6 +313,11 @@ void MAIN {
     }
 
     cb_pop_front(cb_in1, 1);
+    #ifdef HAS_FREQ_FACTOR
+    if(last_ff_idx != uint32_t(-1)) {
+        cb_pop_front(cb_in2, 1);
+    }
+    #endif
 
 }
 }

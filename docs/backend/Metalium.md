@@ -175,4 +175,11 @@ There are several debug flags available to assist with debugging/performance of 
 
 The following is a very brief and evolving deisgn doc as things develop. Generally:
 
-All tensors
+Most tensors are tiled in the backend. Unless they are indices, KV cache (yet to implement) or embed weights (yet to implement). Which are row major to enable efficient scatter/gather within a single chip.
+
+Though llama.cpp encourages a c-with-classes coding style. TTNN by it's nature is written in very modern C++. The backend also reflects this:
+
+1. GGML interfacing code is written in a c-with-classes style
+2. Infrastructure interacting with TTNN, new operators, Metalium utilties are written in modern C++ (up to C++20 which is what TTNN/Metalium uses)
+
+Due to hardware design, most operations are pratically limited to an accuracy BFP16. Which seems to be enough for most models. And so for now FP32 support is emulated with using BFP16 underneath.

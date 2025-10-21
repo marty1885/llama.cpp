@@ -78,6 +78,9 @@ make -j16
 bin/llama-cli -ngl 23 -m tinyllama-1.1b-chat-v1.0.Q4_0.gguf -p "The solution to Riemann hypothesis is" -nkvo
 ```
 
+> [!IMPORTANT]
+> TTNN compiles and sometimes JITs kernel on the fly. Leading to longer initialization time and first token generation time when the kernel cache is cold.
+
 ## Hardware
 
 ### Hardware support

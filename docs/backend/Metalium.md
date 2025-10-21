@@ -155,8 +155,11 @@ Besides the standard FP32 and BFP16 floating point support. Tenstorrent processo
 | GGML_METALIUM_MESH_SHAPE  | string                               | Shape of the device mesh for clustering (ex: 2x4 for 2x4 mesh)                                             |
 | GGML_METALIUM_KERNEL_ROOT | string                               | Root of the Metalium kernel library in case running from weird places and you don't have embedded kernels  |
 
-NOTE: `GGML_METALIUM_DEVICE_ID` and `GGML_METALIUM_MESH_SHAPE` cannot be set at the same time.
-NOTE: Clustering is in early stage development. The option exists for development purpose.
+> [!NOTE]
+> `GGML_METALIUM_DEVICE_ID` and `GGML_METALIUM_MESH_SHAPE` cannot be set at the same time.
+
+> [!NOTE]
+> Clustering is in early stage development. The option exists for development purpose.
 
 ### Debug flags
 

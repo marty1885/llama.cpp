@@ -20,13 +20,16 @@ Tenstorrent produces a range of ASICs with very scalable design that enables eff
 
 This backend tries to call operators in TTNN when possible. If an operator is not supported by TTNN, custom kernels in Metalium are implemented to keep operations and data on-device.
 
+> [!NOTE]
+> In Tenstorrent's documentation and codebase, Metalium (officially TT-Metalium) is sometimes abbreviated as Metal. This should not be confused with Apple's Metal API, as they are entirely distinct technologies developed by different companies, designed for different hardware, and built on completely different architectures. To avoid confusion, this backend consistently uses the name Metalium. If you encounter any instance where "Metal" is mentioned in the context of this backend, it should be understood as referring to Metalium.
+
 ### llama.cpp + Metalium
 
-The llama.cpp Metalium backend is designed to support inference on Tenstorrent's Wormhole or later processors. It is experimental software in it's early days. The earlier Grayskull generation processors have their support removed from current versions of TTNN, thus also unsupported by this backend.
+The llama.cpp Metalium backend is designed to enable inference on Tenstorrent's Wormhole processors and newer. As experimental software in its early stages, it uses TTNN for both tensor management and its operator library. When TTNN does not support a specific operation, the backend implements custom kernels that run directly on Metalium to maintain on-device computation.
 
 ### Note on current limitations
 
-As mentioned earlier, the Metalium backend is experimental software. Thus features will be developed and enabled over time. As of writing the documentation, the following limitations applies:
+As mentioned, the Metalium backend is experimental software. Thus features will be developed and enabled over time. As of writing the documentation, the following limitations applies:
 
 * Only one device is exposed at a time
     * Multi device scaling is handled using TTNN's native scaling

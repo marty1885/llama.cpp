@@ -1,4 +1,4 @@
-// This file is like test-backend-ops.cpp but we expect _everything_ to be supported by the Metalium backend.
+ // This file is like test-backend-ops.cpp but we expect _everything_ to be supported by the Metalium backend.
 // Also tests for edge cases in Metalium. (ex: Metalium/TTNN nativly uses 32x32 matrices as it's smallest unit)
 
 // some code stolen from test-backend-ops.cpp
@@ -727,10 +727,9 @@ int main(int argc, char ** argv)
     ///////////////// put experiment code here /////////////////
     // easier on the eye to find it (also one line to disable UT)
     tests.push_back(make_test([](ggml_context* ctx) {
-        ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 32, 1);
-        ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-        ggml_tensor* ff = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32);
-        return ggml_rope_ext(ctx, a, b, ff, 64, GGML_ROPE_TYPE_NORMAL, 512, 10000, 1, 0, 1, 1, 1);
+        ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 32, 1);
+        ggml_tensor* b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 32, 1);
+        return ggml_mul_mat(ctx, a, b);
     }, "RoPE Normal " + std::string(ggml_type_name(GGML_TYPE_F32))));
     ///////////////// end of experiment code /////////////////
 

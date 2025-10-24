@@ -11,11 +11,36 @@
 #include "ttnn/types.hpp"
 #include "utils.hpp"
 
+// NOTE: This is a terribly inefficient implementation of MUL_MAT on TT hardware. Just a simple SPMD parallelization
+// NOTE: GGML's MUL_MAT is *not* a standard MatMul/GEMM.
+//       Conceptually, it performs the following operation:
+//           mul_mat(a, bT) = transpose(matmul(a, bT)) = matmul(b, aT)
+//       Here "bT" means B is pre-transposed. GGML stores B this way internally,
+//       so the actual call looks like mul_mat(a, b), but it behaves as if
+//       you had passed in bT.
+//
+// NOTE: Conventions -- standard matrix multiplication is defined as:
+//           A: (M, K),  B: (K, N)  ->  C: (M, N)
+//       where K is the shared dimension.
+//       In our case, we redefine it as:
+//           A: (M, K),  B: (N, K)  ->  C: (N, M)
+//       This effectively swaps the output axes compared to standard MM,
+//       though K remains the shared dimension.
+//
+// NOTE: To support full GGML 4D tensors, we generalize to:
+//           A: (B, C, M, K)
+//           B: (B*x, C*y, N, K), where x, y are positive integers
+//           ->  C: (B*x, C*y, N, M)
+//
+// TODO: Implement kernels that reuses data via storing on SRAM
+// TODO: Implement kernels that reduce NoC traffic by multicasting
+
 using namespace tt::tt_metal;
 
 struct MulMatDeviceOperation {
     const tt::tt_metal::MemoryConfig output_mem_config;
     const tt::tt_metal::DataType output_dtype{};
+    const bool high_percision = false;
 
     void validate_with_output_tensors(
         const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
@@ -28,11 +53,12 @@ struct MulMatDeviceOperation {
         const std::vector<Tensor>& input_tensors, std::vector<Tensor>& output_tensors) const;
 };
 
-ttnn::Tensor ttggml::MulMatOperation::invoke(const Tensor& a, const Tensor& b) {
+ttnn::Tensor ttggml::MulMatOperation::invoke(const Tensor& a, const Tensor& b, bool high_percision) {
     return tt::tt_metal::operation::run(
         MulMatDeviceOperation{
             b.memory_config(),
             b.dtype(),
+            high_percision,
         },
         {a, b},
         {},
@@ -51,8 +77,8 @@ std::vector<ttnn::TensorSpec> MulMatDeviceOperation::compute_output_specs(
     ttnn::Shape output_shape({
         std::max(a.logical_shape()[0], b.logical_shape()[0]),
         std::max(a.logical_shape()[1], b.logical_shape()[1]),
-        a.logical_shape()[2],
         b.logical_shape()[2],
+        a.logical_shape()[2],
     });
     return {TensorSpec(
         output_shape,
@@ -75,7 +101,6 @@ std::vector<ttnn::Tensor> MulMatDeviceOperation::create_output_tensors(
 
 void MulMatDeviceOperation::validate_with_output_tensors(
     const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const {
-    std::cout << input_tensors.size() << ", " << output_tensors.size() << std::endl;
     const auto& a = input_tensors.at(0);
     const auto& b = input_tensors.at(1);
     const auto& a_shape = a.logical_shape();
@@ -116,9 +141,12 @@ tt::tt_metal::operation::ProgramWithCallbacks MulMatDeviceOperation::create_prog
     const auto& o_tensor = output_tensors.at(0);
 
     const uint32_t K = a_tensor.logical_shape()[-1];
-    const uint32_t N = b_tensor.logical_shape()[-2];
-    const uint32_t M = o_tensor.logical_shape()[-2];
-
+    const uint32_t N = b_tensor.logical_shape()[2];
+    const uint32_t M = a_tensor.logical_shape()[2];
+    const uint32_t C = b_tensor.logical_shape()[1];
+    const uint32_t B = b_tensor.logical_shape()[0];
+    const uint32_t x = a_tensor.logical_shape()[0] / B;
+    const uint32_t y = b_tensor.logical_shape()[1] / C;
 
     tt::tt_metal::IDevice* device = a_tensor.device();
 
@@ -164,7 +192,7 @@ tt::tt_metal::operation::ProgramWithCallbacks MulMatDeviceOperation::create_prog
     });
 
     KernelHandle compute = CreateMetaliumKernel(program, "mul_mat_compute", all_cores, ComputeConfig{
-        .fp32_dest_acc_en = true,
+        .fp32_dest_acc_en = high_percision,
     });
 
     uint32_t id = 0;
@@ -173,9 +201,9 @@ tt::tt_metal::operation::ProgramWithCallbacks MulMatDeviceOperation::create_prog
         for(const auto& range : group.ranges()) {
             for(const auto& core : range) {
 
-                SetRuntimeArgs(program, reader, core, std::vector<uint32_t>{a->address(), b->address(), Mt, Nt, Kt, id, work_per_item});
-                SetRuntimeArgs(program, compute, core, std::vector<uint32_t>{Mt, Nt, Kt, id, work_per_item});
-                SetRuntimeArgs(program, writer, core, std::vector<uint32_t>{o->address(), Mt, Nt, Kt, id, work_per_item});
+                SetRuntimeArgs(program, reader, core, std::vector<uint32_t>{a->address(), b->address(), Mt, Nt, Kt, B, C, x, y, id, work_per_item});
+                SetRuntimeArgs(program, compute, core, std::vector<uint32_t>{Mt, Nt, Kt, B, C, x, y, id, work_per_item});
+                SetRuntimeArgs(program, writer, core, std::vector<uint32_t>{o->address(), Mt, Nt, Kt, B, C, x, y, id, work_per_item});
 
                 id += work_per_item;
             }

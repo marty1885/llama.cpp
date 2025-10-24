@@ -816,6 +816,10 @@ inline static void ggml_metalium_op_src_sanity_check(const struct ggml_tensor * 
 #define GGML_METALIUM_OP_SRC0_SANITY_CHECK(_node) GGML_METALIUM_OP_SRC_SANITY_CHECK(_node, 0)
 #define GGML_METALIUM_OP_SRC1_SANITY_CHECK(_node) GGML_METALIUM_OP_SRC_SANITY_CHECK(_node, 1)
 
+
+// Experimental flag to enable or disable custom mul_mat
+// #define USE_CUSTOM_MUL_MAT
+
 static bool ggml_backend_metalium_can_mul_mat(const struct ggml_tensor * dst)
 {
     const struct ggml_tensor * src0 = dst->src[0];
@@ -826,8 +830,13 @@ static bool ggml_backend_metalium_can_mul_mat(const struct ggml_tensor * dst)
     // For now we simply only allow those shapes. We transpose the shapes ourselves
     // TODO: Detect when shape[1] can be removed and do that automagically
 
+#ifdef USE_CUSTOM_MUL_MAT
+    return src0->ne[0] == src1->ne[0] && src1->ne[2] % src0->ne[2] == 0 && src1->ne[3] % src0->ne[3] == 0
+        && src1->ne[2] != 0 && src1->ne[3] != 0;
+#else
     return src0->ne[0] == src1->ne[0] && src0->ne[2] == 1 && src1->ne[2] == 1 &&
         (src0->ne[3] == src1->ne[3] || src0->ne[3] == 1);
+#endif
 }
 
 static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
@@ -835,12 +844,15 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC1_SANITY_CHECK(dst);
 
-#if 0
+#ifdef USE_CUSTOM_MUL_MAT
     // WIP implementation of MUL_MAT using direct kernels
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
     TensorWithMetadata* src0_meta = (TensorWithMetadata*)dst->src[0]->extra;
 
-    auto res = ttggml::mul_mat(*realize_ggml_view(dst->src[0]), *realize_ggml_view(dst->src[1]));
+    uint32_t prec = dst->op_params[0];
+    bool high_percision = prec == GGML_PREC_F32;
+
+    auto res = ttggml::mul_mat(*realize_ggml_view(dst->src[0]), *realize_ggml_view(dst->src[1]), high_percision);
 
     *dst_meta = TensorWithMetadata{
         .tensor = std::make_shared<tt::tt_metal::Tensor>(res),
@@ -1796,8 +1808,10 @@ static bool ggml_backend_metalium_can_rope(const struct ggml_tensor * dst)
         return n_dims % 64 == 0;
     }
     if(mode == GGML_ROPE_TYPE_NORMAL) {
+        ggml_tensor* ff = dst->src[2];
         if(dst->src[2]) {
-            return dst->src[2]->ne[0] % 32 == 0 && n_dims % 32 == 0; // XXX: This case fails
+            return !ggml_is_quantized(ff->type)  // we do sub-tile hacking
+            && ff->ne[0] % 32 == 0 && n_dims % 32 == 0; // XXX: This case fails
         }
         return n_dims % 32 == 0;
     }
@@ -2470,7 +2484,7 @@ static bool ggml_backend_metalium_device_supports_op(ggml_backend_dev_t device, 
         fprintf(stderr, "REJECT op %s (%s)\n", ggml_op_name(op->op), op->name);
         for(int i = 0; i < GGML_MAX_SRC; i++) {
             if(op->src[i]) {
-                fprintf(stderr, "  src%d shape [%ld %ld %ld %ld], dtype = %s\n", i, op->src[i]->ne[0], op->src[i]->ne[1], op->src[i]->ne[2], op->src[i]->ne[3], ggml_type_name(op->src[i]->type));
+                fprintf(stderr, "  src%d shape [%ld %ld %ld %ld], dtype = %s, name = '%s'\n", i, op->src[i]->ne[0], op->src[i]->ne[1], op->src[i]->ne[2], op->src[i]->ne[3], ggml_type_name(op->src[i]->type), op->src[i]->name);
             }
             else {
                 break;

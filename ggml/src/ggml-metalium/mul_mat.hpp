@@ -6,7 +6,7 @@ namespace ttggml {
 using namespace ttnn;
 
 struct MulMatOperation {
-    static ttnn::Tensor invoke(const Tensor& a, const Tensor& b);
+    static ttnn::Tensor invoke(const Tensor& a, const Tensor& b, bool high_percision = false);
 };
 
 /**

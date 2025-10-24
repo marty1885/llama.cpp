@@ -764,7 +764,7 @@ int main(int argc, char ** argv)
     // easier on the eye to find it (also one line to disable UT)
     tests.push_back(make_test([](ggml_context* ctx) {
         ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 32, 1);
-        ggml_tensor* b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 64, 1);
+        ggml_tensor* b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 64, 2);
         return ggml_mul_mat(ctx, a, b);
     }, "test MM", 1e-5));
     ///////////////// end of experiment code /////////////////

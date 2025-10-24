@@ -112,8 +112,8 @@ void MulMatDeviceOperation::validate_with_output_tensors(
     TT_FATAL(b.layout() == ttnn::TILE_LAYOUT, "Expected layout TILE_LAYOUT for tensor b");
 
     TT_FATAL(a_shape4d[3] == b_shape4d[3] &&
-        a_shape4d[1] % b_shape4d[1] == 0 && a_shape4d[1] > 0 &&
-        a_shape4d[0] % b_shape4d[0] == 0 && a_shape4d[0] > 0 &&
+        b_shape4d[1] % a_shape4d[1] == 0 && b_shape4d[1] > 0 &&
+        b_shape4d[0] % a_shape4d[0] == 0 && b_shape4d[0] > 0 &&
         a_shape4d[2] > 0 && b_shape4d[2] > 0,
         "Expcted format a: [B, N, M, K], b: [B*x, C*x, N, K] but get a: {}, b: {}",
         a_shape, b_shape);
@@ -143,10 +143,12 @@ tt::tt_metal::operation::ProgramWithCallbacks MulMatDeviceOperation::create_prog
     const uint32_t K = a_tensor.logical_shape()[-1];
     const uint32_t N = b_tensor.logical_shape()[2];
     const uint32_t M = a_tensor.logical_shape()[2];
-    const uint32_t C = b_tensor.logical_shape()[1];
-    const uint32_t B = b_tensor.logical_shape()[0];
-    const uint32_t x = a_tensor.logical_shape()[0] / B;
+    const uint32_t C = a_tensor.logical_shape()[1];
+    const uint32_t B = a_tensor.logical_shape()[0];
+    const uint32_t x = b_tensor.logical_shape()[1] / B;
     const uint32_t y = b_tensor.logical_shape()[1] / C;
+
+    TT_FATAL(x != 0 && y != 0, "Internal error: batch multipler cannot be 0");
 
     tt::tt_metal::IDevice* device = a_tensor.device();
 
@@ -167,7 +169,7 @@ tt::tt_metal::operation::ProgramWithCallbacks MulMatDeviceOperation::create_prog
         core_group_2,
         work_per_core1,
         work_per_core2] =
-        tt::tt_metal::split_work_to_cores(core_grid, Mt*Nt);
+        tt::tt_metal::split_work_to_cores(core_grid, Mt*Nt*C*B);
 
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_0, 4, a_tensor.dtype()); // cb_in0
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_1, 4, b_tensor.dtype()); // cb_in1

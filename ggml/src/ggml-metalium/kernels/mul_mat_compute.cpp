@@ -13,6 +13,8 @@ void MAIN {
     uint32_t C = get_arg_val<uint32_t>(4);
     uint32_t x = get_arg_val<uint32_t>(5);
     uint32_t y = get_arg_val<uint32_t>(6);
+    uint32_t id = get_arg_val<uint32_t>(7);
+    uint32_t size = get_arg_val<uint32_t>(8);
 
     constexpr uint32_t cb_in0 = tt::CBIndex::c_0;
     constexpr uint32_t cb_in1 = tt::CBIndex::c_1;

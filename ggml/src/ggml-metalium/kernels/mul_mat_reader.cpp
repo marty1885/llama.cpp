@@ -11,6 +11,8 @@ void kernel_main() {
     uint32_t C = get_arg_val<uint32_t>(6);
     uint32_t x = get_arg_val<uint32_t>(7);
     uint32_t y = get_arg_val<uint32_t>(8);
+    uint32_t id = get_arg_val<uint32_t>(9);
+    uint32_t size = get_arg_val<uint32_t>(10);
 
 
     constexpr uint32_t cb_in0 = tt::CBIndex::c_0;
@@ -23,6 +25,7 @@ void kernel_main() {
     const uint32_t in1_tile_size_bytes = get_tile_size(cb_in1);
     constexpr auto b_args = TensorAccessorArgs<a_args.next_compile_time_args_offset()>();
     const auto b = TensorAccessor(b_args, b_addr, in1_tile_size_bytes);
+
     for(uint32_t _b = 0; _b < B*x; _b++) {
         uint32_t ab = _b / x;
         uint32_t bb = _b;

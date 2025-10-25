@@ -34,6 +34,7 @@
 //
 // TODO: Implement kernels that reuses data via storing on SRAM
 // TODO: Implement kernels that reduce NoC traffic by multicasting
+// TOOD: Add support for masking otherwise currenlt kernel expects 0 padding
 
 using namespace tt::tt_metal;
 
@@ -145,9 +146,8 @@ tt::tt_metal::operation::ProgramWithCallbacks MulMatDeviceOperation::create_prog
     const uint32_t M = a_tensor.logical_shape()[2];
     const uint32_t C = a_tensor.logical_shape()[1];
     const uint32_t B = a_tensor.logical_shape()[0];
-    const uint32_t x = b_tensor.logical_shape()[1] / B;
+    const uint32_t x = b_tensor.logical_shape()[0] / B;
     const uint32_t y = b_tensor.logical_shape()[1] / C;
-
     TT_FATAL(x != 0 && y != 0, "Internal error: batch multipler cannot be 0");
 
     tt::tt_metal::IDevice* device = a_tensor.device();

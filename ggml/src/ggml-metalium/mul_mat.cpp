@@ -160,8 +160,7 @@ tt::tt_metal::operation::ProgramWithCallbacks MulMatDeviceOperation::create_prog
     const uint32_t Nt = N/32 + (N % 32 != 0);
     const uint32_t Mt = M/32 + (M % 32 != 0);
 
-    // auto core_grid = device->compute_with_storage_grid_size();
-    CoreCoord core_grid(1, 1);
+    auto core_grid = device->compute_with_storage_grid_size();
 
     auto [num_cores,
         all_cores,
@@ -169,7 +168,7 @@ tt::tt_metal::operation::ProgramWithCallbacks MulMatDeviceOperation::create_prog
         core_group_2,
         work_per_core1,
         work_per_core2] =
-        tt::tt_metal::split_work_to_cores(core_grid, Mt*Nt*C*B);
+        tt::tt_metal::split_work_to_cores(core_grid, Mt*Nt*C*y*B*x);
 
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_0, 4, a_tensor.dtype()); // cb_in0
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_1, 4, b_tensor.dtype()); // cb_in1

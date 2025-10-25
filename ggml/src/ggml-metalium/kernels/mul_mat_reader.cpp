@@ -26,35 +26,35 @@ void kernel_main() {
     constexpr auto b_args = TensorAccessorArgs<a_args.next_compile_time_args_offset()>();
     const auto b = TensorAccessor(b_args, b_addr, in1_tile_size_bytes);
 
-    for(uint32_t _b = 0; _b < B*x; _b++) {
+    for(uint32_t work_id = id; work_id < id + size; ++work_id) {
+        uint32_t n = work_id % Nt;
+        uint32_t remain = work_id / Nt;
+        uint32_t m = remain % Mt;
+        remain = remain / Mt;
+        uint32_t c = remain % (C*y);
+        remain = remain / (C*y);
+        uint32_t _b = remain % (B*x);
+
         uint32_t ab = _b / x;
         uint32_t bb = _b;
-        for(uint32_t c = 0; c < C*y; c++) {
-            uint32_t ac = c / y;
-            uint32_t bc = c;
-            uint32_t a_offset_plane = ab * C + ac;
-            uint32_t b_offset_plane = bb * C*y + bc;
+        uint32_t ac = c / y;
+        uint32_t bc = c;
+        uint32_t a_offset_plane = ab * C + ac;
+        uint32_t b_offset_plane = bb * C*y + bc;
 
+        for(uint32_t k = 0; k < Kt; ++k) {
+            uint32_t a_idx = m * Kt + k + a_offset_plane * Kt * Mt;
+            uint32_t b_idx = n * Kt + k + b_offset_plane * Kt * Nt;
 
-            for(uint32_t m = 0; m < Mt; ++m) {
-                for(uint32_t n = 0; n < Nt; ++n) {
-                    for(uint32_t k = 0; k < Kt; ++k) {
-                        uint32_t a_idx = m * Kt + k + a_offset_plane * Kt * Mt;
-                        uint32_t b_idx = n * Kt + k + b_offset_plane * Kt * Nt;
-
-                        cb_reserve_back(cb_in0, 1);
-                        cb_reserve_back(cb_in1, 1);
-                        uint32_t cb_in0_addr = get_write_ptr(cb_in0);
-                        uint32_t cb_in1_addr = get_write_ptr(cb_in1);
-                        noc_async_read_tile(a_idx, a, cb_in0_addr);
-                        noc_async_read_tile(b_idx, b, cb_in1_addr);
-                        noc_async_read_barrier();
-                        cb_push_back(cb_in0, 1);
-                        cb_push_back(cb_in1, 1);
-                    }
-                }
-            }
-
+            cb_reserve_back(cb_in0, 1);
+            cb_reserve_back(cb_in1, 1);
+            uint32_t cb_in0_addr = get_write_ptr(cb_in0);
+            uint32_t cb_in1_addr = get_write_ptr(cb_in1);
+            noc_async_read_tile(a_idx, a, cb_in0_addr);
+            noc_async_read_tile(b_idx, b, cb_in1_addr);
+            noc_async_read_barrier();
+            cb_push_back(cb_in0, 1);
+            cb_push_back(cb_in1, 1);
         }
     }
 }

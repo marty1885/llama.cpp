@@ -194,3 +194,14 @@ Though llama.cpp encourages a c-with-classes coding style. TTNN by it's nature i
 Due to hardware design, most operations are pratically limited to an accuracy BFP16. Which seems to be enough for most models. And so for now FP32 support is emulated with using BFP16 underneath.
 
 ### Note on `GGML_METALIUM_CACHE_MM_TRANSPOSE`
+
+`GGML_MUL_MAT` is a weird operation, `mul_mat(a, b)` is in fact evaulating `tranpose(matmul(a, b)) = matmul(tranpose(b), tranpose(a))` since `b` is pre-tranposed on GGML. It effectivly evaulates `matmul(bT, tranpose(a))`
+
+There's is 2 code paths that executed the `GGML_MUL_MAT` operation on device.
+
+* By using TTNN `ttnn.matmul(b, ttnn.transpose(a))`
+* By using a custom MUL_MAT written in Metalium kernels
+
+The current custom MUL_MAT kernel is very barebones. But still faster then actually performing a transpose then matmul using TNN. However, if you are willing to sacrifice a lot of DRAM space - since `a` is the weight matrix, the backend can tranpose the weight matrix once and cache the result. This can be done by using the `GGML_METALIUM_CACHE_MM_TRANSPOSE` flag. It transposes the weight matrix once and caches the result for future use.
+
+The eventual goal is to get rid of this flag since there's no reason custom kernels can't reach near the same performance (it's just pre-transpose, but we add a transpose stem to the matrix engine). But until then, it is recommended to use it for better performance.

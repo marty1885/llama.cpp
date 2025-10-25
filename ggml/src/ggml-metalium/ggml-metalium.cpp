@@ -845,6 +845,7 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
 
 #ifdef USE_CUSTOM_MUL_MAT
     // WIP implementation of MUL_MAT using direct kernels
+    GGML_UNUSED(ctx);
     TensorWithMetadata* dst_meta = (TensorWithMetadata*)dst->extra;
     TensorWithMetadata* src0_meta = (TensorWithMetadata*)dst->src[0]->extra;
 

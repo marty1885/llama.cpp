@@ -192,3 +192,5 @@ Though llama.cpp encourages a c-with-classes coding style. TTNN by it's nature i
 2. Infrastructure interacting with TTNN, new operators, Metalium utilties are written in modern C++ (up to C++20 which is what TTNN/Metalium uses)
 
 Due to hardware design, most operations are pratically limited to an accuracy BFP16. Which seems to be enough for most models. And so for now FP32 support is emulated with using BFP16 underneath.
+
+### Note on `GGML_METALIUM_CACHE_MM_TRANSPOSE`

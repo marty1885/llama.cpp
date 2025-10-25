@@ -818,7 +818,7 @@ inline static void ggml_metalium_op_src_sanity_check(const struct ggml_tensor * 
 
 
 // Experimental flag to enable or disable custom mul_mat
-#define USE_CUSTOM_MUL_MAT
+// #define USE_CUSTOM_MUL_MAT
 
 static bool ggml_backend_metalium_can_mul_mat(const struct ggml_tensor * dst)
 {

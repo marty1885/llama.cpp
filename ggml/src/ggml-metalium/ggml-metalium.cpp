@@ -487,23 +487,11 @@ static void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, ggml_type
     // Tilize to ROW_MAJOR doesn't mean the tensor is contiguous. It still has the underlying 32x32 tiles
     // we need to view into the tensor to get the contiguous data
     std::array<size_t, 4> stride = {1, 1, 1, 1};
-    if(padded_shape.size() == 4) {
-        stride = {padded_shape[1] * padded_shape[2] * padded_shape[3],
-                    padded_shape[2] * padded_shape[3],
-                    padded_shape[3],
-                    1};
-    }
-    else if(padded_shape.size() == 3) {
-        stride = {padded_shape[1] * padded_shape[2], padded_shape[2], 1, 1};
-    }
-    else if(padded_shape.size() == 2) {
-        stride = {padded_shape[1], 1, 1, 1};
-    }
-    else if(padded_shape.size() == 1) {
-        stride = {1, 1, 1, 1};
-    }
-    else {
-        GGML_ASSERT(false && "Unsupported tensor shape");
+
+    size_t cumulative_stride = 1;
+    for(int i = padded_shape.size() - 1; i >= 0; i--) {
+        stride[i] = cumulative_stride;
+        cumulative_stride *= padded_shape[i];
     }
 
     std::array<size_t, 4> nshape {1, 1, 1, 1};
@@ -2077,16 +2065,17 @@ ggml_backend_metalium_buffer_init_tensor(ggml_backend_buffer_t buffer,
 {
     ggml_backend_metalium_buffer_context * bufctx = (ggml_backend_metalium_buffer_context *)buffer->context;
 
-    bufctx->metadata_to_free.push_back(std::make_unique<ggml_tensor_extra_metalium>());
+    bufctx->metadata_to_free.push_back(std::make_unique<ggml_tensor_extra_metalium>(ggml_tensor_extra_metalium{
+        .tensor = nullptr,
+    }));
     ggml_tensor_extra_metalium* meta = bufctx->metadata_to_free.back().get();
     tensor->extra = meta;
-    *meta = {
-        .tensor = nullptr,
-    };
 
-    // HACK: Make KV cache work
+    // HACK: Make KV cache work. They don't get set before first use
+    // TODO: Most likely we'd want to refer this allocation to first time use of the tensor to support proper KV cache setup
+    //       as the "real" shape information (GGML allocates KV cache as a very long 1D tensor) is missing here
     std::string_view name(tensor->name);
-    if(strstr(std::string(name).c_str(), "cache") != NULL && tensor->op == GGML_OP_NONE) {
+    if(std::string_view(name).find("cache") != std::string::npos && tensor->op == GGML_OP_NONE) {
         std::vector<uint32_t> shape(tensor->ne, tensor->ne + GGML_MAX_DIMS);
         std::reverse(shape.begin(), shape.end());
         auto t = ttnn::zeros(ttnn::Shape(shape), ggml2tt_type(tensor->type, bufctx->device->arch()), tt::tt_metal::Layout::ROW_MAJOR);
@@ -2413,14 +2402,6 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
     auto tensor_supported = [&](const struct ggml_tensor * tensor) {
         if(tensor == NULL || !is_ggml_type_supported_by_metalium(tensor->type, ctx->device->arch())) {
             return false;
-        }
-        // TTNN requires the tensor to be 4-byte aligned and all quantized tensors must be a multiple of 32
-
-        // HACK: later GGML contains an absurd code that views into [1, embed, 1, 1] then tranpose to [embed, 1, ,1 ,1]
-        //       which is a waste of time on TTNN. We mush allow the view op to pass then perform the correct view
-        //       ignoring the transpose.
-        if(tensor->op == GGML_OP_VIEW) {
-            return true;
         }
 
         tt::tt_metal::DataType tt_type = ggml2tt_type(tensor->type, ctx->device->arch());

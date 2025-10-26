@@ -422,38 +422,50 @@ static tt::tt_metal::HostBuffer ggml_quantized2owned_storage(const void* src, co
     return data2borroweded_storage<float, DstType>(vec.get(), size);
 }
 
+// Copies the content of the TT tensor into memory pointed by `dst` with data of type `dst_ggtype`
+// This function will do it's best to convert whatever it is in the TT tensor into types accaptable
+// by GGML
+// This function works by deciding if the tensor is already in the desired format, and if not
+// convert to FP32 then convert into the desired format
 template <typename SrcType>
 static void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, ggml_type dst_ggtype) {
-    // Converts TT tensors to GGML types
     ttnn::Shape shape = tensor.logical_shape();
     ttnn::Shape padded_shape = tensor.padded_shape();
+
+    // we only supporting reading from these types that is held in TT tensor
     static_assert(std::is_same_v<SrcType, float> || std::is_same_v<SrcType, bfloat16> || std::is_same_v<SrcType, uint32_t>);
     GGML_ASSERT(tensor.layout() == ttnn::Layout::TILE);
 
     // FIXME: untilize is cursed. Causes _MANY_ corruption errors. Replacing it with to_layout
     // Fixes the majority of accuracy and corruption errors in test-backend-ops
-    // tt::tt_metal::Tensor row_major_tensor = ttnn::untilize(tensor).cpu();
     // Ofc this is slower so we really want to enable untilize on device
+    // tt::tt_metal::Tensor row_major_tensor = ttnn::untilize(tensor).cpu();
     tt::tt_metal::Tensor row_major_tensor = tensor.cpu().to_layout(ttnn::ROW_MAJOR_LAYOUT);
     GGML_ASSERT(row_major_tensor.storage_type() == tt::tt_metal::StorageType::HOST);
 
+    // Grab the data held in the TT tensor
     const tt::tt_metal::HostStorage& storage = row_major_tensor.host_storage();
     const auto buffer = storage.buffer().get_shard({0, 0}).value();
     auto view = buffer.view_as<SrcType>();
     const SrcType* buf = &view[0];
     size_t buf_size = view.size();
-
     GGML_ASSERT(buf != nullptr);
-    void* intermid = nullptr;
-    std::vector<std::byte> intermid_buf;
-    bool need_quantized_conversion = false;
-    bool src_dst_same = false;
+
+    // Determine our conversion strategy
+    void* intermid = nullptr;                // pointer to a buffer that can hold the intermediate data (if needed)
+    bool need_quantized_conversion = false;  // flag indicating whether we need to qunatize the value extracted from TT later for GGML use
+    bool src_dst_same = false;               // If TT and GGML both have the same type - we can just memcpy
+
+    std::vector<std::byte> intermid_buf;     // In case we need it, some place to put data
+
+    // If both side is FP32
     if(dst_ggtype == GGML_TYPE_F32 && !std::is_same_v<SrcType, float>) {
         intermid = dst;
         need_quantized_conversion = false;
         src_dst_same = false;
     }
-    // Just putting the integer types here to remind me TT tensors can have integer types
+    // If both side are the same type fundimentally
+    // NOTE: Just putting the integer types here to remind me TT tensors can have integer types
     else if ((std::is_same_v<SrcType, float> && dst_ggtype == GGML_TYPE_F32) ||
              (std::is_same_v<SrcType, bfloat16> && dst_ggtype == GGML_TYPE_BF16) ||
              (std::is_same_v<SrcType, int32_t> && dst_ggtype == GGML_TYPE_I32) ||
@@ -464,6 +476,7 @@ static void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, ggml_type
         need_quantized_conversion = false;
         src_dst_same = true;
     }
+    // If both side are different - allocate the intermediate buffer and we need to convert
     else {
         intermid_buf.resize(shape.volume() * sizeof(float));
         intermid = intermid_buf.data();
@@ -484,36 +497,41 @@ static void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, ggml_type
         GGML_UNREACHABLE();
     };
 
-    // Tilize to ROW_MAJOR doesn't mean the tensor is contiguous. It still has the underlying 32x32 tiles
-    // we need to view into the tensor to get the contiguous data
+    // Tilize to ROW_MAJOR doesn't mean the tensor is contiguous. It produces tensors that has 0 padded up to the nearest
+    // 32 elements on last two (for GGML first two) dimentions.
+    // Compute the stride for each dimension
     std::array<size_t, 4> stride = {1, 1, 1, 1};
-
     size_t cumulative_stride = 1;
     for(int i = padded_shape.size() - 1; i >= 0; i--) {
         stride[i] = cumulative_stride;
         cumulative_stride *= padded_shape[i];
     }
 
+    // Convert TT shape to GGML shape
     std::array<size_t, 4> nshape {1, 1, 1, 1};
     for(size_t i = 0; i < shape.size(); i++) {
         nshape[4 - shape.size() + i] = shape[i];
     }
-    static_assert(GGML_MAX_DIMS == 4, "Looping depth is hardcoded to 4");
 
+    static_assert(GGML_MAX_DIMS == 4, "Looping depth is hardcoded to 4");
     // Sanity check: src_dst_same shuld indicate there is no need for quantized conversion
     GGML_ASSERT(((src_dst_same && !need_quantized_conversion) || !src_dst_same) && "src and dst should be the same type if src_dst_same is true");
-    // Optimization: If the source shape indicates that the tensor is contiguous in memory - memcpy it directly or (since we are converting to float) abuse the pointer
     // NOTE: The following optimizations are not full and has some slow paths taken unoptimally. But good enough for now
+
+    // Optimization: large block copy
+    // If  row major in TT is continous - memcpy it directly or (since we are converting from float) abuse the pointer
     if(nshape[3] % 32 == 0 && ((nshape[0] == 1 && nshape[1] == 1) || nshape[2] % 32 == 0)) {
         const size_t buf_size = std::accumulate(nshape.begin(), nshape.end(), 1, std::multiplies<size_t>());
+        // Both sides are same type - memcpy and call it a day
         if(src_dst_same && !need_quantized_conversion) {
             memcpy(dst, buf, sizeof(SrcType) * buf_size);
             return;
         }
+        // need conversion but TT side is already FP32 - pointer abuse
         if(std::is_same_v<SrcType, float> && need_quantized_conversion) {
-            // Pointer abuse
             intermid = const_cast<void*>(static_cast<const void*>(buf));
         }
+        // else we manually convert
         else {
             for(size_t i = 0; i < buf_size; i++) {
                 ((float*)intermid)[i] = src_adaptor(buf[i]);
@@ -528,7 +546,7 @@ static void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, ggml_type
             memcpy((SrcType*)intermid + i * src_block_size, buf + i * src_block_stride, sizeof(SrcType) * src_block_size);
         }
     }
-    // If we can do row-by-row copy
+    // row-by-row copy
     // Only avoid small copies via memcpy if not copying into FP32 - we rely on raw copies for other types as the
     // fallback loop asserts FP32
     else if(src_dst_same && !need_quantized_conversion && (shape[3] >= 4 || !std::is_same_v<SrcType, float>)) {

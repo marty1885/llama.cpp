@@ -2469,12 +2469,26 @@ static bool ggml_backend_metalium_device_supports_op(ggml_backend_dev_t device, 
     if(!ok && g_debug_flags.print_rejected_ops) {
         fprintf(stderr, "REJECT op %s (%s)\n", ggml_op_name(op->op), op->name);
         for(int i = 0; i < GGML_MAX_SRC; i++) {
-            if(op->src[i]) {
-                fprintf(stderr, "  src%d shape [%ld %ld %ld %ld], dtype = %s, name = '%s'\n", i, op->src[i]->ne[0], op->src[i]->ne[1], op->src[i]->ne[2], op->src[i]->ne[3], ggml_type_name(op->src[i]->type), op->src[i]->name);
-            }
-            else {
+            if(!op->src[i]) {
                 break;
             }
+            fprintf(stderr, "  src%d shape [%ld %ld %ld %ld], dtype = %s, name = '%s'\n", i, op->src[i]->ne[0], op->src[i]->ne[1], op->src[i]->ne[2], op->src[i]->ne[3], ggml_type_name(op->src[i]->type), op->src[i]->name);
+        }
+
+        // Follow op details
+        // if(op->op == GGML_OP_FLASH_ATTN_EXT) {
+        //     fprintf(stderr, "  FlashAttention debug details:\n");
+        //     const char* names[] = {"query", "key", "value", "mask"};
+        //     for(int i = 0; i < 4; i++) {
+        //         if(!op->src[i]) {
+        //             break;
+        //         }
+        //         ggml_tensor* t = op->src[i];
+        //         while(t->op == GGML_OP_PERMUTE) {
+        //             t = t->src[0];
+        //         }
+        //         fprintf(stderr, "    src%d follow - %s shape [%ld %ld %ld %ld], dtype = %s, name = '%s'\n", i, names[i], t->ne[0], t->ne[1], t->ne[2], t->ne[3], ggml_type_name(t->type), t->name);
+        //     }
         }
     }
     return ok;

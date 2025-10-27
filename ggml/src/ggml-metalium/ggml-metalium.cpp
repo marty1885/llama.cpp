@@ -1443,6 +1443,8 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
             x = ttnn::add(x, mask);
         }
         else {
+            // TODO: Replace this with a single operator that works on the mask
+            // Also TODO: Make a new softmax that just does everything GGML wants
             const int n_head      = src0->ne[2];
             const int n_head_log2 = 1u << (uint32_t) floorf(log2f((float) n_head));
 

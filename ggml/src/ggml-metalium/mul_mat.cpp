@@ -181,7 +181,9 @@ tt::tt_metal::operation::ProgramWithCallbacks MulMatDeviceOperation::create_prog
     KernelHandle reader = CreateMetaliumKernel(program, "mul_mat_reader", all_cores, DataMovementConfig{
         .processor = DataMovementProcessor::RISCV_0,
         .noc = NOC::RISCV_0_default,
-        .compile_args = reader_compile_time_args
+        .compile_args = reader_compile_time_args,
+        .defines = {},
+        .named_compile_args = {}
     });
 
     std::vector<uint32_t> writer_compile_time_args;
@@ -189,11 +191,17 @@ tt::tt_metal::operation::ProgramWithCallbacks MulMatDeviceOperation::create_prog
     KernelHandle writer = CreateMetaliumKernel(program, "mul_mat_writer", all_cores, DataMovementConfig{
         .processor = DataMovementProcessor::RISCV_1,
         .noc = NOC::RISCV_1_default,
-        .compile_args = writer_compile_time_args
+        .compile_args = writer_compile_time_args,
+        .defines = {},
+        .named_compile_args = {}
     });
 
     KernelHandle compute = CreateMetaliumKernel(program, "mul_mat_compute", all_cores, ComputeConfig{
         .fp32_dest_acc_en = high_percision,
+        .unpack_to_dest_mode = {},
+        .compile_args = {},
+        .defines = {},
+        .named_compile_args = {}
     });
 
     uint32_t id = 0;

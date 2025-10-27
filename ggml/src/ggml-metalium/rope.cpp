@@ -252,7 +252,8 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
         .processor = DataMovementProcessor::RISCV_0,
         .noc = NOC::RISCV_0_default,
         .compile_args = reader_compile_time_args,
-        .defines = reader_defines
+        .defines = reader_defines,
+        .named_compile_args = {}
     });
 
     std::vector<uint32_t> writer_compile_time_args;
@@ -261,12 +262,16 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
         .processor = DataMovementProcessor::RISCV_1,
         .noc = NOC::RISCV_1_default,
         .compile_args = writer_compile_time_args,
-        .defines = {}
+        .defines = {},
+        .named_compile_args = {}
     });
 
     KernelHandle compute = CreateMetaliumKernel(program, fmt::format("rope_{}_compute", variant), all_cores, ComputeConfig{
         .fp32_dest_acc_en = true,
-        .defines = defines
+        .unpack_to_dest_mode = {},
+        .compile_args = {},
+        .defines = defines,
+        .named_compile_args = {},
     });
 
     uint32_t active_id = 0;

@@ -1401,13 +1401,7 @@ static void ggml_backend_metalium_concat(ggml_backend_metalium_context * ctx, st
 
 static bool ggml_backend_metalium_can_softmax(const struct ggml_tensor * dst)
 {
-    if(dst->src[1] != nullptr) {
-        // TinyLLaMA somehow has x [1, 32, 1, 32] and mask [1, 1, 32, 32]
-        // Don't know what's this about
-        // FIXME: This masks a problem in RWKV. Need proper fix
-        const ggml_tensor *src1 = dst->src[1];
-        return numpy_broadcast_rule(src1, dst) && dst->ne[1] == src1->ne[1];
-    }
+    GGML_UNUSED(dst);
     return true;
 }
 

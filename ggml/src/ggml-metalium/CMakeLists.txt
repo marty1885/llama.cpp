@@ -75,6 +75,7 @@ if(GGML_METALIUM_EMBED_KERNELS)
     target_link_libraries(ggml-metalium PRIVATE ggml-metalium-kernels)
     target_compile_definitions(ggml-metalium PRIVATE GGML_METALIUM_EMBED_KERNELS)
     set_target_properties(ggml-metalium-kernels PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_options(ggml-metalium-kernels PRIVATE -Wno-missing-declarations)
 endif()
 
 

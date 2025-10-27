@@ -58,6 +58,7 @@
 #include <tt-metalium/persistent_kernel_cache.hpp>
 #include <ttnn/operations/data_movement/reshape_view/reshape.hpp>
 #include <ttnn/operations/reduction/generic/generic_reductions.hpp>
+#include <ttnn/cpp/ttnn/operations/data_movement/gather/tosa/gather_tosa.hpp>
 
 
 #include <memory>
@@ -1238,13 +1239,17 @@ static void ggml_backend_metalium_scale(ggml_backend_metalium_context * ctx, str
 static bool ggml_backend_metalium_can_get_rows(const struct ggml_tensor * dst)
 {
     const ggml_tensor *idxs = dst->src[1];
-    if(idxs->ne[0] != 1 || idxs->ne[1] != 1 || idxs->ne[2] != 1 || idxs->ne[3] != 1) {
-        return false;
+    // effectivly no-op
+    if(idxs->ne[0] == 1 && idxs->ne[1] == 1 && idxs->ne[2] == 1 && idxs->ne[3] == 1 && ggml_n_dims(dst->src[0]) == 1) {
+        return true;
     }
-    if(ggml_n_dims(dst->src[0]) != 1) {
-        return false;
+
+    const ggml_tensor* src = dst->src[0];
+    if(idxs->ne[2] == 1 && src->ne[3] == 1 && !is_view(idxs)) {
+        return true;
     }
-    return true;
+
+    return false;
 }
 
 static void ggml_backend_metalium_get_rows(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
@@ -1256,9 +1261,26 @@ static void ggml_backend_metalium_get_rows(ggml_backend_metalium_context * ctx, 
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
 
     auto t = realize_ggml_view(dst->src[0]);
-    *dst_meta = {
-        .tensor = t,
-    };
+    const ggml_tensor *idxs = dst->src[1];
+    if(idxs->ne[0] == 1 && idxs->ne[1] == 1 && idxs->ne[2] == 1 && idxs->ne[3] == 1 && ggml_n_dims(dst->src[0]) == 1) {
+        *dst_meta = {
+            .tensor = t,
+        };
+    }
+    else {
+        ggml_tensor_extra_metalium* idx_meta = (ggml_tensor_extra_metalium*)idxs->extra;
+        GGML_ASSERT(idx_meta != nullptr);
+        // The operation wants 3D tensor but we have 4D, op also wants index be 2d
+        auto src_shape4d = t->logical_shape().to_array_4D();
+        ttnn::Shape src_new_shape({src_shape4d[1], src_shape4d[2], src_shape4d[3]});
+        auto idx_shape4d = idx_meta->tensor->logical_shape().to_array_4D();
+        ttnn::Shape idx_new_shape({idx_shape4d[2], idx_shape4d[3]});
+        ttnn::Tensor gathered = ttnn::tosa::gather(t->reshape(src_new_shape), ttnn::tilize_with_zero_padding(idx_meta->tensor->reshape(idx_new_shape)), std::nullopt);
+        gathered = gathered.reshape(gathered.logical_shape().to_rank(4));
+        *dst_meta = {
+            .tensor = std::make_shared<ttnn::Tensor>(gathered)
+        };
+    }
 }
 
 static bool ggml_backend_metalium_can_norm(const struct ggml_tensor * dst, bool rms)
@@ -1536,7 +1558,7 @@ static void ggml_backend_metalium_group_norm(ggml_backend_metalium_context * ctx
     int n_groups;
     float eps;
     memcpy(&n_groups, dst->op_params, sizeof(n_groups));
-    memcpy(&eps, dst->op_params + sizeof(n_groups), sizeof(eps));
+    memcpy(&eps, dst->op_params + 1, sizeof(eps));
 
     // XXX: Moreh's operators needs some cleanup
     auto tensor = realize_ggml_view(dst->src[0]);

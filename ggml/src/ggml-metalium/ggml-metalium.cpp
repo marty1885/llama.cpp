@@ -14,6 +14,7 @@
 #include "ttnn/operations/eltwise/binary/binary_composite.hpp"
 #include "ttnn/operations/eltwise/unary/unary.hpp"
 #include "ttnn/operations/moreh/moreh_group_norm/moreh_group_norm.hpp"
+#include "ttnn/tensor/layout/layout.hpp"
 #include "ttnn/tensor/shape/shape.hpp"
 #include "ttnn/tensor/storage.hpp"
 #include "ttnn/tensor/tensor.hpp"
@@ -1400,12 +1401,6 @@ static void ggml_backend_metalium_concat(ggml_backend_metalium_context * ctx, st
 
 static bool ggml_backend_metalium_can_softmax(const struct ggml_tensor * dst)
 {
-    float arr[2];
-    memcpy(arr, dst->op_params, sizeof(arr));
-    auto [scale, max_bias] = arr;
-    if(dst->src[1] != nullptr && max_bias != 0.f) {
-        return false;
-    }
     if(dst->src[1] != nullptr) {
         // TinyLLaMA somehow has x [1, 32, 1, 32] and mask [1, 1, 32, 32]
         // Don't know what's this about
@@ -1428,11 +1423,12 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
     memcpy(&params, dst->op_params, sizeof(params));
     auto [scale, max_bias] = params;
 
+    const ggml_tensor *src0 = dst->src[0];
     const ggml_tensor *src1 = dst->src[1];
 
-    auto t = realize_ggml_view(dst->src[0]);
+    auto t = realize_ggml_view(src0);
     tt::tt_metal::Tensor x = *t;
-    // TODO: use the operimzied op if we can. It only works in certain conidtions
+    // XXX: TTNN's own implementation does not handle broadcasting as GGML wants
     // if(src1 != nullptr) {
     //     auto mask = realize_ggml_view(src1);
     //     x = ttnn::operations::normalization::scale_mask_softmax(*t, scale, *mask);
@@ -1442,33 +1438,23 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
     }
 
     if(src1 != nullptr) {
-        auto mask = realize_ggml_view(src1);
+        auto mask = *realize_ggml_view(src1);
         if(max_bias == 0.f) {
-            // std::cout << "x: " << x.logical_shape() << " mask: " << mask->logical_shape() << std::endl;
-            // std::cout << "x.dtype: " << (int)x.dtype() << " mask.dtype: " << (int)mask->dtype() << std::endl;
-            x = ttnn::add(x, *mask);
+            x = ttnn::add(x, mask);
         }
         else {
-            // This path is not used due to bugs
-            // TODO: Revive it later
-            const uint32_t n_head = t->logical_shape()[1];
-            const uint32_t n_head_log2 = 1u << (uint32_t) std::floor(std::log2(n_head));
+            const int n_head      = src0->ne[2];
+            const int n_head_log2 = 1u << (uint32_t) floorf(log2f((float) n_head));
+
             const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
             const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
-            auto make_tile = [](const tt::tt_metal::Tensor& t, ttnn::MeshDevice* dev) {
-                return ttnn::tilize_with_zero_padding(t.to_device(dev));
-            };
-
-            // const float slope = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
-            auto *dev = t->device();
-            // BUG here. Generating wrong shaped tensor
-            // This is a part of the limitation of TTNN can't have odd numbers of elements in the last dimension
-            auto idxs = make_tile(ttnn::arange(0, n_head, 1), dev);
-            auto slope = ttnn::where(ttnn::lt(idxs, (float)n_head_log2), ttnn::rpow(ttnn::add(idxs, 1.f), m0)
-                , ttnn::rpow(ttnn::add(ttnn::multiply(ttnn::subtract(idxs, (float)n_head_log2), 2.f), 1.f), m1));
-            auto positional_bias = ttnn::matmul(slope, ttnn::transpose(idxs, -2, -1)); // FIXME: make sure this is correct
-
-            x = ttnn::add(x, ttnn::multiply(*mask, positional_bias));
+            auto slopes = ttnn::arange(0, n_head, 1, tt::tt_metal::DataType::FLOAT32, *x.device(), ttnn::DRAM_MEMORY_CONFIG, ttnn::TILE_LAYOUT);
+            auto base = ttnn::where(ttnn::lt(slopes, n_head_log2), m0, m1);
+            auto exp = ttnn::where(ttnn::lt(slopes, n_head_log2), ttnn::add(slopes, 1), ttnn::add(ttnn::multiply(ttnn::subtract(slopes, n_head_log2), 2.f), 1));
+            slopes = ttnn::pow(base, exp, tt::tt_metal::DataType::BFLOAT16);
+            slopes = ttnn::transpose(slopes.reshape(slopes.logical_shape().to_rank(4)), 1, 3);
+            mask = ttnn::multiply(mask, slopes);
+            x = ttnn::add(x, mask);
         }
     }
     x = ttnn::softmax(x, 3);

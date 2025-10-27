@@ -16,7 +16,7 @@
 #include "ttnn/tensor/storage.hpp"
 #include "ttnn/tensor/tensor.hpp"
 #include "ttnn/tensor/types.hpp"
-#include "types/arch.h"
+#include "types/arch.hpp"
 #include <algorithm>
 #include <array>
 #include <cstddef>

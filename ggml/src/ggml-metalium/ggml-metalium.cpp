@@ -19,7 +19,7 @@
 #include "ttnn/tensor/tensor.hpp"
 #include "ttnn/tensor/types.hpp"
 #include "ttnn/types.hpp"
-#include "types/arch.h"
+#include "types/arch.hpp"
 #include "umd/device/types/arch.hpp"
 #include "umd/device/types/cluster_descriptor_types.hpp"
 #include <string.h>
@@ -2831,7 +2831,7 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
         // WHY???
         // chip_id_t MeshDevice::build_id() const { return reference_device()->id(); }
         // Reference device should be the same... Dafaq?
-        chip_id_t id = device->get_devices().size() == 1 ? device->get_devices()[0]->id() : device->id();
+        tt::ChipId id = device->get_devices().size() == 1 ? device->get_devices()[0]->id() : device->id();
         GGML_ASSERT(id == device_id && "WTF? Metalium ID should match with asked device ID");
         std::string arch_str = tt::arch_to_str(device->arch());
         std::transform(arch_str.begin(), arch_str.end(), arch_str.begin(), ::toupper);

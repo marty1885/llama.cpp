@@ -539,11 +539,20 @@ static void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, ggml_type
         }
     }
     // If the 2nd dimension is not divisible by 32, we can still copy block by block
-    else if(src_dst_same && !need_quantized_conversion && nshape[0] % 32 == 0 && nshape[1] % 32 != 0) {
+    else if(nshape[0] % 32 == 0 && nshape[1] % 32 != 0) {
         const size_t src_block_size = nshape[2] * nshape[3];
         const size_t src_block_stride = stride[1];
-        for(size_t i=0;i<nshape[0]*nshape[1];i++) {
-            memcpy((SrcType*)intermid + i * src_block_size, buf + i * src_block_stride, sizeof(SrcType) * src_block_size);
+        if(src_dst_same) {
+            for(size_t i=0;i<nshape[0]*nshape[1];i++) {
+                memcpy((SrcType*)intermid + i * src_block_size, buf + i * src_block_stride, sizeof(SrcType) * src_block_size);
+            }
+        }
+        else {
+            for(size_t i=0;i<nshape[0]*nshape[1];i++) {
+                for(size_t j=0;j<src_block_size;j++) {
+                    ((SrcType*)intermid)[i * src_block_size + j] = src_adaptor(buf[i * src_block_stride + j]);
+                }
+            }
         }
     }
     // row-by-row copy

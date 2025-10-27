@@ -308,7 +308,7 @@ static bool is_ggml_type_supported_by_metalium(ggml_type ggtype, tt::ARCH arch) 
 }
 
 template <typename SrcType, typename DstType>
-static tt::tt_metal::HostBuffer data2borroweded_storage(const SrcType* src, size_t size) {
+static tt::tt_metal::HostBuffer host_data_to_tt_host_buffer(const SrcType* src, size_t size) {
     // Converts GGML floating point (FP32, FP16, BF16) to TT floating point (FP32, BF16)
     using Src = std::remove_cv_t<std::remove_reference_t<SrcType>>;
     using Dst = std::remove_cv_t<std::remove_reference_t<DstType>>;
@@ -393,7 +393,7 @@ static tt::tt_metal::HostBuffer data2borroweded_storage(const SrcType* src, size
 }
 
 template <typename DstType>
-static tt::tt_metal::HostBuffer ggml_quantized2owned_storage(const void* src, const ggml_tensor* tensor) {
+static tt::tt_metal::HostBuffer quantized_ggml_data_to_tt_host_buffer(const void* src, const ggml_tensor* tensor) {
     const ggml_type_traits* trait = ggml_get_type_traits(tensor->type);
     const size_t size = ggml_nelements(tensor);
     GGML_ASSERT(trait->to_float != NULL);
@@ -419,7 +419,7 @@ static tt::tt_metal::HostBuffer ggml_quantized2owned_storage(const void* src, co
         );
         return tt::tt_metal::HostBuffer(ttsl::Span<float>(vec_ptr, size), std::move(pin));
     }
-    return data2borroweded_storage<float, DstType>(vec.get(), size);
+    return host_data_to_tt_host_buffer<float, DstType>(vec.get(), size);
 }
 
 // Copies the content of the TT tensor into memory pointed by `dst` with data of type `dst_ggtype`
@@ -428,7 +428,7 @@ static tt::tt_metal::HostBuffer ggml_quantized2owned_storage(const void* src, co
 // This function works by deciding if the tensor is already in the desired format, and if not
 // convert to FP32 then convert into the desired format
 template <typename SrcType>
-static void tensor2ggml(const tt::tt_metal::Tensor& tensor, void* dst, ggml_type dst_ggtype) {
+static void copy_tt_tensor_to_host_buffer(const tt::tt_metal::Tensor& tensor, void* dst, ggml_type dst_ggtype) {
     ttnn::Shape shape = tensor.logical_shape();
     ttnn::Shape padded_shape = tensor.padded_shape();
 
@@ -803,11 +803,13 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
     }
 
     // HACK: Fallback path: if somehow the framework does not set the real tensor, we can make our own
-    auto tt_type = ggml2tt_type(tensor->type, meta->tensor->device()->arch());
-    auto shape = ttnn::Shape({uint32_t(tensor->ne[3]), uint32_t(tensor->ne[2]), uint32_t(tensor->ne[1]), uint32_t(tensor->ne[0])});
-    auto res = ttnn::tilize_with_zero_padding(ttnn::zeros(shape, tt::tt_metal::DataType::BFLOAT16).to_device(meta->tensor->device()), std::nullopt, tt_type);
-    meta->tensor = std::make_shared<tt::tt_metal::Tensor>(res);
-    return meta->tensor;
+    // FIXME: GCC says meta->tensor is NULL
+    // auto tt_type = ggml2tt_type(tensor->type, meta->tensor->device()->arch());
+    // auto shape = ttnn::Shape({uint32_t(tensor->ne[3]), uint32_t(tensor->ne[2]), uint32_t(tensor->ne[1]), uint32_t(tensor->ne[0])});
+    // auto res = ttnn::tilize_with_zero_padding(ttnn::zeros(shape, tt::tt_metal::DataType::BFLOAT16).to_device(meta->tensor->device()), std::nullopt, tt_type);
+    // meta->tensor = std::make_shared<tt::tt_metal::Tensor>(res);
+    // return meta->tensor;
+    GGML_ASSERT(false && "Fallback path not implemented");
 }
 
 inline static void ggml_metalium_op_src_sanity_check(const struct ggml_tensor * node, int idx) {
@@ -1881,9 +1883,9 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     GGML_ASSERT(tensor->extra != NULL);
 
     ggml_backend_metalium_buffer_context * bufctx = (ggml_backend_metalium_buffer_context *)buffer->context;
+    GGML_ASSERT(bufctx != NULL);
     ggml_type ggtype = tensor->type;
     ggml_tensor_extra_metalium * meta = (ggml_tensor_extra_metalium *)tensor->extra;
-    const tt::ARCH processor_class = bufctx->device->arch();
 
     // Make sure we are not writing to a view tensor
     if(size != ggml_nbytes(tensor) || (meta->tensor && ggml_tt_tensors_shape_equal(tensor, *meta->tensor) == false)
@@ -1899,24 +1901,24 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     if(ggtype == GGML_TYPE_F32) {
         // For now we cast F32 to BF16. Need a scalable way to handle this as WORMHOLD_B0 have native support for F32
         // TODO: Enable proper FP32 when all related bugs gets fixed for devices that support it
-        storage = data2borroweded_storage<float, bfloat16>((const float*)data, size / sizeof(float));
+        storage = host_data_to_tt_host_buffer<float, bfloat16>((const float*)data, size / sizeof(float));
     }
     else if (ggtype == GGML_TYPE_F16) {
         // TT hardware claims to support FP16 but the API does not expose it. For now we use BF16 as it is close enough
-        storage = data2borroweded_storage<ggml_fp16_t, bfloat16>((const ggml_fp16_t*)data, size / sizeof(ggml_fp16_t));
+        storage = host_data_to_tt_host_buffer<ggml_fp16_t, bfloat16>((const ggml_fp16_t*)data, size / sizeof(ggml_fp16_t));
     }
     else if (ggtype == GGML_TYPE_BF16) {
-        storage = data2borroweded_storage<ggml_bf16_t, bfloat16>((const ggml_bf16_t*)data, size / sizeof(ggml_bf16_t));
+        storage = host_data_to_tt_host_buffer<ggml_bf16_t, bfloat16>((const ggml_bf16_t*)data, size / sizeof(ggml_bf16_t));
     }
     else if (ggtype == GGML_TYPE_I32) {
-        storage = data2borroweded_storage<int, uint32_t>((const int*)data, size / sizeof(int));
+        storage = host_data_to_tt_host_buffer<int, uint32_t>((const int*)data, size / sizeof(int));
         intermidiate_type = tt::tt_metal::DataType::UINT32;
         tilize = false; // Integer tensors are indices - operations will want them untiled
     }
     else if (ggml_is_quantized(ggtype)) {
         // Going to FP16 requires a cast to BFLOAT16 which is slower. Instead go to FP32. Even though it's larger
         // it's faster due to one less step.
-        storage = ggml_quantized2owned_storage<float>(data, tensor);
+        storage = quantized_ggml_data_to_tt_host_buffer<float>(data, tensor);
         intermidiate_type = tt::tt_metal::DataType::FLOAT32;
     }
     else {
@@ -1925,6 +1927,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     }
     GGML_ASSERT(storage.has_value() && "Failed to convert data to TT storage");
 
+    // Convert GGML shape to TT shape
     ttsl::SmallVector<uint32_t> shape(GGML_MAX_DIMS, 1);
     for(int i = 0; i < GGML_MAX_DIMS; i++) {
         // GGML stores the shape in reverse order
@@ -1968,7 +1971,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     tt::tt_metal::Tensor t(std::move(*storage), ttnn::Shape(shape)
         , intermidiate_type, tt::tt_metal::Layout::ROW_MAJOR);
 
-    tt::tt_metal::DataType final_type = ggml2tt_type(ggtype, processor_class);
+    tt::tt_metal::DataType final_type = ggml2tt_type(ggtype, bufctx->device->arch());
     if(tilize) {
         t = ttnn::tilize_with_zero_padding(t.to_device(bufctx->device.get()), std::nullopt, final_type);
     }
@@ -1999,8 +2002,8 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
     // Here's the general logic of get_tensor
     // 1. Get the TT tensor from the metadata
     // 2. If the TT tensor is quantized, cast it to BFLOAT16
-    // 3. Call tensor2ggml to convert the TT tensor to GGML tensor
-    //    - tensor2ggml internally handles the data type conversion
+    // 3. Call copy_tt_tensor_to_host_buffer to convert the TT tensor to GGML tensor
+    //    - copy_tt_tensor_to_host_buffer internally handles the data type conversion
     GGML_ASSERT(size == ggml_nbytes(tensor));
     GGML_ASSERT(tensor->extra != NULL);
     GGML_UNUSED(offset);
@@ -2067,13 +2070,13 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
     GGML_ASSERT(dst_ggtype != GGML_TYPE_F64 && dst_ggtype != GGML_TYPE_I16 && dst_ggtype != GGML_TYPE_I8);
     switch(t->dtype()) {
         case tt::tt_metal::DataType::BFLOAT16:
-            tensor2ggml<bfloat16>(*t, (float*)data, dst_ggtype);
+            copy_tt_tensor_to_host_buffer<bfloat16>(*t, (float*)data, dst_ggtype);
             break;
         case tt::tt_metal::DataType::FLOAT32:
-            tensor2ggml<float>(*t, (float*)data, dst_ggtype);
+            copy_tt_tensor_to_host_buffer<float>(*t, (float*)data, dst_ggtype);
             break;
         case tt::tt_metal::DataType::UINT32:
-            tensor2ggml<uint32_t>(*t, (int*)data, dst_ggtype);
+            copy_tt_tensor_to_host_buffer<uint32_t>(*t, (int*)data, dst_ggtype);
             break;
         default:
             GGML_ASSERT(false && "Unsupported data type in TT tensor when converting to GGML tensor");

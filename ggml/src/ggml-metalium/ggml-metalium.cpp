@@ -1271,11 +1271,9 @@ static void ggml_backend_metalium_get_rows(ggml_backend_metalium_context * ctx, 
         ggml_tensor_extra_metalium* idx_meta = (ggml_tensor_extra_metalium*)idxs->extra;
         GGML_ASSERT(idx_meta != nullptr);
         // The operation wants 3D tensor but we have 4D, op also wants index be 2d
-        auto src_shape4d = t->logical_shape().to_array_4D();
-        ttnn::Shape src_new_shape({src_shape4d[1], src_shape4d[2], src_shape4d[3]});
-        auto idx_shape4d = idx_meta->tensor->logical_shape().to_array_4D();
-        ttnn::Shape idx_new_shape({idx_shape4d[2], idx_shape4d[3]});
-        ttnn::Tensor gathered = ttnn::tosa::gather(t->reshape(src_new_shape), ttnn::tilize_with_zero_padding(idx_meta->tensor->reshape(idx_new_shape)), std::nullopt);
+        auto src3d = t->reshape(t->logical_shape().to_rank(3));
+        auto idx2d = idx_meta->tensor->reshape(idx_meta->tensor->logical_shape().to_rank(2));
+        ttnn::Tensor gathered = ttnn::tosa::gather(src3d, ttnn::tilize_with_zero_padding(idx2d), std::nullopt);
         gathered = gathered.reshape(gathered.logical_shape().to_rank(4));
         *dst_meta = {
             .tensor = std::make_shared<ttnn::Tensor>(gathered)

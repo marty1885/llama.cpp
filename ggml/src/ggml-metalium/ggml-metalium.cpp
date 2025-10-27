@@ -2489,7 +2489,7 @@ static bool ggml_backend_metalium_device_supports_op(ggml_backend_dev_t device, 
         //         }
         //         fprintf(stderr, "    src%d follow - %s shape [%ld %ld %ld %ld], dtype = %s, name = '%s'\n", i, names[i], t->ne[0], t->ne[1], t->ne[2], t->ne[3], ggml_type_name(t->type), t->name);
         //     }
-        }
+        // }
     }
     return ok;
 }

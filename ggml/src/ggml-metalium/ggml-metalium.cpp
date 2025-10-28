@@ -2750,7 +2750,7 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
             return tensor_supported(src1) && numpy_broadcast_rule(src0, src1);
         // DIV does not support broadcasting on TTNN
         case GGML_OP_DIV:
-            return tensor_supported(src1) && memcmp(src0->ne, src1->ne, sizeof(src0->ne)) == 0;
+            return tensor_supported(src1) && numpy_broadcast_rule(src0, src1);
 
         case GGML_OP_MUL_MAT:
             return tensor_supported(src1) && ggml_backend_metalium_can_mul_mat(op);

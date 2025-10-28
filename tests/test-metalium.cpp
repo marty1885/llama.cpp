@@ -710,6 +710,19 @@ void add_unittests(std::vector<std::unique_ptr<test_case>>& tests)
             return ggml_rope(ctx, a, b, 32, GGML_ROPE_TYPE_NORMAL);
         }, "RoPE Normal " + std::string(ggml_type_name(GGML_TYPE_F32))));
     }
+
+    tests.push_back(make_test([](ggml_context* ctx) {
+        int n = 300*256;
+        int m = 60;
+        int r = 8;
+        int be1 = 1;
+        int be2 = 1;
+        ggml_tensor * in = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n, m, be1, be2);
+        ggml_tensor * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, r, be1, be2);
+        ggml_tensor * out = ggml_get_rows(ctx, in, rows);
+
+        return out;
+    }, "Simple GET_ROWS", 1e-5));
     // more complex tests
     tests.push_back(make_test([](ggml_context* ctx) {
         ggml_tensor* x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 18);

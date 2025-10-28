@@ -1,3 +1,4 @@
+#include "fmt/base.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -10,6 +11,7 @@
 #include "tt-metalium/host_buffer.hpp"
 #include "tt-metalium/memory_pin.hpp"
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
+#include "ttnn/operations/data_movement/stack/stack.hpp"
 #include "ttnn/operations/eltwise/binary/binary.hpp"
 #include "ttnn/operations/eltwise/binary/binary_composite.hpp"
 #include "ttnn/operations/eltwise/unary/unary.hpp"
@@ -60,6 +62,7 @@
 #include <ttnn/operations/data_movement/reshape_view/reshape.hpp>
 #include <ttnn/operations/reduction/generic/generic_reductions.hpp>
 #include <ttnn/cpp/ttnn/operations/data_movement/gather/tosa/gather_tosa.hpp>
+#include <ttnn/cpp/ttnn/operations/transformer/sdpa_decode/sdpa_decode.hpp>
 
 
 #include <memory>
@@ -1859,6 +1862,138 @@ static void ggml_backend_metalium_rope(ggml_backend_metalium_context * ctx, stru
     };
 }
 
+static bool ggml_backend_metalium_can_flash_attn(const struct ggml_tensor * dst)
+{
+    if(!g_debug_flags.experimental_ops) {
+        return false;
+    }
+    auto follow_tensor_upstream = [](const ggml_tensor* tensor) -> const ggml_tensor* {
+        if(!tensor) {
+            return NULL;
+        }
+        while(tensor->op == GGML_OP_TRANSPOSE || tensor->op == GGML_OP_PERMUTE) {
+            tensor = tensor->src[0];
+        }
+        return tensor;
+    };
+    const ggml_tensor* q = follow_tensor_upstream(dst->src[0]);
+    const ggml_tensor* k = follow_tensor_upstream(dst->src[1]);
+    const ggml_tensor* v = follow_tensor_upstream(dst->src[2]);
+    const ggml_tensor* mask = follow_tensor_upstream(dst->src[3]);
+
+    std::array<float, 3> params;
+    memcpy(params.data(), dst->op_params, sizeof(float) * 3);
+    auto [scale, max_bias, logit_softcap] = params;
+
+    if(max_bias != 0.f) {
+        return false;
+    }
+
+    // Examoke input
+    // REJECT op FLASH_ATTN_EXT (__fattn__-6)
+    //   src0 shape [64 32 32 1], dtype = f32, name = 'Qcur-6 (view) (permuted)'
+    //   src1 shape [64 1536 8 1], dtype = f16, name = 'cache_k_l6 (view) (permuted)'
+    //   src2 shape [64 1536 8 1], dtype = f16, name = 'cache_v_l6 (view) (permuted)'
+    //   src3 shape [1536 64 1 1], dtype = f16, name = ' (copy)'
+    //   FlashAttention debug details:
+    //     src0 follow - query shape [64 32 32 1], dtype = f32, name = 'Qcur-6 (view)'
+    //     src1 follow - key shape [64 8 1536 1], dtype = f16, name = 'cache_k_l6 (view)'
+    //     src2 follow - value shape [64 8 1536 1], dtype = f16, name = 'cache_v_l6 (view)'
+    //     src3 follow - mask shape [1536 64 1 1], dtype = f16, name = ' (copy)'
+    //
+    // GGML:
+    // q:    [n_embd_k, n_batch,     n_head,    ne3 ]
+    // k:    [n_embd_k, n_kv,        n_head_kv, ne3 ]
+    // v:    [n_embd_v, n_kv,        n_head_kv, ne3 ] !! not transposed !!
+    // mask: [n_kv,     n_batch_pad, ne32,      ne33] !! n_batch_pad = GGML_PAD(n_batch, GGML_KQ_MASK_PAD) !!
+    // res:  [n_embd_v, n_head,      n_batch,   ne3 ] !! permuted !!
+    //
+    // TT
+    // input_tensor_q (ttnn.Tensor): the input tensor [1 x b x nh x dh]
+    // input_tensor_k (ttnn.Tensor): the input tensor [b x nkv x   s x dh]
+    // input_tensor_v (ttnn.Tensor): the input tensor [b x nkv x   s x dh]
+
+    int64_t ne3 = q->ne[3];
+    if(ne3 != 1) {
+        return false;
+    }
+    if(k->ne[3] != 1 || v->ne[3] != 1) {
+        return false;
+    }
+    int64_t b = q->ne[1];
+    // Either we don't need to broadcast or we broadcast for them
+    if(mask && mask->ne[2] != 1 && !(mask->ne[3] == 1 || mask->ne[3] == b)) {
+        return false;
+    }
+
+    return true;
+}
+
+static void ggml_backend_metalium_flash_attn(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
+{
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+    GGML_UNUSED(ctx);
+    ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
+
+    auto follow_tensor_upstream = [](const ggml_tensor* tensor) -> const ggml_tensor* {
+        if(!tensor) {
+            return NULL;
+        }
+        while(tensor->op == GGML_OP_TRANSPOSE || tensor->op == GGML_OP_PERMUTE) {
+            tensor = tensor->src[0];
+        }
+        return tensor;
+    };
+    const ggml_tensor* q = follow_tensor_upstream(dst->src[0]);
+    const ggml_tensor* k = follow_tensor_upstream(dst->src[1]);
+    const ggml_tensor* v = follow_tensor_upstream(dst->src[2]);
+    const ggml_tensor* mask = follow_tensor_upstream(dst->src[3]);
+
+    std::array<float, 3> params;
+    memcpy(params.data(), dst->op_params, sizeof(float) * 3);
+    auto [scale, max_bias, logit_softcap] = params;
+
+    auto qt = *realize_ggml_view(q);
+    auto kt = *realize_ggml_view(k);
+    auto vt = *realize_ggml_view(v);
+
+    uint32_t b = qt.logical_shape()[1];
+    if(kt.logical_shape()[0] != b) {
+        ttnn::Shape repeat_factor({b, 1, 1, 1});
+        kt = ttnn::repeat(kt, repeat_factor);
+    }
+
+    if(vt.logical_shape()[0] != b) {
+        ttnn::Shape repeat_factor({b, 1, 1, 1});
+        vt = ttnn::repeat(vt, repeat_factor);
+    }
+
+    std::optional<ttnn::Tensor> mask_tensor;
+    if(mask) {
+        mask_tensor = *realize_ggml_view(mask);
+        if(mask_tensor->logical_shape()[0] != b) {
+            ttnn::Shape repeat_factor({b, 1, 1, 1});
+            *mask_tensor = ttnn::repeat(*mask_tensor, repeat_factor);
+        }
+    }
+
+    auto res = ttnn::transformer::scaled_dot_product_attention_decode(
+        qt,
+        kt,
+        vt,
+        false,
+        mask_tensor,
+        std::vector<uint32_t>{},
+        std::nullopt,
+        std::nullopt,
+        scale
+    );
+    *dst_meta = {
+        .tensor = std::make_shared<ttnn::Tensor>(res)
+    };
+}
+
 // backend interface
 
 static const char * ggml_backend_metalium_name(ggml_backend_t backend) {
@@ -2419,6 +2554,10 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
                 ggml_backend_metalium_rope(ctx, node);
                 break;
 
+            case GGML_OP_FLASH_ATTN_EXT:
+                ggml_backend_metalium_flash_attn(ctx, node);
+                break;
+
             case GGML_OP_NONE:
                 break;
 
@@ -2439,7 +2578,6 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
     }
 
     return GGML_STATUS_SUCCESS;
-
     GGML_UNUSED(backend);
 }
 
@@ -2458,20 +2596,20 @@ static bool ggml_backend_metalium_device_supports_op(ggml_backend_dev_t device, 
         }
 
         // Follow op details
-        // if(op->op == GGML_OP_FLASH_ATTN_EXT) {
-        //     fprintf(stderr, "  FlashAttention debug details:\n");
-        //     const char* names[] = {"query", "key", "value", "mask"};
-        //     for(int i = 0; i < 4; i++) {
-        //         if(!op->src[i]) {
-        //             break;
-        //         }
-        //         ggml_tensor* t = op->src[i];
-        //         while(t->op == GGML_OP_PERMUTE) {
-        //             t = t->src[0];
-        //         }
-        //         fprintf(stderr, "    src%d follow - %s shape [%ld %ld %ld %ld], dtype = %s, name = '%s'\n", i, names[i], t->ne[0], t->ne[1], t->ne[2], t->ne[3], ggml_type_name(t->type), t->name);
-        //     }
-        // }
+        if(op->op == GGML_OP_FLASH_ATTN_EXT) {
+            fprintf(stderr, "  FlashAttention debug details:\n");
+            const char* names[] = {"query", "key", "value", "mask"};
+            for(int i = 0; i < 4; i++) {
+                if(!op->src[i]) {
+                    break;
+                }
+                ggml_tensor* t = op->src[i];
+                while(t->op == GGML_OP_PERMUTE) {
+                    t = t->src[0];
+                }
+                fprintf(stderr, "    src%d follow - %s shape [%ld %ld %ld %ld], dtype = %s, name = '%s'\n", i, names[i], t->ne[0], t->ne[1], t->ne[2], t->ne[3], ggml_type_name(t->type), t->name);
+            }
+        }
     }
     return ok;
 }
@@ -2598,6 +2736,8 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
             return ((src1 && tensor_supported(src1)) || !src1) && ggml_backend_metalium_can_glu(op);
         case GGML_OP_ROPE:
             return tensor_supported(src1) && ggml_backend_metalium_can_rope(op);
+        case GGML_OP_FLASH_ATTN_EXT:
+            return tensor_supported(src1) && tensor_supported(op->src[2]) && ggml_backend_metalium_can_flash_attn(op);
         default:
             return false;
     }

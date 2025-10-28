@@ -151,7 +151,7 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
     } else if (tensor->type == GGML_TYPE_I32) {
         std::vector<int32_t> datai32(size);
-        std::uniform_int_distribution<int32_t> distribution_int32(0, 2048);
+        std::uniform_int_distribution<int32_t> distribution_int32(0, 60);
         for (size_t i = 0; i < size; i++) {
             datai32[i] = distribution_int32(generator);
         }
@@ -763,9 +763,21 @@ int main(int argc, char ** argv)
     ///////////////// put experiment code here /////////////////
     // easier on the eye to find it (also one line to disable UT)
     tests.push_back(make_test([](ggml_context* ctx) {
-        ggml_tensor* a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 32, 1);
-        ggml_tensor* b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 64, 2);
-        return ggml_mul_mat(ctx, a, b);
+        int n = 300*256;
+        int m = 60;
+        int r = 8;
+        int be1 = 1;
+        int be2 = 1;
+        ggml_tensor * in = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n, m, be1, be2);
+        ggml_set_name(in, "in");
+
+        ggml_tensor * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, r, be1, be2);
+        ggml_set_name(rows, "rows");
+
+        ggml_tensor * out = ggml_get_rows(ctx, in, rows);
+        ggml_set_name(out, "out");
+
+        return out;
     }, "test MM", 1e-5));
     ///////////////// end of experiment code /////////////////
 

@@ -652,6 +652,12 @@ static bool is_view(const ggml_tensor* tensor)
         tensor->op == GGML_OP_PERMUTE;
 }
 
+static bool is_integer_type(ggml_type type)
+{
+    std::array<ggml_type, 4> integer_types = {GGML_TYPE_I32, GGML_TYPE_I16, GGML_TYPE_I8, GGML_TYPE_I64};
+    return std::find(integer_types.begin(), integer_types.end(), type) != integer_types.end();
+}
+
 static tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tensor& tensor, const struct ggml_tensor * node)
 {
     if(ggml_tt_tensors_shape_equal(node, tensor)) {
@@ -857,6 +863,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
     // auto res = ttnn::tilize_with_zero_padding(ttnn::zeros(shape, tt::tt_metal::DataType::BFLOAT16).to_device(meta->tensor->device()), std::nullopt, tt_type);
     // meta->tensor = std::make_shared<tt::tt_metal::Tensor>(res);
     // return meta->tensor;
+    fmt::println(stderr, "Tensor \"{}\" getting through fallback path. OP = {}, dtype={}", tensor->name, ggml_op_name(tensor->op), ggml_type_name(tensor->type));
     GGML_ASSERT(false && "Fallback path not implemented");
 }
 
@@ -985,6 +992,9 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
 
 static bool ggml_backend_metalium_can_cpy(const struct ggml_tensor * dst)
 {
+    if(is_integer_type(dst->type) || is_integer_type(dst->src[0]->type)) {
+        return false;
+    }
     // Destination must not be a view
     if(dst->op != GGML_OP_CPY) {
         return true;
@@ -1249,6 +1259,20 @@ static bool ggml_backend_metalium_can_get_rows(const struct ggml_tensor * dst)
     }
 
     const ggml_tensor* src = dst->src[0];
+    if(is_integer_type(src->type)) {
+        return false;
+    }
+
+    // FIXME: TTNN running into issues with large tensor....?
+    if(idxs->ne[0] > 256) {
+        return false;
+    }
+
+    // FIXME: Doesn't seem to be working correctly when batched
+    if(src->ne[2] != 1 || src->ne[3] != 1) {
+        return false;
+    }
+
     if(idxs->ne[2] == 1 && src->ne[3] == 1 && !is_view(idxs)) {
         return true;
     }
@@ -2160,9 +2184,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     }
     else {
         t = t.to_device(bufctx->device.get());
-        if(t.dtype() != final_type) {
-            t = ttnn::typecast(t, final_type);
-        }
+        GGML_ASSERT(t.dtype() == final_type && "Tensor dtype mismatch during tensor creation for row major tensors");
         GGML_ASSERT(!permute.has_value() && "Cannot permute tensor without tilizing");
     }
 

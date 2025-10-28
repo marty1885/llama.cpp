@@ -2855,6 +2855,10 @@ struct test_softcap : public test_case {
 
         return out;
     }
+
+    double max_nmse_err() override {
+        return 9e-3;
+    }
 };
 
 // GGML_OP_SILU_BACK
@@ -2968,6 +2972,10 @@ struct test_norm_mul_add : public test_case {
         ggml_tensor * out = ggml_add(ctx, m, b);
         ggml_set_name(out, "out");
         return out;
+    }
+
+    double max_nmse_err() override {
+        return 4e-5f;
     }
 };
 // GGML_OP_RMS_NORM

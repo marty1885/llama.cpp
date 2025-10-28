@@ -1944,9 +1944,16 @@ static bool ggml_backend_metalium_can_flash_attn(const struct ggml_tensor * dst)
     if(k->ne[3] != 1 || v->ne[3] != 1) {
         return false;
     }
+    if(k->ne[1] < 32 || v->ne[1] < 32 || k->ne[1] % 32 != 0 || v->ne[1] % 32 != 0) {
+        return false;
+    }
     int64_t b = q->ne[1];
     // Either we don't need to broadcast or we broadcast for them
     if(mask && mask->ne[2] != 1 && !(mask->ne[3] == 1 || mask->ne[3] == b)) {
+        return false;
+    }
+    // The op does not support broadcasting mask
+    if(mask && (mask->ne[0] != k->ne[1] || mask->ne[1] != q->ne[1])) {
         return false;
     }
 
@@ -2013,6 +2020,11 @@ static void ggml_backend_metalium_flash_attn(ggml_backend_metalium_context * ctx
         std::nullopt,
         scale
     );
+
+    // HACK: I have no idea why
+    if(!ggml_tt_tensors_shape_equal(dst, res)) {
+        res = ttnn::transpose(res, 1, 2);
+    }
     *dst_meta = {
         .tensor = std::make_shared<ttnn::Tensor>(res)
     };

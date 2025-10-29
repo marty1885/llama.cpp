@@ -243,17 +243,17 @@ static tt::tt_metal::DataType ggml2tt_type_internal(ggml_type ggtype, tt::ARCH a
         static constexpr std::array<tt::tt_metal::DataType, GGML_TYPE_COUNT> table = {
             /*GGML_TYPE_F32 = */ tt::tt_metal::DataType::BFLOAT16,
             /*GGML_TYPE_F16 = */ tt::tt_metal::DataType::BFLOAT16,
-            /*GGML_TYPE_Q4_0 = */ tt::tt_metal::DataType::BFLOAT8_B,    // Using BFLOAT8_B for now as BFLOAT4_B is not accurate enough
-            /*GGML_TYPE_Q4_1 = */ tt::tt_metal::DataType::BFLOAT8_B,    // Does work but causes issues in unit tests
+            /*GGML_TYPE_Q4_0 = */ tt::tt_metal::DataType::BFLOAT8_B,
+            /*GGML_TYPE_Q4_1 = */ tt::tt_metal::DataType::BFLOAT8_B,
             tt::tt_metal::DataType::INVALID,
             tt::tt_metal::DataType::INVALID,
             /*GGML_TYPE_Q5_0 = */ tt::tt_metal::DataType::BFLOAT8_B,
-            /*GGML_TYPE_Q5_1 = */ tt::tt_metal::DataType::BFLOAT8_B,    // Does work but causes issues in unit tests
+            /*GGML_TYPE_Q5_1 = */ tt::tt_metal::DataType::BFLOAT8_B,
             /*GGML_TYPE_Q8_0 = */ tt::tt_metal::DataType::BFLOAT8_B,
             /*GGML_TYPE_Q8_1 = */ tt::tt_metal::DataType::BFLOAT8_B,
             /*GGML_TYPE_Q2_K = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_Q3_K = */ tt::tt_metal::DataType::BFLOAT8_B,   // Using BFLOAT8_B for now as BFLOAT4_B is not accurate enough
-            /*GGML_TYPE_Q4_K = */ tt::tt_metal::DataType::BFLOAT8_B,   // Using BFLOAT8_B for now as BFLOAT4_B is not accurate enough
+            /*GGML_TYPE_Q3_K = */ tt::tt_metal::DataType::BFLOAT8_B,
+            /*GGML_TYPE_Q4_K = */ tt::tt_metal::DataType::BFLOAT8_B,
             /*GGML_TYPE_Q5_K = */ tt::tt_metal::DataType::BFLOAT8_B,
             /*GGML_TYPE_Q6_K = */ tt::tt_metal::DataType::BFLOAT8_B,
             /*GGML_TYPE_Q8_K = */ tt::tt_metal::DataType::BFLOAT8_B,
@@ -1709,8 +1709,14 @@ static void ggml_backend_metalium_sum(ggml_backend_metalium_context * ctx, struc
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
 
     auto t = realize_ggml_view(dst->src[0]);
+    ttnn::WormholeComputeKernelConfig cfg{
+        .math_fidelity = MathFidelity::HiFi4,
+        .math_approx_mode = false,
+        .fp32_dest_acc_en = true,
+        .packer_l1_acc = true
+    };
     *dst_meta = {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::sum(*t)),
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::sum(*t, std::nullopt, false, std::nullopt, cfg)),
     };
 }
 

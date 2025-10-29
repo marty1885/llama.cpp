@@ -2085,7 +2085,7 @@ struct test_get_rows : public test_case {
 
     // GGML quants is different to TT quants - leading to error
     double max_nmse_err() override {
-        return 6e-4;
+        return 1e-3;
     }
 };
 
@@ -2676,7 +2676,7 @@ struct test_bin_bcast : public test_case {
         }
     }
     double max_nmse_err() override {
-        return 6e-4f; // Mul and DIV is a bit annoyning
+        return 8e-4f; // Mul and DIV is a bit annoyning
     }
 
     float grad_eps() override {

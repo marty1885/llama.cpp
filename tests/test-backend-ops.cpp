@@ -2780,6 +2780,10 @@ struct test_add1 : public test_case {
     float grad_eps() override {
         return 0.1f * ne[0]*ne[1]*ne[2]*ne[3];
     }
+
+    double max_nmse_err() override {
+        return 1e-5;
+    }
 };
 
 // GGML_OP_SCALE

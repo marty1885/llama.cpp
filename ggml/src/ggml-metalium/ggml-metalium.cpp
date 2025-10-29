@@ -1356,6 +1356,7 @@ static void ggml_backend_metalium_add1(ggml_backend_metalium_context * ctx, stru
     GGML_UNUSED(ctx);
     GGML_METALIUM_OP_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC1_SANITY_CHECK(dst);
 
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
 
@@ -1363,8 +1364,9 @@ static void ggml_backend_metalium_add1(ggml_backend_metalium_context * ctx, stru
     memcpy(&esp, dst->op_params, sizeof(esp));
 
     auto t = realize_ggml_view(dst->src[0]);
+    auto q = realize_ggml_view(dst->src[1]);
     *dst_meta = {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::add(*t, 1.f)),
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::add(*t, *q)),
     };
 }
 

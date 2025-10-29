@@ -2692,14 +2692,14 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
             case tt::tt_metal::DataType::FLOAT32:
             case tt::tt_metal::DataType::UINT32:
             case tt::tt_metal::DataType::INT32:
+            case tt::tt_metal::DataType::BFLOAT8_B:
+            case tt::tt_metal::DataType::BFLOAT4_B:
                 return true;
-            case tt::tt_metal::DataType::UINT8:
-                return tensor->ne[0] % 4 == 0 && tensor->ne[0] != 0;
             case tt::tt_metal::DataType::INVALID:
                 GGML_ASSERT(false && "Unsupported data type");
                 break;
             default:
-                return tensor->ne[0] % 32 == 0 && tensor->ne[0] != 0 && tensor->ne[1] % 32 == 0 && tensor->ne[1] != 0;
+                return false;
         }
         GGML_UNREACHABLE();
     };

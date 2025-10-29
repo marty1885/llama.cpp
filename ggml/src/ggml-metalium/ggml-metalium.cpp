@@ -1320,7 +1320,7 @@ static void ggml_backend_metalium_get_rows(ggml_backend_metalium_context * ctx, 
 static bool ggml_backend_metalium_can_norm(const struct ggml_tensor * dst, bool rms)
 {
     GGML_UNUSED(rms);
-    // no hard checks but this seems to work well enough
+    // no hard checks but this seems to work well enough, else we run out of SRAM
     if(dst->ne[0] > 4096) {
         return false;
     }
@@ -1338,7 +1338,16 @@ static void ggml_backend_metalium_norm(ggml_backend_metalium_context * ctx, stru
     float esp = 0;
     memcpy(&esp, dst->op_params, sizeof(esp));
 
+    // HACK: the norm implementations in TTNN does not like size 1 tensors - we know the result is going to be sign(x)
+    // so let's just make that
     auto t = realize_ggml_view(dst->src[0]);
+    if(t->logical_shape()[-1] == 1) {
+        *dst_meta = {
+            .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(ttnn::sign(*t), t->dtype())),
+        };
+        return;
+    }
+
     tt::tt_metal::Tensor res;
     if(rms) {
         res = ttnn::rms_norm(*t, esp);
@@ -1359,9 +1368,6 @@ static void ggml_backend_metalium_add1(ggml_backend_metalium_context * ctx, stru
     GGML_METALIUM_OP_SRC1_SANITY_CHECK(dst);
 
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
-
-    float esp = 0;
-    memcpy(&esp, dst->op_params, sizeof(esp));
 
     auto t = realize_ggml_view(dst->src[0]);
     auto q = realize_ggml_view(dst->src[1]);
@@ -1703,6 +1709,13 @@ static void ggml_backend_metalium_sum(ggml_backend_metalium_context * ctx, struc
     *dst_meta = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::sum(*t)),
     };
+}
+
+static bool ggml_backend_metalium_can_sum_rows(const struct ggml_tensor * dst)
+{
+    // FIXME: Don't know why but it's broken for these cases
+    ggml_tensor* src0 = dst->src[0];
+    return src0->ne[2] == 1 && src0->ne[3] == 1;
 }
 
 static void ggml_backend_metalium_sum_rows(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
@@ -2738,13 +2751,13 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
         case GGML_OP_SQR:
         case GGML_OP_PERMUTE:
         case GGML_OP_LOG:
-        case GGML_OP_GROUP_NORM:
         case GGML_OP_VIEW:
-        // SUM{_ROWS} technically works but supprts_op rejects the result tensor.
-        // Which gotta do so to avoid some bugs around binary ops with tiled dim=1
         case GGML_OP_SUM:
-        case GGML_OP_SUM_ROWS:
             return true;
+        case GGML_OP_GROUP_NORM:
+            return false; // Disabled because the operator seems to be broken
+        case GGML_OP_SUM_ROWS:
+            return ggml_backend_metalium_can_sum_rows(op);
 
         case GGML_OP_CONT:
         case GGML_OP_CPY:

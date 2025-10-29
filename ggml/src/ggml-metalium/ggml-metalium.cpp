@@ -612,7 +612,7 @@ static void copy_tt_tensor_to_host_pointer(const tt::tt_metal::Tensor& tensor, v
             for(size_t j = 0; j < nshape[2]; j++) {
                 // optimization: copy a row of memory at a time
                 const size_t src_idx = i * stride[1] + j * stride[2];
-                memcpy((SrcType*)intermid + i * dst_stride, buf + src_idx, sizeof(SrcType) * nshape[3]);
+                memcpy((SrcType*)intermid + j * dst_stride + i * nshape[2] * dst_stride, buf + src_idx, sizeof(SrcType) * nshape[3]);
             }
         }
     }
@@ -625,7 +625,15 @@ static void copy_tt_tensor_to_host_pointer(const tt::tt_metal::Tensor& tensor, v
                     for(size_t x = 0; x < nshape[3]; x++) {
                         const size_t src_idx = w * stride[0] + z * stride[1] + y * stride[2] + x * stride[3];
                         GGML_ASSERT(src_idx < buf_size);
-                        ((float*)intermid)[idx] = src_adaptor(buf[src_idx]);
+                        if(!src_dst_same) {
+                            ((float*)intermid)[idx] = src_adaptor(buf[src_idx]);
+                        }
+                        else {
+                            // memcpy((SrcType*)intermid + idx, buf + src_idx, sizeof(SrcType));
+                            const SrcType* src_ptr = buf + src_idx;
+                            SrcType* dst_ptr = (SrcType*)intermid + idx;
+                            *dst_ptr = *src_ptr;
+                        }
                         idx++;
                     }
                 }

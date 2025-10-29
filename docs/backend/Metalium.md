@@ -172,7 +172,7 @@ There are several debug flags available to assist with debugging/performance of 
 |-----------------------------------|-----------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | GGML_METALIUM_PRINT_REJECTED_OPS  | 0(default) or 1 | Print operators GGML asked if the Metalium backend can run, and Metalium reported false                                                                                  |
 | GGML_METALIUM_PRINT_VIEW          | 0(default) or 1 | Print all view operations (VIEW, TRANSPOSE, RESHAPE, PERMUTE) that the backend's lazy view system sees                                                                   |
-| GGML_METALIUM_CACHE_MM_TRANSPOSE  | 0(default) or 1 | TTNN has limited support for pre-transposed matmul that GGML needs and does most on the fly. This options cache the transpose. Trades lot of memory for some performance |
+| GGML_METALIUM_CACHE_MM_TRANSPOSE  | 0(default) or 1 | TTNN has limited support for pre-transposed matmul that GGML needs and does most on the fly. This options cache the transpose. But is incompatiable with LoRA fully      |
 |GGML_METALIUM_DISABLE_PROGRAM_CACHE| 0(default) or 1 | Disables TTNN program cacheing                                                                                                                                           |
 | GGML_METALIUM_EXPERIMENTAL_OPS    | 0(default) or 1 | Enables experimental ops that is known to cause trouble                                                                                                                  |
 
@@ -202,102 +202,6 @@ There's is 2 code paths that executed the `GGML_MUL_MAT` operation on device.
 * By using TTNN `ttnn.matmul(b, ttnn.transpose(a))`
 * By using a custom MUL_MAT written in Metalium kernels
 
-The current custom MUL_MAT kernel is very barebones. But still faster then actually performing a transpose then matmul using TNN. However, if you are willing to sacrifice a lot of DRAM space - since `a` is the weight matrix, the backend can tranpose the weight matrix once and cache the result. This can be done by using the `GGML_METALIUM_CACHE_MM_TRANSPOSE` flag. It transposes the weight matrix once and caches the result for future use.
+The current custom MUL_MAT kernel is very barebones. But still faster then actually performing a transpose then matmul using TNN. However, if you are willing to compatibility with workload that modifies the weight - since `a` is the weight matrix and does not change across the inference run, the backend can transpose the weight matrix once and cache the result. This can be done by using the `GGML_METALIUM_CACHE_MM_TRANSPOSE` flag. It transposes the weight matrix once and caches the result for future use.
 
 The eventual goal is to get rid of this flag since there's no reason custom kernels can't reach near the same performance (it's just pre-transpose, but we add a transpose stem to the matrix engine). But until then, it is recommended to use it for better performance.
-
-### On (part of thw) unit test failures
-
-I did some quick debug printing and it shows the follwing. Itt feels like the problem exists in the CPU backend instead of Metalium. The CPU backend is the one getting NaNs while Metalium producing good values. And the printed values are at an offset. Also diffed against upstream - (as of writing) the fork does not touch any part of the CPU backend. But I am more skepitcal that it's my skill issue instead of GGML itself being the problem.
-
-```plaintext
-test CPY of FP32 to BFP16 (CPY): nodes: 3
-
-Content of tensor dst (copy of src):
-backend: Metalium, CPU    0  0.202148  0.416016, diff = -0.213867
-    1 -0.714844  0.302734, diff = -1.017578
-    2  0.416016  0.941406, diff = -0.525391
-    3  0.302734  0.443359, diff = -0.140625
-    4 -0.957031 -0.574219, diff = -0.382812
-    5 -0.886719 -1.000000, diff =  0.113281
-    6  0.941406 -0.632812, diff =  1.574219
-    7  0.443359  0.235352, diff =  0.208008
-    8  0.664062  0.049561, diff =  0.614502
-    9  0.878906 -0.984375, diff =  1.863281
-   10 -0.574219 -0.417969, diff = -0.156250
-   11 -1.000000  0.049561, diff = -1.049561
-   12 -0.636719 -0.722656, diff =  0.085938
-   13  0.984375 -0.906250, diff =  1.890625
-   14 -0.632812 -0.267578, diff = -0.365234
-   15  0.235352 -0.535156, diff =  0.770508
-   16 -0.390625  0.570312, diff = -0.960938
-   17  0.223633  0.236328, diff = -0.012695
-   18  0.049561  0.028442, diff =  0.021118
-   19 -0.984375  0.964844, diff = -1.949219
-   20 -0.135742 -0.906250, diff =  0.770508
-   21 -0.953125  0.718750, diff = -1.671875
-   22 -0.417969 -0.660156, diff =  0.242188
-   23  0.049561 -0.099121, diff =  0.148682
-   24  0.223633      -inf, diff =       inf
-   25 -0.200195      -inf, diff =       inf
-   26 -0.722656       inf, diff =      -inf
-   27 -0.906250  0.000000, diff = -0.906250
-   28 -0.416016       inf, diff =      -inf
-   29  0.949219      -inf, diff =       inf
-   30 -0.267578       inf, diff =      -inf
-   31 -0.535156  0.000000, diff = -0.535156
-   32 -0.087891       inf, diff =      -inf
-   33 -0.820312      -inf, diff =       inf
-   34  0.570312       inf, diff =      -inf
-   35  0.236328  0.000000, diff =  0.236328
-   36 -0.601562       inf, diff =      -inf
-   37 -0.235352      -inf, diff =       inf
-   38  0.028442       inf, diff =      -inf
-   39  0.964844  0.000000, diff =  0.964844
-   40  0.184570  0.000000, diff =  0.184570
-   41 -0.066406  0.000000, diff = -0.066406
-   42 -0.906250  0.000000, diff = -0.906250
-   43  0.718750  0.000000, diff =  0.718750
-   44  0.214844  0.000000, diff =  0.214844
-   45  0.361328  0.000000, diff =  0.361328
-   46 -0.660156  0.000000, diff = -0.660156
-   47 -0.099121  0.000000, diff = -0.099121
-
-[CPY] inf mismatch: Metalium=0.223633 CPU=-inf
-Content of tensor sent_0:
-backend: Metalium, CPU    0 -0.250000 -0.250000, diff =  0.000000
-    1  0.593750  0.593750, diff =  0.000000
-    2  0.902344  0.902344, diff =  0.000000
-    3 -0.632812 -0.632812, diff =  0.000000
-    4  0.464844  0.464844, diff =  0.000000
-    5  0.558594  0.558594, diff =  0.000000
-    6  0.197266  0.197266, diff =  0.000000
-    7  0.193359  0.193359, diff =  0.000000
-    8 -0.687500 -0.687500, diff =  0.000000
-    9 -0.108398 -0.108398, diff =  0.000000
-   10 -0.687500 -0.687500, diff =  0.000000
-   11 -0.800781 -0.800781, diff =  0.000000
-   12 -0.882812 -0.882812, diff =  0.000000
-   13 -0.081543 -0.081543, diff =  0.000000
-   14  0.730469  0.730469, diff =  0.000000
-   15 -0.332031 -0.332031, diff =  0.000000
-
-
-Content of tensor sent_1:
-backend: Metalium, CPU    0  0.726562  0.726562, diff =  0.000000
-    1  0.699219  0.699219, diff =  0.000000
-    2  0.247070  0.247070, diff =  0.000000
-    3 -0.101074 -0.101074, diff =  0.000000
-    4 -0.337891 -0.337891, diff =  0.000000
-    5 -0.808594 -0.808594, diff =  0.000000
-    6 -0.871094 -0.871094, diff =  0.000000
-    7 -0.257812 -0.257812, diff =  0.000000
-    8 -0.378906 -0.378906, diff =  0.000000
-    9  0.337891  0.337891, diff =  0.000000
-   10 -0.349609 -0.349609, diff =  0.000000
-   11  0.332031  0.332031, diff =  0.000000
-   12  0.458984  0.458984, diff =  0.000000
-   13  0.182617  0.182617, diff =  0.000000
-   14  0.275391  0.275391, diff =  0.000000
-   15 -0.451172 -0.451172, diff =  0.000000
-```

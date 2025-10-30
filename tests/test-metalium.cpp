@@ -721,6 +721,18 @@ void add_unittests(std::vector<std::unique_ptr<test_case>>& tests)
     //     ggml_tensor * in = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n, m, be1, be2);
     //     ggml_tensor * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, r, be1, be2);
     //     ggml_tensor * out = ggml_get_rows(ctx, in, rows);
+    //
+    // // DITTO
+    // tests.push_back(make_test([](ggml_context* ctx) {
+    //     ggml_tensor * dst = ggml_new_tensor_4d(ctx, GGML_TYPE_BF16, 32, 200, 1, 1);
+
+    //     ggml_tensor * src = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 1, 1, 1);
+    //     ggml_tensor * idx = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1);
+
+    //     ggml_tensor * out = ggml_set_rows(ctx, dst, src, idx);
+
+    //     return out;
+    // }, "test MM", 1e-5));
 
     //     return out;
     // }, "Simple GET_ROWS", 1e-5));
@@ -777,15 +789,9 @@ int main(int argc, char ** argv)
     ///////////////// put experiment code here /////////////////
     // easier on the eye to find it (also one line to disable UT)
     tests.push_back(make_test([](ggml_context* ctx) {
-        ggml_tensor * in = ggml_new_tensor_4d(ctx, GGML_TYPE_BF16, 2, 2, 3, 4);
-        ggml_set_name(in, "src");
-
-        ggml_tensor * dst = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 2, 2, 3, 4);
-        ggml_set_name(dst, "dst");
-
-        ggml_tensor * out = ggml_cpy(ctx, in, dst);
-
-        return out;
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 64);
+        ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 128);
+        return ggml_mul_mat(ctx, a, b);
     }, "test MM", 1e-5));
     ///////////////// end of experiment code /////////////////
 

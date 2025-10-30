@@ -62,12 +62,12 @@
 #include <ttnn/operations/data_movement/reshape_view/reshape.hpp>
 #include <ttnn/operations/reduction/generic/generic_reductions.hpp>
 #include <ttnn/cpp/ttnn/operations/data_movement/gather/tosa/gather_tosa.hpp>
+#include <ttnn/cpp/ttnn/operations/data_movement/scatter/tosa_scatter.hpp>
 #include <ttnn/cpp/ttnn/operations/transformer/sdpa_decode/sdpa_decode.hpp>
 
 
 #include <memory>
 #include <type_traits>
-#include <unordered_map>
 #include <vector>
 
 #include "rope.hpp"
@@ -1316,6 +1316,85 @@ static void ggml_backend_metalium_get_rows(ggml_backend_metalium_context * ctx, 
         gathered = gathered.reshape(gathered.logical_shape().to_rank(4));
         *dst_meta = {
             .tensor = std::make_shared<ttnn::Tensor>(gathered)
+        };
+    }
+}
+
+static bool ggml_backend_metalium_can_set_rows(const struct ggml_tensor * dst)
+{
+    // result->src[0] = b; // src
+    // result->src[1] = c; // idx
+    // result->src[2] = a; // dst // note: order is weird due to legacy reasons (https://github.com/ggml-org/llama.cpp/pull/16063#discussion_r2385795931)
+    fmt::println("Test");
+    const ggml_tensor *idxs = dst->src[1];
+    // effectivly no-op
+    if(idxs->ne[0] == 1 && idxs->ne[1] == 1 && idxs->ne[2] == 1 && idxs->ne[3] == 1 && ggml_n_dims(dst->src[0]) == 1) {
+        return true;
+    }
+
+    const ggml_tensor* src = dst->src[0];
+    if(is_integer_type(src->type)) {
+        return false;
+    }
+
+    // FIXME: TTNN running into issues with large tensor....?
+    if(idxs->ne[0] > 256) {
+        return false;
+    }
+
+    // FIXME: Doesn't seem to be working correctly when batched
+    if(src->ne[2] != 1 || src->ne[3] != 1) {
+        return false;
+    }
+
+    if(idxs->ne[2] == 1 && src->ne[3] == 1 && !is_view(idxs)) {
+        return true;
+    }
+
+    return false;
+}
+
+static void ggml_backend_metalium_set_rows(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
+{
+    GGML_UNUSED(ctx);
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+    // GGML_METALIUM_OP_SRC1_SANITY_CHECK(dst);
+
+    ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
+    ggml_tensor_extra_metalium* real_dst_meta = (ggml_tensor_extra_metalium*)dst->src[2]->extra;
+    ggml_tensor_extra_metalium* idx_meta = (ggml_tensor_extra_metalium*)dst->src[1]->extra;
+
+    auto real_dst = realize_ggml_view(dst->src[2]);
+    auto src = realize_ggml_view(dst->src[0]);
+    auto idx = idx_meta->tensor;
+    const ggml_tensor *idxs = dst->src[1];
+
+    fmt::println("ggml_backend_metalium_set_rows");
+    if(idxs->ne[0] == 1 && idxs->ne[1] == 1 && idxs->ne[2] == 1 && idxs->ne[3] == 1 && ggml_n_dims(dst->src[2]) == 1) {
+        fmt::println("fast_path");
+        *dst_meta = {
+            .tensor = src,
+        };
+        *real_dst_meta = {
+            .tensor = src,
+        };
+    }
+    else {
+        ggml_tensor_extra_metalium* idx_meta = (ggml_tensor_extra_metalium*)idxs->extra;
+        GGML_ASSERT(idx_meta != nullptr);
+        // The operation wants 3D tensor but we have 4D, op also wants index be 2d
+        auto src3d = src->reshape(src->logical_shape().to_rank(3));
+        auto idx2d = idx_meta->tensor->reshape(idx_meta->tensor->logical_shape().to_rank(2));
+        auto real_dst3d = real_dst->reshape(real_dst->logical_shape().to_rank(3));
+        ttnn::Tensor res = ttnn::tosa_scatter(real_dst3d, ttnn::tilize_with_zero_padding(idx2d), src3d, std::nullopt);
+        fmt::println("res: {}", res.logical_shape());
+        res = res.reshape(res.logical_shape().to_rank(4));
+        *dst_meta = {
+            .tensor = std::make_shared<ttnn::Tensor>(res),
+        };
+        *real_dst_meta = {
+            .tensor = std::make_shared<ttnn::Tensor>(res),
         };
     }
 }
@@ -2624,6 +2703,10 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
                 ggml_backend_metalium_flash_attn(ctx, node);
                 break;
 
+            case GGML_OP_SET_ROWS:
+                ggml_backend_metalium_set_rows(ctx, node);
+                break;
+
             case GGML_OP_NONE:
                 break;
 
@@ -2779,8 +2862,6 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
-            return tensor_supported(src1) && numpy_broadcast_rule(src0, src1);
-        // DIV does not support broadcasting on TTNN
         case GGML_OP_DIV:
             return tensor_supported(src1) && numpy_broadcast_rule(src0, src1);
 
@@ -2804,6 +2885,8 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
             return tensor_supported(src1) && ggml_backend_metalium_can_rope(op);
         case GGML_OP_FLASH_ATTN_EXT:
             return tensor_supported(src1) && tensor_supported(op->src[2]) && ggml_backend_metalium_can_flash_attn(op);
+        case GGML_OP_SET_ROWS:
+            return tensor_supported(src1) && ggml_backend_metalium_can_set_rows(op);
         default:
             return false;
     }

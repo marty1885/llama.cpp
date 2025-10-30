@@ -1325,7 +1325,6 @@ static bool ggml_backend_metalium_can_set_rows(const struct ggml_tensor * dst)
     // result->src[0] = src
     // result->src[1] = idx
     // result->src[2] = dst
-    fmt::println("Test");
     const ggml_tensor *idxs = dst->src[1];
     // effectivly no-op
     if(idxs->ne[0] == 1 && idxs->ne[1] == 1 && idxs->ne[2] == 1 && idxs->ne[3] == 1 && ggml_n_dims(dst->src[0]) == 1) {
@@ -1342,11 +1341,6 @@ static bool ggml_backend_metalium_can_set_rows(const struct ggml_tensor * dst)
         return false;
     }
 
-    // FIXME: Doesn't seem to be working correctly when batched
-    if(src->ne[2] != 1 || src->ne[3] != 1) {
-        return false;
-    }
-
     if(idxs->ne[2] == 1 && src->ne[3] == 1 && !is_view(idxs)) {
         return true;
     }
@@ -1359,7 +1353,7 @@ static void ggml_backend_metalium_set_rows(ggml_backend_metalium_context * ctx, 
     GGML_UNUSED(ctx);
     GGML_METALIUM_OP_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
-    GGML_METALIUM_OP_SRC1_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC_SANITY_CHECK(dst, 2);
 
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
     ggml_tensor_extra_metalium* real_dst_meta = (ggml_tensor_extra_metalium*)dst->src[2]->extra;

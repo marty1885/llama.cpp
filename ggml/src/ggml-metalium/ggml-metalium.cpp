@@ -1336,11 +1336,6 @@ static bool ggml_backend_metalium_can_set_rows(const struct ggml_tensor * dst)
         return false;
     }
 
-    // FIXME: TTNN running into issues with large tensor....?
-    if(idxs->ne[0] > 256) {
-        return false;
-    }
-
     if(idxs->ne[2] == 1 && src->ne[3] == 1 && !is_view(idxs)) {
         return true;
     }
@@ -2196,9 +2191,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     // 2. Create a TT tensor from the flat buffer as ROW_MAJOR. Send it to the device and tile it
     // 3. If the data is quantized, cast down to BFLOAT8_B or BFLOAT4_B
     // There's a lot of things to do here.
-    // TODO: Currently FP32 is hard coded to convert to BFLOAT16. Use FP32 when the hardware supports it
     // TODO: Make a scalable way to decide which GGML type casts to TT quantized types
-    // TODO: Use the simpler tilize() when the final 2 dimensions are both multiples of 32
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(tensor->extra != NULL);
 

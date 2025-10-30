@@ -11,7 +11,6 @@
 #include "tt-metalium/host_buffer.hpp"
 #include "tt-metalium/memory_pin.hpp"
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
-#include "ttnn/operations/data_movement/stack/stack.hpp"
 #include "ttnn/operations/eltwise/binary/binary.hpp"
 #include "ttnn/operations/eltwise/binary/binary_composite.hpp"
 #include "ttnn/operations/eltwise/unary/unary.hpp"
@@ -1322,9 +1321,10 @@ static void ggml_backend_metalium_get_rows(ggml_backend_metalium_context * ctx, 
 
 static bool ggml_backend_metalium_can_set_rows(const struct ggml_tensor * dst)
 {
-    // result->src[0] = b; // src
-    // result->src[1] = c; // idx
-    // result->src[2] = a; // dst // note: order is weird due to legacy reasons (https://github.com/ggml-org/llama.cpp/pull/16063#discussion_r2385795931)
+    // GGML has a weird order
+    // result->src[0] = src
+    // result->src[1] = idx
+    // result->src[2] = dst
     fmt::println("Test");
     const ggml_tensor *idxs = dst->src[1];
     // effectivly no-op
@@ -1359,7 +1359,7 @@ static void ggml_backend_metalium_set_rows(ggml_backend_metalium_context * ctx, 
     GGML_UNUSED(ctx);
     GGML_METALIUM_OP_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
-    // GGML_METALIUM_OP_SRC1_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC1_SANITY_CHECK(dst);
 
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
     ggml_tensor_extra_metalium* real_dst_meta = (ggml_tensor_extra_metalium*)dst->src[2]->extra;
@@ -1370,9 +1370,8 @@ static void ggml_backend_metalium_set_rows(ggml_backend_metalium_context * ctx, 
     auto idx = idx_meta->tensor;
     const ggml_tensor *idxs = dst->src[1];
 
-    fmt::println("ggml_backend_metalium_set_rows");
+    // Setting on a 1 row tensor is guarenteed to just be a replacment
     if(idxs->ne[0] == 1 && idxs->ne[1] == 1 && idxs->ne[2] == 1 && idxs->ne[3] == 1 && ggml_n_dims(dst->src[2]) == 1) {
-        fmt::println("fast_path");
         *dst_meta = {
             .tensor = src,
         };

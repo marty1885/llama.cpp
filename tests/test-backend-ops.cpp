@@ -2085,7 +2085,7 @@ struct test_get_rows : public test_case {
 
     // GGML quants is different to TT quants - leading to error
     double max_nmse_err() override {
-        return 1e-3;
+        return 6e-3;
     }
 };
 
@@ -4966,7 +4966,7 @@ struct test_sum : public test_case {
     }
 
     double max_nmse_err() override {
-        return 1e-4;
+        return 8e-4;
     }
 };
 

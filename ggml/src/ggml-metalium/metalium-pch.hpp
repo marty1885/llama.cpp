@@ -1,5 +1,6 @@
 #include <unistd.h>
 #ifdef __cplusplus
+#include "fmt/base.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -7,16 +8,26 @@
 #include "ggml-cpu.h"
 #include "ggml-metalium.h"
 
+#include "hostdevcommon/common_values.hpp"
+#include "tt-metalium/bfloat16.hpp"
 #include "tt-metalium/host_buffer.hpp"
+#include "tt-metalium/memory_pin.hpp"
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
+#include "ttnn/operations/eltwise/binary/binary.hpp"
 #include "ttnn/operations/eltwise/binary/binary_composite.hpp"
 #include "ttnn/operations/eltwise/unary/unary.hpp"
 #include "ttnn/operations/moreh/moreh_group_norm/moreh_group_norm.hpp"
+#include "ttnn/tensor/layout/layout.hpp"
 #include "ttnn/tensor/shape/shape.hpp"
 #include "ttnn/tensor/storage.hpp"
 #include "ttnn/tensor/tensor.hpp"
 #include "ttnn/tensor/types.hpp"
+#include "ttnn/types.hpp"
 #include "types/arch.hpp"
+#include "umd/device/types/arch.hpp"
+#include "umd/device/types/cluster_descriptor_types.hpp"
+#include <string.h>
+#include <sys/types.h>
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -51,11 +62,12 @@
 #include <tt-metalium/persistent_kernel_cache.hpp>
 #include <ttnn/operations/data_movement/reshape_view/reshape.hpp>
 #include <ttnn/operations/reduction/generic/generic_reductions.hpp>
+#include <ttnn/cpp/ttnn/operations/data_movement/gather/tosa/gather_tosa.hpp>
+#include <ttnn/cpp/ttnn/operations/data_movement/scatter/tosa_scatter.hpp>
+#include <ttnn/cpp/ttnn/operations/transformer/sdpa_decode/sdpa_decode.hpp>
 
 
 #include <memory>
 #include <type_traits>
-#include <unordered_map>
-#include <variant>
 #include <vector>
 #endif

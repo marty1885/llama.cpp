@@ -135,8 +135,9 @@ Besides the standard FP32 and BFP16 floating point support. Tenstorrent processo
 | GGML_TYPE_Q4_0_8_8    | Unsupported                |
 | GGML_TYPE_TQ1_0       | Unsupported                |
 | GGML_TYPE_TQ2_0       | Unsupported                |
+| GGML_TYPE_MXFP4       | BFLOAT4_B                  |
 
-* All BFLOAT4_B types used to work but is emulated with BFLOAT8_B until upstream bug is fixed
+* Most BFLOAT4_B types used to work but is emulated with BFLOAT8_B until upstream bug is fixed
 
 ## Environment Variable
 
@@ -176,7 +177,7 @@ There are several debug flags available to assist with debugging/performance of 
 |GGML_METALIUM_DISABLE_PROGRAM_CACHE| 0(default) or 1 | Disables TTNN program cacheing                                                                                                                                           |
 | GGML_METALIUM_EXPERIMENTAL_OPS    | 0(default) or 1 | Enables experimental ops that is known to cause trouble                                                                                                                  |
 
-## Know issues
+## Known issues
 
 - The backend cannot exit without leaking some memory (gets handled by OS) due to destruction order issues.
 

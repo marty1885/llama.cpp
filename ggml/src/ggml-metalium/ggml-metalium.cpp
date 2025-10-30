@@ -1633,10 +1633,8 @@ static void ggml_backend_metalium_arange(ggml_backend_metalium_context * ctx, st
         GGML_ASSERT(false && "Unsupported GGML type");
     }
 
-    // TODO: Request TT to support arange directly on the device
-    auto tensor = ttnn::arange(start, end, step, dtype);
-    tensor = ttnn::reshape(tensor, ttnn::Shape{1, 1, 1, (uint32_t)(end - start)});
-    tensor = ttnn::tilize_with_zero_padding(tensor.to_device(device));
+    auto tensor = ttnn::arange(start, end, step, dtype, *device, ttnn::DRAM_MEMORY_CONFIG, ttnn::TILE_LAYOUT);
+    tensor = tensor.reshape(tensor.logical_shape().to_rank(4));
     *dst_meta = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(tensor)),
     };

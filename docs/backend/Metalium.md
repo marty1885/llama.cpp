@@ -95,7 +95,7 @@ The following hardware are tested.
 | Wormhole N300                 | Tested  |
 | Wormhole QuietBox             | Tested  |
 
-## DataType Supports
+## Data Type Supports
 
 Besides the standard FP32 and BFP16 floating point support. Tenstorrent processors support their own native quantized data types (BFLOAT8_B, BFLOAT4_B, etc.). Thus, weights and activations are automatically converted to supported native types. The conversion is as follows:
 
@@ -103,15 +103,15 @@ Besides the standard FP32 and BFP16 floating point support. Tenstorrent processo
 |-----------------------|----------------------------|
 | GGML_TYPE_F32         | BFLOAT16                   |
 | GGML_TYPE_F16         | BFLOAT16                   |
-| GGML_TYPE_Q4_0        | BFLOAT4_B*                 |
-| GGML_TYPE_Q4_1        | BFLOAT4_B*                 |
+| GGML_TYPE_Q4_0        | BFLOAT8_B*                 |
+| GGML_TYPE_Q4_1        | BFLOAT8_B*                 |
 | GGML_TYPE_Q5_0        | BFLOAT8_B                  |
 | GGML_TYPE_Q5_1        | BFLOAT8_B                  |
 | GGML_TYPE_Q8_0        | BFLOAT8_B                  |
 | GGML_TYPE_Q8_1        | BFLOAT8_B                  |
 | GGML_TYPE_Q2_K        | Unsupported                |
-| GGML_TYPE_Q3_K        | BFLOAT4_B*                 |
-| GGML_TYPE_Q4_K        | BFLOAT4_B*                 |
+| GGML_TYPE_Q3_K        | BFLOAT4_B                  |
+| GGML_TYPE_Q4_K        | BFLOAT4_B                  |
 | GGML_TYPE_Q5_K        | BFLOAT8_B                  |
 | GGML_TYPE_Q6_K        | BFLOAT8_B                  |
 | GGML_TYPE_Q8_K        | BFLOAT8_B                  |
@@ -125,7 +125,7 @@ Besides the standard FP32 and BFP16 floating point support. Tenstorrent processo
 | GGML_TYPE_IQ4_XS      | Unsupported                |
 | GGML_TYPE_I8          | Unsupported                |
 | GGML_TYPE_I16         | Unsupported                |
-| GGML_TYPE_I32         | INT32                      |
+| GGML_TYPE_I32         | UINT32                     |
 | GGML_TYPE_I64         | Unsupported                |
 | GGML_TYPE_F64         | Unsupported                |
 | GGML_TYPE_IQ1_M       | Unsupported                |
@@ -135,9 +135,12 @@ Besides the standard FP32 and BFP16 floating point support. Tenstorrent processo
 | GGML_TYPE_Q4_0_8_8    | Unsupported                |
 | GGML_TYPE_TQ1_0       | Unsupported                |
 | GGML_TYPE_TQ2_0       | Unsupported                |
+| GGML_TYPE_IQ4_NL_4_4  | Unsupported                |
+| GGML_TYPE_IQ4_NL_4_8  | Unsupported                |
+| GGML_TYPE_IQ4_NL_8_8  | Unsupported                |
 | GGML_TYPE_MXFP4       | BFLOAT4_B                  |
 
-* Most BFLOAT4_B types used to work but is emulated with BFLOAT8_B until upstream bug is fixed
+`Q4_0` and `Q4_1` are set to BFLOAT8 due to numerical precision issues. It is adviced to use Q4_K_* for better performance.
 
 ## Environment Variable
 

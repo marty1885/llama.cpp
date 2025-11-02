@@ -240,43 +240,46 @@ static tt::tt_metal::DataType ggml2tt_type_internal(ggml_type ggtype, tt::ARCH a
     // This table is consulted to map GGML types to TT types dueing tensor creation
     if(arch == tt::ARCH::WORMHOLE_B0) {
         static constexpr std::array<tt::tt_metal::DataType, GGML_TYPE_COUNT> table = {
-            /*GGML_TYPE_F32 = */ tt::tt_metal::DataType::BFLOAT16,
-            /*GGML_TYPE_F16 = */ tt::tt_metal::DataType::BFLOAT16,
-            /*GGML_TYPE_Q4_0 = */ tt::tt_metal::DataType::BFLOAT8_B,
-            /*GGML_TYPE_Q4_1 = */ tt::tt_metal::DataType::BFLOAT8_B,
+            /*GGML_TYPE_F32        = */ tt::tt_metal::DataType::BFLOAT16,
+            /*GGML_TYPE_F16        = */ tt::tt_metal::DataType::BFLOAT16,
+            /*GGML_TYPE_Q4_0       = */ tt::tt_metal::DataType::BFLOAT8_B,
+            /*GGML_TYPE_Q4_1       = */ tt::tt_metal::DataType::BFLOAT8_B,
             tt::tt_metal::DataType::INVALID,
             tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_Q5_0 = */ tt::tt_metal::DataType::BFLOAT8_B,
-            /*GGML_TYPE_Q5_1 = */ tt::tt_metal::DataType::BFLOAT8_B,
-            /*GGML_TYPE_Q8_0 = */ tt::tt_metal::DataType::BFLOAT8_B,
-            /*GGML_TYPE_Q8_1 = */ tt::tt_metal::DataType::BFLOAT8_B,
-            /*GGML_TYPE_Q2_K = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_Q3_K = */ tt::tt_metal::DataType::BFLOAT8_B,
-            /*GGML_TYPE_Q4_K = */ tt::tt_metal::DataType::BFLOAT8_B,
-            /*GGML_TYPE_Q5_K = */ tt::tt_metal::DataType::BFLOAT8_B,
-            /*GGML_TYPE_Q6_K = */ tt::tt_metal::DataType::BFLOAT8_B,
-            /*GGML_TYPE_Q8_K = */ tt::tt_metal::DataType::BFLOAT8_B,
-            /*GGML_TYPE_IQ2_XXS = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_IQ2_XS = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_IQ3_XXS = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_IQ1_S = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_IQ4_NL = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_IQ3_S = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_IQ2_S = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_IQ4_XS = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_I8 = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_I16 = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_I32 = */ tt::tt_metal::DataType::UINT32, // Yeah not ideal. but don't have support for tilizing int32 on device
-            /*GGML_TYPE_I64 = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_F64 = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_IQ1_M = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_BF16 = */ tt::tt_metal::DataType::BFLOAT16,
-            /*GGML_TYPE_Q4_0_4_4 = */ tt::tt_metal::DataType::INVALID, // Untested from this point on
-            /*GGML_TYPE_Q4_0_4_8 = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_Q4_0_8_8 = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_TQ1_0   = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_TQ2_0   = */ tt::tt_metal::DataType::INVALID,
-            /*GGML_TYPE_MXFP4   =  */ tt::tt_metal::DataType::BFLOAT4_B,
+            /*GGML_TYPE_Q5_0       = */ tt::tt_metal::DataType::BFLOAT8_B,
+            /*GGML_TYPE_Q5_1       = */ tt::tt_metal::DataType::BFLOAT8_B,
+            /*GGML_TYPE_Q8_0       = */ tt::tt_metal::DataType::BFLOAT8_B,
+            /*GGML_TYPE_Q8_1       = */ tt::tt_metal::DataType::BFLOAT8_B,
+            /*GGML_TYPE_Q2_K       = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_Q3_K       = */ tt::tt_metal::DataType::BFLOAT4_B,
+            /*GGML_TYPE_Q4_K       = */ tt::tt_metal::DataType::BFLOAT4_B,
+            /*GGML_TYPE_Q5_K       = */ tt::tt_metal::DataType::BFLOAT8_B,
+            /*GGML_TYPE_Q6_K       = */ tt::tt_metal::DataType::BFLOAT8_B,
+            /*GGML_TYPE_Q8_K       = */ tt::tt_metal::DataType::BFLOAT8_B,
+            /*GGML_TYPE_IQ2_XXS    = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_IQ2_XS     = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_IQ3_XXS    = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_IQ1_S      = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_IQ4_NL     = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_IQ3_S      = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_IQ2_S      = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_IQ4_XS     = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_I8         = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_I16        = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_I32        = */ tt::tt_metal::DataType::UINT32, // Yeah not ideal. but don't have support for tilizing int32 on device
+            /*GGML_TYPE_I64        = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_F64        = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_IQ1_M      = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_BF16       = */ tt::tt_metal::DataType::BFLOAT16,
+            /*GGML_TYPE_Q4_0_4_4   = */ tt::tt_metal::DataType::INVALID, // Support removed from GGML
+            /*GGML_TYPE_Q4_0_4_8   = */ tt::tt_metal::DataType::INVALID, // Support removed from GGML
+            /*GGML_TYPE_Q4_0_8_8   = */ tt::tt_metal::DataType::INVALID, // Support removed from GGML
+            /*GGML_TYPE_TQ1_0      = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_TQ2_0      = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_IQ4_NL_4_4 = */ tt::tt_metal::DataType::INVALID, // Support removed from GGML
+            /*GGML_TYPE_IQ4_NL_4_8 = */ tt::tt_metal::DataType::INVALID, // Support removed from GGML
+            /*GGML_TYPE_IQ4_NL_8_8 = */ tt::tt_metal::DataType::INVALID, // Support removed from GGML
+            /*GGML_TYPE_MXFP4      = */ tt::tt_metal::DataType::BFLOAT4_B,
         };
         // safeguard against OOB read from outdated table
         if(ggtype >= table.size()) {
@@ -919,8 +922,13 @@ static bool ggml_backend_metalium_can_mul_mat(const struct ggml_tensor * dst)
     }
 
     // Our own slow implementation
-    return src0->ne[0] == src1->ne[0] && src1->ne[2] % src0->ne[2] == 0 && src1->ne[3] % src0->ne[3] == 0
-        && src1->ne[2] != 0 && src1->ne[3] != 0;
+    if(!(src0->ne[0] == src1->ne[0] && src1->ne[2] % src0->ne[2] == 0 && src1->ne[3] % src0->ne[3] == 0
+                && src1->ne[2] != 0 && src1->ne[3] != 0)) {
+        return false;
+    }
+
+    // we will perform a transpose which is not supported on quantized types for now
+    return (!is_view(src0) || !ggml_is_quantized(src0->type)) && (!is_view(src1) || !ggml_is_quantized(src1->type));
 }
 
 static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {

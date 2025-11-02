@@ -789,8 +789,8 @@ int main(int argc, char ** argv)
     ///////////////// put experiment code here /////////////////
     // easier on the eye to find it (also one line to disable UT)
     tests.push_back(make_test([](ggml_context* ctx) {
-        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 64);
-        ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 128);
+        ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 1, 16);
+        ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1);
         return ggml_mul_mat(ctx, a, b);
     }, "test MM", 1e-5));
     ///////////////// end of experiment code /////////////////

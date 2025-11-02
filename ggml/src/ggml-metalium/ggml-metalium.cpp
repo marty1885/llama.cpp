@@ -278,6 +278,10 @@ static tt::tt_metal::DataType ggml2tt_type_internal(ggml_type ggtype, tt::ARCH a
             /*GGML_TYPE_TQ2_0   = */ tt::tt_metal::DataType::INVALID,
             /*GGML_TYPE_MXFP4   =  */ tt::tt_metal::DataType::BFLOAT4_B,
         };
+        // safeguard against OOB read from outdated table
+        if(ggtype >= table.size()) {
+            return tt::tt_metal::DataType::INVALID;
+        }
         tt::tt_metal::DataType type = table[ggtype];
         return type;
     }
@@ -931,8 +935,9 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     const struct ggml_tensor * src1 = dst->src[1];
     bool can_be_processed_by_ttnn = src0->ne[0] == src1->ne[0] && src0->ne[2] == 1 && src1->ne[2] == 1 &&
         (src0->ne[3] == src1->ne[3] || src0->ne[3] == 1);
+    bool awkward_gemv = src1->ne[0] == 1; // HACK: the custom MUL_MAT kernel needs to have masking support
 
-    if(can_be_processed_by_ttnn && g_debug_flags.cache_mm_transpose) {
+    if(can_be_processed_by_ttnn && (g_debug_flags.cache_mm_transpose || awkward_gemv)) {
         GGML_TENSOR_BINARY_OP_LOCALS
 
         const enum ggml_type type = src0->type;

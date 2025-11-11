@@ -32,7 +32,7 @@ The llama.cpp Metalium backend is designed to enable inference on Tenstorrent's 
 As mentioned, the Metalium backend is experimental software. Thus features will be developed and enabled over time. As of writing the documentation, the following limitations applies:
 
 * Only one device is exposed at a time
-    * Multi device scaling is handled using TTNN's native scaling
+    * Multi device scaling is handled using TTNN's native scaling (to be implemented)
     * See the `GGML_METALIUM_DEVICE_ID` and `GGML_METALIUM_MESH_SHAPE` environment variables below
 * KV Cache has to be stored on the CPU (via the `-nkvo` flag)
 * FP32 tenssors is emulated by internally using BFP16 (The matrix unit does not support FP32 natively, which is the bulk of compute, though the vector unit does support FP32)

@@ -71,6 +71,7 @@
 
 #include "rope.hpp"
 #include "mul_mat.hpp"
+#include "soft_max.hpp"
 
 extern void metalium_register_all_kernel();
 
@@ -1527,8 +1528,12 @@ static void ggml_backend_metalium_concat(ggml_backend_metalium_context * ctx, st
 
 static bool ggml_backend_metalium_can_softmax(const struct ggml_tensor * dst)
 {
-    GGML_UNUSED(dst);
-    return true;
+    // GGML_UNUSED(dst);
+    // return true;
+    std::array<float, 2> params;
+    memcpy(&params, dst->op_params, sizeof(params));
+    auto [scale, max_bias] = params;
+    return scale == 1.f && max_bias == 0.f && dst->src[1] == NULL;
 }
 
 static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
@@ -1538,7 +1543,10 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
 
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
-
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttggml::soft_max(*realize_ggml_view(dst->src[0])))
+    };
+#if 0
     std::array<float, 2> params;
     memcpy(&params, dst->op_params, sizeof(params));
     auto [scale, max_bias] = params;
@@ -1583,6 +1591,7 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
     *dst_meta = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(x)),
     };
+#endif
 }
 
 static void ggml_backend_metalium_cos(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)

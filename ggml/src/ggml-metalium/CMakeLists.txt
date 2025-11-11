@@ -9,6 +9,7 @@ ggml_add_backend_library(ggml-metalium
     utils.cpp
     rope.cpp
     mul_mat.cpp
+    soft_max.cpp
 )
 
 target_include_directories(ggml-metalium PRIVATE
@@ -66,6 +67,9 @@ if(GGML_METALIUM_EMBED_KERNELS)
             mul_mat_reader
             mul_mat_compute
             mul_mat_writer
+            soft_max_reader
+            soft_max_writer
+            soft_max_compute
     )
     include(cmake/add_kernel.cmake)
     foreach(kernel IN ITEMS ${GGML_METALIUM_EMBED_KERNELS})

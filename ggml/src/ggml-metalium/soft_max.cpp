@@ -106,12 +106,19 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
         work_per_core2] =
         tt::tt_metal::split_work_to_cores(core_grid, height_tiles);
 
+    // We'll deal with it later
+    TT_FATAL(a_tensor.dtype() == tt::tt_metal::DataType::BFLOAT16, "Unsupported data type");
+    TT_FATAL(o_tensor.dtype() == tt::tt_metal::DataType::BFLOAT16, "Unsupported data type");
+
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_0, 2, a_tensor.dtype()); // cb_in0
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_16, 2, o_tensor.dtype()); // cb_out
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_24, 1, tt::tt_metal::DataType::BFLOAT16); // cb_const1
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_25, 1, tt::tt_metal::DataType::BFLOAT16); // cb_sum
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_26, 1, tt::tt_metal::DataType::BFLOAT16); // cb_max
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_27, 1, tt::tt_metal::DataType::BFLOAT16); // cb_tmp
+    MakeCircularBuffer(program, all_cores, tt::CBIndex::c_28, 1, tt::tt_metal::DataType::BFLOAT16); // cb_global_max
+    MakeCircularBuffer(program, all_cores, tt::CBIndex::c_29, 1, tt::tt_metal::DataType::BFLOAT16); // cb_global_sum
+    MakeCircularBuffer(program, all_cores, tt::CBIndex::c_30, 1, tt::tt_metal::DataType::BFLOAT16); // cb_tmp2
 
 
     std::vector<uint32_t> reader_compile_time_args;

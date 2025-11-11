@@ -12,6 +12,7 @@
 #include "compute_kernel_api/reduce.h"
 #include "compute_kernel_api/bcast.h"
 #include "compute_kernel_api/eltwise_binary_sfpu.h"
+#include "compute_kernel_api/eltwise_binary.h"
 
 #include <debug/dprint_tensix.h>
 
@@ -96,6 +97,7 @@ void MAIN {
     constexpr uint32_t cb_global_sum = tt::CBIndex::c_29;
     constexpr uint32_t cb_tmp2 = tt::CBIndex::c_30;
     init_sfpu(cb_in0, cb_out0);
+    binary_op_init_common(cb_in0, cb_const1, cb_out0);
 
     // setup
     {
@@ -149,6 +151,8 @@ void MAIN {
             tile_regs_release();
             cb_push_back(cb_tmp, 1);
 
+            // 1. expand the reduced max back into a full tile
+            // 2. Compute s_vec * exp(m_vec - m_global)
             tile_regs_acquire();
             cb_wait_front(cb_tmp, 1);
             cb_wait_front(cb_sum, 1);
@@ -172,6 +176,7 @@ void MAIN {
             cb_push_back(cb_tmp2, 1);
             cb_pop_front(cb_tmp, 1);
 
+            // reduce s_vec * exp(m_vec - m_global) (computed from the previous step)
             tile_regs_acquire();
             cb_wait_front(cb_tmp2, 1);
             cb_reserve_back(cb_tmp, 1);
@@ -184,6 +189,7 @@ void MAIN {
             tile_regs_release();
             cb_push_back(cb_tmp, 1);
 
+            // Expand the result to match the original shape
             tile_regs_acquire();
             cb_wait_front(cb_tmp, 1);
             cb_reserve_back(cb_global_sum, 1);

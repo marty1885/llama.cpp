@@ -139,14 +139,16 @@ void MAIN {
             pack_tile(3, cb_tmp);
             pack_tile(1, cb_sum);
             tile_regs_release();
+
+            tile_regs_acquire();
             unary_bcast_init<BroadcastType::COL>(cb_tmp, cb_sum);
             unary_bcast<BroadcastType::COL>(cb_tmp, 0, 0);
             recip_tile_init();
             recip_tile(0);
-            tile_regs_acquire();
             tile_regs_commit();
-            pack_tile(0, cb_sum);
             tile_regs_wait();
+            pack_tile(0, cb_sum);
+            tile_regs_release();
         }
 
         for(uint32_t x = 0; x < width_tiles; ++x) {
@@ -158,6 +160,7 @@ void MAIN {
             copy_tile(cb_sum, 0, 1); // Tile 1 -> Sum (gobal inverse)
             copy_tile_init(cb_max);
             copy_tile(cb_max, 0, 2); // Tile 2 -> max (global)
+            cb_reserve_back(cb_out0, 1); // Output tile
 
             sub_binary_tile(0, 2, 3);
             exp_tile(3);
@@ -165,11 +168,12 @@ void MAIN {
 
             tile_regs_commit();
             tile_regs_wait();
-            cb_reserve_back(cb_out0, 1);
             pack_tile(0, cb_out0);
+            cb_pop_front(cb_in0, 1);
             tile_regs_release();
             cb_push_back(cb_out0, 1);
         }
     }
+
 }
 }  // namespace NAMESPACE

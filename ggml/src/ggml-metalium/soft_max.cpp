@@ -86,6 +86,8 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
     const uint32_t height = a_tensor.logical_shape()[-2];
     const uint32_t batch = a_tensor.logical_shape()[-3] * a_tensor.logical_shape()[-4];
 
+    std::cout << "Softmax: width=" << width << ", height=" << height << ", batch=" << batch << std::endl;
+
     // tt::tt_metal::IDevice* device = a_tensor.device();
     CoreCoord core_grid = CoreCoord(1, 1);
 
@@ -94,6 +96,7 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
 
     const uint32_t width_tiles = width / 32 + (width % 32 != 0);
     const uint32_t height_tiles = (height / 32 + (height % 32 != 0)) * batch;
+    std::cout << "Softmax: width_tiles = " << width_tiles << ", height_tiles = " << height_tiles << std::endl;
 
     auto [num_cores,
         all_cores,

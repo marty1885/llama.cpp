@@ -31,6 +31,4 @@ void kernel_main() {
             cb_push_back(cb_in0, 1);
         }
     }
-
-
 }

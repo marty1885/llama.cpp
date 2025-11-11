@@ -175,7 +175,8 @@ namespace NAMESPACE {
 void MAIN {
     uint32_t width = get_arg_val<uint32_t>(0);
     uint32_t height = get_arg_val<uint32_t>(1);
-    uint32_t batch_size = get_arg_val<uint32_t>(2);
+    uint32_t n_head = get_arg_val<uint32_t>(3);
+    uint32_t batch = get_arg_val<uint32_t>(4);
 
     const uint32_t width_tiles = (width + TILE_SIZE - 1) / TILE_SIZE;
     const uint32_t height_tiles = (height + TILE_SIZE - 1) / TILE_SIZE;
@@ -247,7 +248,7 @@ void MAIN {
     // MAIN COMPUTATION LOOP
     // ========================================================================
 
-    for(uint32_t b = 0; b < batch_size; ++b) {
+    for(uint32_t b = 0; b < n_head*batch; ++b) {
         for(uint32_t y = 0; y < height_tiles; ++y) {
 
             // ================================================================
@@ -326,6 +327,8 @@ void MAIN {
             cb_push_back(cb_global_max, 1);
             cb_push_back(cb_tmp2, 1);
             cb_pop_front(cb_tmp, 1);
+            cb_pop_front(cb_sum, 1);
+            cb_pop_front(cb_max, 1);
 
             // Step 2c: Reduce sum and compute reciprocal
             tile_regs_acquire();
@@ -355,8 +358,6 @@ void MAIN {
 
             cb_pop_front(cb_tmp, 1);
             cb_pop_front(cb_tmp2, 1);
-            cb_pop_front(cb_sum, 1);
-            cb_pop_front(cb_max, 1);
 
             // ================================================================
             // PHASE 3: Compute final softmax values

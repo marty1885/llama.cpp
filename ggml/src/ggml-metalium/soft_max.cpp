@@ -72,9 +72,17 @@ std::vector<ttnn::Tensor> SoftMaxDeviceOperation::create_output_tensors(
 
 void SoftMaxDeviceOperation::validate_with_output_tensors(
     const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const {
+        const auto& a_tensor = input_tensors.at(0);
         if(!output_tensors.empty() && output_tensors[0].has_value()) {
+            const auto& o_tensor = output_tensors[0].value();
             TT_FATAL(input_tensors.at(0).logical_shape() == output_tensors[0].value().logical_shape(), "Expect shape be same");
+            // XXX: We will deal with alternative data type support later
+            TT_FATAL(o_tensor.dtype() == tt::tt_metal::DataType::BFLOAT16, "Output data type must be BFLOAT16");
         }
+
+        // XXX: We will deal with alternative data type support later
+        TT_FATAL(a_tensor.dtype() == tt::tt_metal::DataType::BFLOAT16, "Input data type must be BFLOAT16");
+
 }
 
 tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_program(
@@ -86,7 +94,8 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
 
     const uint32_t width = a_tensor.logical_shape()[-1];
     const uint32_t height = a_tensor.logical_shape()[-2];
-    const uint32_t batch = a_tensor.logical_shape()[-3] * a_tensor.logical_shape()[-4];
+    const uint32_t n_head = a_tensor.logical_shape()[-3];
+    const uint32_t batch = a_tensor.logical_shape()[-4];
 
     // tt::tt_metal::IDevice* device = a_tensor.device();
     CoreCoord core_grid = CoreCoord(1, 1);
@@ -95,7 +104,7 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
     auto* o = o_tensor.buffer();
 
     const uint32_t width_tiles = width / 32 + (width % 32 != 0);
-    const uint32_t height_tiles = (height / 32 + (height % 32 != 0)) * batch;
+    const uint32_t height_tiles = (height / 32 + (height % 32 != 0));
 
     auto [num_cores,
         all_cores,
@@ -104,10 +113,6 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
         work_per_core1,
         work_per_core2] =
         tt::tt_metal::split_work_to_cores(core_grid, height_tiles);
-
-    // We'll deal with it later
-    TT_FATAL(a_tensor.dtype() == tt::tt_metal::DataType::BFLOAT16, "Unsupported data type");
-    TT_FATAL(o_tensor.dtype() == tt::tt_metal::DataType::BFLOAT16, "Unsupported data type");
 
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_0, 2, a_tensor.dtype()); // cb_in0
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_16, 2, o_tensor.dtype()); // cb_out
@@ -158,9 +163,9 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
         for(const auto& range : group.ranges()) {
             for(const auto& core : range) {
 
-                SetRuntimeArgs(program, reader, core, std::vector<uint32_t>{a->address(), width_tiles, height_tiles});
-                SetRuntimeArgs(program, compute, core, std::vector<uint32_t>{width, height, batch});
-                SetRuntimeArgs(program, writer, core, std::vector<uint32_t>{o->address(), width_tiles, height_tiles});
+                SetRuntimeArgs(program, reader, core, std::vector<uint32_t>{a->address(), width_tiles, height_tiles, n_head, batch});
+                SetRuntimeArgs(program, compute, core, std::vector<uint32_t>{width, height, batch, n_head, batch});
+                SetRuntimeArgs(program, writer, core, std::vector<uint32_t>{o->address(), width_tiles, height_tiles, n_head, batch});
             }
         }
     }

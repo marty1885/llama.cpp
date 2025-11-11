@@ -18,6 +18,7 @@ using namespace tt::tt_metal;
 struct SoftMaxDeviceOperation {
     const tt::tt_metal::MemoryConfig output_mem_config;
     const tt::tt_metal::DataType output_dtype{};
+    float scale = 1.f;
 
     void validate_with_output_tensors(
         const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
@@ -30,11 +31,12 @@ struct SoftMaxDeviceOperation {
         const std::vector<Tensor>& input_tensors, std::vector<Tensor>& output_tensors) const;
 };
 
-ttnn::Tensor ttggml::SoftMaxOperation::invoke(const Tensor& a) {
+ttnn::Tensor ttggml::SoftMaxOperation::invoke(const Tensor& a, float scale) {
     return tt::tt_metal::operation::run(
         SoftMaxDeviceOperation{
             a.memory_config(),
-            a.dtype()
+            a.dtype(),
+            scale
         },
         {a},
         {},
@@ -86,8 +88,6 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
     const uint32_t height = a_tensor.logical_shape()[-2];
     const uint32_t batch = a_tensor.logical_shape()[-3] * a_tensor.logical_shape()[-4];
 
-    std::cout << "Softmax: width=" << width << ", height=" << height << ", batch=" << batch << std::endl;
-
     // tt::tt_metal::IDevice* device = a_tensor.device();
     CoreCoord core_grid = CoreCoord(1, 1);
 
@@ -96,7 +96,6 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
 
     const uint32_t width_tiles = width / 32 + (width % 32 != 0);
     const uint32_t height_tiles = (height / 32 + (height % 32 != 0)) * batch;
-    std::cout << "Softmax: width_tiles = " << width_tiles << ", height_tiles = " << height_tiles << std::endl;
 
     auto [num_cores,
         all_cores,
@@ -142,11 +141,15 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
         .named_compile_args = {}
     });
 
+    std::map<std::string, std::string> defines;
+    if(scale != 1.f) {
+        defines["SCALE"] = to_string_precise(scale);
+    }
     KernelHandle compute = CreateMetaliumKernel(program, "soft_max_compute", all_cores, ComputeConfig{
         .fp32_dest_acc_en = true,
         .unpack_to_dest_mode = {},
         .compile_args = {},
-        .defines = {},
+        .defines = std::move(defines),
         .named_compile_args = {}
     });
 

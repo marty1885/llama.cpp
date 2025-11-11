@@ -25,15 +25,10 @@ using namespace ckernel::sfpu;
 void update_online_softmax_values_internal(const uint32_t dst_index_in0, const uint32_t dst_index_in1, const uint32_t dst_index_out) {
     constexpr uint32_t n_vector_in_tile = 32;
 
-    // Calculate base indices for each tile in the Dst register array.
-    // Each tile occupies 32 consecutive Dst registers (n_vector_in_tile) in WH and BH
-    // For example: tile 0 uses dst_reg[0-31], tile 1 uses dst_reg[32-63], etc.
     const uint32_t in_base_idx = dst_index_in0 * n_vector_in_tile;
     const uint32_t sum_base_idx = dst_index_in1 * n_vector_in_tile;
     const uint32_t max_base_idx = dst_index_out * n_vector_in_tile;
 
-    // Process one face of the tile (8 SIMD operations covering 256 elements).
-    // Each iteration processes 32 elements, so 8 iterations = 256 elements = one 16x16 face.
     for (size_t i = 0; i < 8; i++) {
         vFloat x = dst_reg[in_base_idx];
         vFloat sum = dst_reg[sum_base_idx];
@@ -52,6 +47,25 @@ void update_online_softmax_values_internal(const uint32_t dst_index_in0, const u
     }
 }
 
+void compute_result_for_online_softmax_internal(const uint32_t dst_index_in0, const uint32_t dst_index_in1, const uint32_t dst_index_out) {
+    constexpr uint32_t n_vector_in_tile = 32;
+
+    const uint32_t in_base_idx = dst_index_out * n_vector_in_tile;
+    const uint32_t sum_base_idx = dst_index_in0 * n_vector_in_tile;
+    const uint32_t max_base_idx = dst_index_in1 * n_vector_in_tile;
+
+    for (size_t i = 0; i < 8; i++) {
+        vFloat x = dst_reg[in_base_idx];
+        vFloat inv_sum = dst_reg[sum_base_idx];
+        vFloat x_max = dst_reg[max_base_idx];
+
+        vFloat res = _sfpu_exp_21f_<true>(x - x_max) * inv_sum;
+
+        dst_reg[in_base_idx] = res;
+        dst_reg++;
+    }
+}
+
 
 #endif
 
@@ -59,6 +73,12 @@ static void update_online_softmax_values() {
     // parameters not used - we alwasys put input on tile 0, sum on 1 and max on 2
     MATH(_llk_math_eltwise_binary_sfpu_params_<false>(update_online_softmax_values_internal, 0, 1, 2));
 }
+
+static void compute_result_for_online_softmax() {
+    // parameters not used - we alwasys put input on tile 0, sum on 1 and max on 2
+    MATH(_llk_math_eltwise_binary_sfpu_params_<false>(compute_result_for_online_softmax_internal, 1, 2, 0));
+}
+
 
 
 namespace NAMESPACE {
@@ -176,34 +196,31 @@ void MAIN {
             pack_tile(0, cb_global_sum);
             tile_regs_release();
             cb_push_back(cb_global_sum, 1);
-            cb_pop_front(cb_tmp, 0);
+            cb_pop_front(cb_tmp, 1);
+            cb_pop_front(cb_tmp2, 1);
         }
+        cb_pop_front(cb_sum, 1);
+        cb_pop_front(cb_max, 1);
 
+        cb_wait_front(cb_global_sum, 1);
+        cb_wait_front(cb_global_max, 1);
         for(uint32_t x = 0; x < width_tiles; ++x) {
             tile_regs_acquire();
             cb_wait_front(cb_in0, 1);
             copy_tile_init(cb_in0);
             copy_tile(cb_in0, 0, 0); // Tile 0 -> input
-            cb_wait_front(cb_global_sum, 1);
             copy_tile_init(cb_global_sum);
             copy_tile(cb_global_sum, 0, 1); // Tile 1 -> Sum (gobal inverse)
-            cb_wait_front(cb_global_max, 1);
             copy_tile_init(cb_global_max);
             copy_tile(cb_global_max, 0, 2); // Tile 2 -> max (global)
             cb_reserve_back(cb_out0, 1); // Output tile
 
 
-            // dprint_tensix_dest_reg(/*tile_id*/0);
-            // dprint_tensix_dest_reg(/*tile_id*/1);
-            // dprint_tensix_dest_reg(/*tile_id*/2);
+            dprint_tensix_dest_reg(/*tile_id*/0);
+            dprint_tensix_dest_reg(/*tile_id*/1);
+            dprint_tensix_dest_reg(/*tile_id*/2);
 
-
-            sub_binary_tile(0, 2, 3);
-            dprint_tensix_dest_reg(/*tile_id*/3);
-
-            exp_tile(3);
-            dprint_tensix_dest_reg(/*tile_id*/3);
-            mul_binary_tile(1, 3, 0);
+            compute_result_for_online_softmax();
 
             tile_regs_commit();
             tile_regs_wait();
@@ -214,8 +231,6 @@ void MAIN {
         }
         cb_pop_front(cb_global_max, 1);
         cb_pop_front(cb_global_sum, 1);
-        cb_pop_front(cb_sum, 1);
-        cb_pop_front(cb_max, 1);
     }
 
 }

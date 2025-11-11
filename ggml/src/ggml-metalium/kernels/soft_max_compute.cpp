@@ -119,11 +119,11 @@ void MAIN {
             copy_tile(cb_in0, 0, 0); // Tile 0 -> input
 
             update_online_softmax_values();
+            cb_pop_front(cb_in0, 1);
         }
 
         tile_regs_commit();
         tile_regs_wait();
-        cb_pop_front(cb_in0, 1);
         pack_tile(1, cb_sum);
         pack_tile(2, cb_max);
         tile_regs_release();

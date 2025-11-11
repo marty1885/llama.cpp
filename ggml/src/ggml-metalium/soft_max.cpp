@@ -142,7 +142,7 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
     });
 
     KernelHandle compute = CreateMetaliumKernel(program, "soft_max_compute", all_cores, ComputeConfig{
-        .fp32_dest_acc_en = false,
+        .fp32_dest_acc_en = true,
         .unpack_to_dest_mode = {},
         .compile_args = {},
         .defines = {},

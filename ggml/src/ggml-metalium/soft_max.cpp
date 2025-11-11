@@ -119,6 +119,7 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_28, 1, tt::tt_metal::DataType::BFLOAT16); // cb_global_max
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_29, 1, tt::tt_metal::DataType::BFLOAT16); // cb_global_sum
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_30, 1, tt::tt_metal::DataType::BFLOAT16); // cb_tmp2
+    MakeCircularBuffer(program, all_cores, tt::CBIndex::c_31, 4, tt::tt_metal::DataType::BFLOAT16); // cb_tile_mask
 
 
     std::vector<uint32_t> reader_compile_time_args;
@@ -155,7 +156,7 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
             for(const auto& core : range) {
 
                 SetRuntimeArgs(program, reader, core, std::vector<uint32_t>{a->address(), width_tiles, height_tiles});
-                SetRuntimeArgs(program, compute, core, std::vector<uint32_t>{width_tiles, height_tiles});
+                SetRuntimeArgs(program, compute, core, std::vector<uint32_t>{width, height, batch});
                 SetRuntimeArgs(program, writer, core, std::vector<uint32_t>{o->address(), width_tiles, height_tiles});
             }
         }

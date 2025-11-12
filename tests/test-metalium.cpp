@@ -164,7 +164,7 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     }
 }
 
-void initialize_tensors(ggml_context * ctx) {
+static void initialize_tensors(ggml_context * ctx) {
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
         init_tensor_uniform(t);
     }
@@ -179,7 +179,7 @@ enum class TestResult {
 struct test_case
 {
     test_case(std::string name, std::function<ggml_tensor* (ggml_context*)> build_graph, const std::function<double(const float*, const float*, size_t n)>& loss = nmse)
-        : name(std::move(name)), build_graph(std::move(build_graph)), loss(loss) {}
+        : name(std::move(name)), loss(loss), build_graph(std::move(build_graph)) {}
     std::string name;
     float max_err = 1e-4;
     std::function<double(const float*, const float*, size_t n)> loss;
@@ -346,18 +346,18 @@ struct test_case
     }
 };
 
-std::unique_ptr<test_case> make_test(const std::function<ggml_tensor* (ggml_context*)> & build_graph, std::string name, float max_err = 1e-4) {
+static std::unique_ptr<test_case> make_test(const std::function<ggml_tensor* (ggml_context*)> & build_graph, std::string name, float max_err = 1e-4) {
     std::unique_ptr<test_case> tc = std::make_unique<test_case>(std::move(name), build_graph);
     tc->max_err = max_err;
     return tc;
 }
 
-std::string type_name(ggml_type type)
+static std::string type_name(ggml_type type)
 {
     return ggml_get_type_traits(type)->type_name;
 }
 
-void add_unittests(std::vector<std::unique_ptr<test_case>>& tests)
+static void add_unittests(std::vector<std::unique_ptr<test_case>>& tests)
 {
     const ggml_unary_op supported_unary_ops[] = {
         GGML_UNARY_OP_ABS,
@@ -770,6 +770,8 @@ void add_unittests(std::vector<std::unique_ptr<test_case>>& tests)
 
 int main(int argc, char ** argv)
 {
+    (void)argc;
+    (void)argv;
     ggml_backend_t cpu = ggml_backend_cpu_init();
 
     ggml_backend_reg_t reg = ggml_backend_reg_by_name("Metalium");
@@ -789,8 +791,8 @@ int main(int argc, char ** argv)
     ///////////////// put experiment code here /////////////////
     // easier on the eye to find it (also one line to disable UT)
     tests.push_back(make_test([](ggml_context* ctx) {
-        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 48, 32, 1, 1);
-        ggml_tensor* mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 48, 32, 1, 1);
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 32, 1, 1);
+        ggml_tensor* mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 32, 1, 1);
         return ggml_soft_max_ext(ctx, a, mask, 1, 0);
     }, "test softmax", 1e-5));
     ///////////////// end of experiment code /////////////////

@@ -181,6 +181,8 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
     std::map<std::string, std::string> defines;
     if(scale != 1.f) {
         defines["SCALE"] = to_string_precise(scale);
+        const uint32_t* scale_int = reinterpret_cast<const uint32_t*>(&scale);
+        defines["SCALE_FP32_ENCODED_AS_INT"] = std::to_string(*scale_int);
     }
     if(mask) {
         defines["HAS_MASK"] = "1";
@@ -199,8 +201,8 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
             for(const auto& core : range) {
 
                 DeviceAddr mask_addr = mask ? mask->address() : 0;
-                uint32_t mask_n_head = mask_tensor ? mask_tensor->logical_shape()[2] : 0;
-                uint32_t mask_batch = mask_tensor ? mask_tensor->logical_shape()[3] : 0;
+                uint32_t mask_n_head = mask_tensor ? mask_tensor->logical_shape()[1] : 0;
+                uint32_t mask_batch = mask_tensor ? mask_tensor->logical_shape()[0] : 0;
 
                 SetRuntimeArgs(program, reader, core, std::vector<uint32_t>{a->address(), width_tiles, height_tiles, n_head, batch, (uint32_t)mask_addr, mask_n_head, mask_batch});
                 SetRuntimeArgs(program, compute, core, std::vector<uint32_t>{width, height, batch, n_head, batch});
@@ -226,7 +228,6 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
                         runtime_args[0] = a->address();
 
                         if(input_tensors.size() > 1) {
-                            std::cerr << "Updating mask tensor address\n";
                             auto* mask = input_tensors.at(1).buffer();
                             runtime_args[5] = mask->address();
                         }

@@ -13,6 +13,7 @@
 #include "compute_kernel_api/bcast.h"
 #include "compute_kernel_api/eltwise_binary_sfpu.h"
 #include "compute_kernel_api/eltwise_binary.h"
+#include "compute_kernel_api/eltwise_unary/binop_with_scalar.h"
 
 #include <debug/dprint_tensix.h>
 
@@ -101,10 +102,6 @@ void update_online_softmax_values_internal(const uint32_t dst_index_in0, const u
         vFloat max = dst_reg[max_base_idx];
         vFloat tile_mask = dst_reg[tile_mask_idx];
 
-        #ifdef SCALE
-            x = x * SCALE;
-        #endif
-
         vFloat new_max = max;
         v_if(x > max && tile_mask == 1.f) {
             new_max = x;
@@ -133,10 +130,6 @@ void compute_result_for_online_softmax_internal(const uint32_t dst_index_in0, co
         vFloat inv_sum = dst_reg[sum_base_idx];
         vFloat x_max = dst_reg[max_base_idx];
         vFloat tile_mask = dst_reg[tile_mask_idx];
-
-        #ifdef SCALE
-            x = x * SCALE;
-        #endif
 
         vFloat res = 0;
         v_if(tile_mask == 1.f) {
@@ -264,6 +257,9 @@ void MAIN {
                 cb_wait_front(cb_in0, 1);
                 copy_tile_init(cb_in0);
                 copy_tile(cb_in0, 0, 0); // input -> tile 0
+                #ifdef SCALE
+                mul_unary_tile(0, SCALE_FP32_ENCODED_AS_INT);
+                #endif
                 #ifdef HAS_MASK
                 cb_wait_front(cb_in1, 1);
                 copy_tile_init(cb_in1);
@@ -381,6 +377,9 @@ void MAIN {
                 cb_wait_front(cb_in0, 1);
                 copy_tile_init(cb_in0);
                 copy_tile(cb_in0, 0, 0);              // input -> tile 0
+                #ifdef SCALE
+                mul_unary_tile(0, SCALE_FP32_ENCODED_AS_INT);
+                #endif
                 #ifdef HAS_MASK
                 cb_wait_front(cb_in1, 1);
                 copy_tile_init(cb_in1);

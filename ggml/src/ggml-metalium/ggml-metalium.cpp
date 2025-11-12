@@ -1533,7 +1533,7 @@ static bool ggml_backend_metalium_can_softmax(const struct ggml_tensor * dst)
     std::array<float, 2> params;
     memcpy(&params, dst->op_params, sizeof(params));
     auto [scale, max_bias] = params;
-    return max_bias == 0.f && dst->src[1] == NULL;
+    return max_bias == 0.f;
 }
 
 static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
@@ -1547,9 +1547,18 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
     auto [scale, max_bias] = params;
 
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
-    *dst_meta = {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttggml::soft_max(*realize_ggml_view(dst->src[0]), scale))
-    };
+    auto x = *realize_ggml_view(dst->src[0]);
+    if(dst->src[1] == NULL) {
+        *dst_meta = {
+            .tensor = std::make_shared<tt::tt_metal::Tensor>(ttggml::soft_max(x, scale))
+        };
+    }
+    else {
+        auto mask = *realize_ggml_view(dst->src[1]);
+        *dst_meta = {
+            .tensor = std::make_shared<tt::tt_metal::Tensor>(ttggml::soft_max(x, mask, scale))
+        };
+    }
 #if 0
 
     const ggml_tensor *src0 = dst->src[0];

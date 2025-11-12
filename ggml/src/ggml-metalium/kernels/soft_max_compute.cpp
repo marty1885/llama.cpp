@@ -182,6 +182,7 @@ void MAIN {
     const uint32_t height_tiles = (height + TILE_SIZE - 1) / TILE_SIZE;
 
     constexpr uint32_t cb_in0 = tt::CBIndex::c_0;
+    constexpr uint32_t cb_in1 = tt::CBIndex::c_1;
     constexpr uint32_t cb_out0 = tt::CBIndex::c_16;
     constexpr uint32_t cb_const1 = tt::CBIndex::c_24;
     constexpr uint32_t cb_sum = tt::CBIndex::c_25;
@@ -263,13 +264,22 @@ void MAIN {
                 cb_wait_front(cb_in0, 1);
                 copy_tile_init(cb_in0);
                 copy_tile(cb_in0, 0, 0); // input -> tile 0
+                #ifdef HAS_MASK
+                cb_wait_front(cb_in1, 1);
+                copy_tile_init(cb_in1);
+                copy_tile(cb_in1, 0, 3); // attn mask -> tile 3
+                add_binary_tile(0, 3, 0);
+                #endif
 
                 cb_wait_front(cb_tile_mask, 4);
                 copy_tile_init(cb_tile_mask);
-                copy_tile(cb_tile_mask, select_tile_mask(y, x), 3); // mask -> tile 3
+                copy_tile(cb_tile_mask, select_tile_mask(y, x), 3); // tile mask -> tile 3
 
                 update_online_softmax_values(); // updates tiles 1,2 with running max/sum
                 cb_pop_front(cb_in0, 1);
+                #ifdef HAS_MASK
+                cb_pop_front(cb_in1, 1);
+                #endif
             }
 
             tile_regs_commit();
@@ -371,6 +381,12 @@ void MAIN {
                 cb_wait_front(cb_in0, 1);
                 copy_tile_init(cb_in0);
                 copy_tile(cb_in0, 0, 0);              // input -> tile 0
+                #ifdef HAS_MASK
+                cb_wait_front(cb_in1, 1);
+                copy_tile_init(cb_in1);
+                copy_tile(cb_in1, 0, 1); // attn mask -> tile 1
+                add_binary_tile(0, 1, 0);
+                #endif
                 copy_tile_init(cb_global_sum);
                 copy_tile(cb_global_sum, 0, 1);       // 1/sum -> tile 1
                 copy_tile_init(cb_global_max);
@@ -385,6 +401,9 @@ void MAIN {
                 tile_regs_wait();
                 pack_tile(0, cb_out0);
                 cb_pop_front(cb_in0, 1);
+                #ifdef HAS_MASK
+                cb_pop_front(cb_in1, 1);
+                #endif
                 tile_regs_release();
                 cb_push_back(cb_out0, 1);
             }

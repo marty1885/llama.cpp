@@ -165,10 +165,7 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
     const uint32_t D_active = active_dim_size;
     const uint32_t N = src_tensor.logical_shape()[-2];
 
-    std::optional<Tensor> freq_factor;
-    if(input_tensors.size() >= 3) {
-        freq_factor = std::make_optional(input_tensors.at(2));
-    }
+    std::optional<Tensor> freq_factor = at_index(input_tensors, 2);
 
     tt::tt_metal::IDevice* device = src_tensor.device();
 

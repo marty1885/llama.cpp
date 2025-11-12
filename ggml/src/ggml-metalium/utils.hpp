@@ -16,3 +16,11 @@ tt::tt_metal::KernelHandle CreateMetaliumKernel(
     const std::variant<tt::tt_metal::DataMovementConfig, tt::tt_metal::ComputeConfig, tt::tt_metal::EthernetConfig>& config);
 
 std::string to_string_precise(float value);
+
+template <typename T>
+std::optional<T> at_index(const std::vector<T>& vec, size_t index) {
+    if (index < vec.size()) {
+        return vec[index];
+    }
+    return std::nullopt;
+}

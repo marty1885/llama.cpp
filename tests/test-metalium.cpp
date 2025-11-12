@@ -789,8 +789,9 @@ int main(int argc, char ** argv)
     ///////////////// put experiment code here /////////////////
     // easier on the eye to find it (also one line to disable UT)
     tests.push_back(make_test([](ggml_context* ctx) {
-        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 48, 48, 1, 1);
-        return ggml_soft_max(ctx, a);
+        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 48, 32, 1, 1);
+        ggml_tensor* mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 48, 32, 1, 1);
+        return ggml_soft_max_ext(ctx, a, mask, 1, 0);
     }, "test softmax", 1e-5));
     ///////////////// end of experiment code /////////////////
 

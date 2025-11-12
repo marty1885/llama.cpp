@@ -294,6 +294,7 @@ void MAIN {
             // Step 2a: Reduce max across row to get global max
             tile_regs_acquire();
             cb_wait_front(cb_max, 1);
+            cb_wait_front(cb_const1, 1);
             cb_reserve_back(cb_tmp, 1);
             reduce_init<PoolType::MAX, ReduceDim::REDUCE_ROW>(cb_max, cb_const1, cb_tmp);
             reduce_tile<PoolType::MAX, ReduceDim::REDUCE_ROW>(cb_max, cb_const1, 0, 0, 0);
@@ -399,11 +400,11 @@ void MAIN {
                 tile_regs_commit();
                 tile_regs_wait();
                 pack_tile(0, cb_out0);
+                tile_regs_release();
                 cb_pop_front(cb_in0, 1);
                 #ifdef HAS_MASK
                 cb_pop_front(cb_in1, 1);
                 #endif
-                tile_regs_release();
                 cb_push_back(cb_out0, 1);
             }
             cb_pop_front(cb_global_max, 1);

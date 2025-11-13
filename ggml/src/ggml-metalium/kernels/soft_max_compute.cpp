@@ -1,4 +1,6 @@
-#define REDUCE_OP PoolType::SUM
+#include "compute_kernel_api/pack.h"
+#include "compute_kernel_api/reg_api.h"
+#define REDUCE_OP PoolType::MAX
 #define REDUCE_DIM ReduceDim::REDUCE_ROW
 
 #include <cstdint>
@@ -89,6 +91,38 @@ inline void make_mask_internal(const uint32_t w, const uint32_t h, const int dst
     math::clear_addr_mod_base();
 }
 
+inline void max_cross_face_sfpu_internal(const int dst_tile_id) {
+    math::set_dst_write_addr<DstTileLayout::Default, DstTileShape::Tile32x32>(0);
+    math::set_addr_mod_base();
+    TTI_STALLWAIT(p_stall::STALL_SFPU, p_stall::MATH);
+
+    int offset = dst_tile_id * 32;
+    #pragma unroll 0
+    for (int half = 0; half < 2; half++) {
+        #pragma unroll 0
+        for(int i=0;i<8; i++) {
+            vFloat a = dst_reg[offset];
+            vFloat b = dst_reg[offset+8];
+            vFloat res = a;
+            v_if(b > a) {
+                res = b;
+            } v_endif;
+            dst_reg[offset] = res;
+            dst_reg[offset+8] = res;
+            dst_reg++;
+        }
+        TTI_SETRWC(p_setrwc::CLR_NONE, p_setrwc::CR_D, 8, 0, 0, p_setrwc::SET_D);
+        TTI_SETRWC(p_setrwc::CLR_NONE, p_setrwc::CR_D, 8, 0, 0, p_setrwc::SET_D);
+        TTI_SETRWC(p_setrwc::CLR_NONE, p_setrwc::CR_D, 8, 0, 0, p_setrwc::SET_D);
+        TTI_SETRWC(p_setrwc::CLR_NONE, p_setrwc::CR_D, 8, 0, 0, p_setrwc::SET_D);
+    }
+
+    math::clear_dst_reg_addr();
+    TTI_STALLWAIT(p_stall::STALL_CFG, p_stall::WAIT_SFPU);
+    math::clear_addr_mod_base();
+}
+
+
 void update_online_softmax_values_internal(const uint32_t dst_index_in0, const uint32_t dst_index_in1, const uint32_t dst_index_out) {
     constexpr uint32_t n_vector_in_tile = 32;
     const uint32_t in_base_idx = dst_index_in0 * n_vector_in_tile;
@@ -158,6 +192,10 @@ static void compute_result_for_online_softmax() {
 
 static void make_mask(const int w, const int h, const int dst_tile_id) {
     MATH(make_mask_internal(w, h, dst_tile_id));
+}
+
+static void max_cross_face_sfpu(const int dst_tile_id) {
+    MATH(max_cross_face_sfpu_internal(dst_tile_id));
 }
 
 // ============================================================================
@@ -230,6 +268,7 @@ void MAIN {
         make_mask(remaining_width, remaining_height, 3);  // Bottom-right corner
         tile_regs_commit();
         tile_regs_wait();
+        pack_reconfig_data_format(cb_tile_mask);
         pack_tile(0, cb_tile_mask, 0);
         pack_tile(1, cb_tile_mask, 1);
         pack_tile(2, cb_tile_mask, 2);
@@ -277,10 +316,15 @@ void MAIN {
                 cb_pop_front(cb_in1, 1);
                 #endif
             }
+            // dprint_tensix_dest_reg(2);
+            // max_cross_face_sfpu(2);
+            // dprint_tensix_dest_reg(2);
 
             tile_regs_commit();
             tile_regs_wait();
+            pack_reconfig_data_format(cb_sum);
             pack_tile(1, cb_sum);    // partial sums
+            pack_reconfig_data_format(cb_max);
             pack_tile(2, cb_max);    // partial maxes
             tile_regs_release();
             cb_push_back(cb_sum, 1);
@@ -296,11 +340,13 @@ void MAIN {
             cb_wait_front(cb_max, 1);
             cb_wait_front(cb_const1, 1);
             cb_reserve_back(cb_tmp, 1);
+            reconfig_data_format(cb_max, cb_const1);
             reduce_init<PoolType::MAX, ReduceDim::REDUCE_ROW>(cb_max, cb_const1, cb_tmp);
             reduce_tile<PoolType::MAX, ReduceDim::REDUCE_ROW>(cb_max, cb_const1, 0, 0, 0);
             reduce_uninit();
             tile_regs_commit();
             tile_regs_wait();
+            pack_reconfig_data_format(cb_tmp);
             pack_tile(0, cb_tmp);
             tile_regs_release();
             cb_push_back(cb_tmp, 1);
@@ -312,12 +358,15 @@ void MAIN {
             cb_reserve_back(cb_global_max, 1);
             cb_reserve_back(cb_tmp2, 1);
 
+            reconfig_data_format_srca(cb_tmp);
             unary_bcast_init<BroadcastType::COL>(cb_tmp, cb_global_max);
-            unary_bcast<BroadcastType::COL>(cb_tmp, 0, 0);  // broadcast global max
+            unary_bcast<BroadcastType::COL>(cb_tmp, 0, 0);  // broadcast global maxs
             copy_tile_init(cb_sum);
             copy_tile(cb_sum, 0, 1);      // partial sums -> tile 1
             copy_tile_init(cb_max);
             copy_tile(cb_max, 0, 2);      // partial maxes -> tile 2
+            // dprint_tensix_dest_reg(0);
+            // dprint_tensix_dest_reg(2);
 
             sub_binary_tile(2, 0, 3);     // m_vec - m_global -> tile 3
             exp_tile(3);                  // exp(m_vec - m_global) -> tile 3
@@ -328,7 +377,9 @@ void MAIN {
 
             tile_regs_commit();
             tile_regs_wait();
+            pack_reconfig_data_format(cb_global_max);
             pack_tile(0, cb_global_max);  // save global max
+            pack_reconfig_data_format(cb_tmp2);
             pack_tile(3, cb_tmp2);        // save adjusted sum
             tile_regs_release();
             cb_push_back(cb_global_max, 1);
@@ -341,11 +392,13 @@ void MAIN {
             tile_regs_acquire();
             cb_wait_front(cb_tmp2, 1);
             cb_reserve_back(cb_tmp, 1);
+            reconfig_data_format(cb_tmp2, cb_const1);
             reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_tmp2, cb_const1, cb_tmp);
             reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_tmp2, cb_const1, 0, 0, 0);
             reduce_uninit();
             tile_regs_commit();
             tile_regs_wait();
+            pack_reconfig_data_format(cb_tmp);
             pack_tile(0, cb_tmp);
             tile_regs_release();
             cb_push_back(cb_tmp, 1);
@@ -353,12 +406,14 @@ void MAIN {
             tile_regs_acquire();
             cb_wait_front(cb_tmp, 1);
             cb_reserve_back(cb_global_sum, 1);
+            reconfig_data_format_srca(cb_tmp);
             unary_bcast_init<BroadcastType::COL>(cb_tmp, cb_global_sum);
             unary_bcast<BroadcastType::COL>(cb_tmp, 0, 0);
             recip_tile_init();
             recip_tile(0);                // 1/sum -> tile 0
             tile_regs_commit();
             tile_regs_wait();
+            pack_reconfig_data_format(cb_global_sum);
             pack_tile(0, cb_global_sum);
             tile_regs_release();
             cb_push_back(cb_global_sum, 1);
@@ -399,6 +454,7 @@ void MAIN {
 
                 tile_regs_commit();
                 tile_regs_wait();
+                pack_reconfig_data_format(cb_out0);
                 pack_tile(0, cb_out0);
                 tile_regs_release();
                 cb_pop_front(cb_in0, 1);
@@ -411,5 +467,8 @@ void MAIN {
             cb_pop_front(cb_global_sum, 1);
         }
     }
+
+    cb_pop_front(cb_tile_mask, 4);
+    cb_pop_front(cb_const1, 1);
 }
 }

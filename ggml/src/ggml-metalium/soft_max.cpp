@@ -121,7 +121,7 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
     const uint32_t batch = a_tensor.logical_shape()[-4];
 
     // tt::tt_metal::IDevice* device = a_tensor.device();
-    CoreCoord core_grid = CoreCoord(1, 1);
+    tt::tt_metal::CoreCoord core_grid = tt::tt_metal::CoreCoord(1, 1);
 
     auto* a = a_tensor.buffer();
     auto* o = o_tensor.buffer();

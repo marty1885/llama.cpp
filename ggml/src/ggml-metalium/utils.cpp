@@ -38,7 +38,7 @@ CBHandle MakeCircularBuffer(Program& program, const CoreSpec& core, tt::CBIndex 
 KernelHandle CreateMetaliumKernel(
     Program& program,
     const std::string& str, // could be path or actual kenrel
-    const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
+    const CoreSpec& core_spec,
     const std::variant<DataMovementConfig, ComputeConfig, EthernetConfig>& config) {
 
     if(str.find_first_of(" \n\t") != std::string::npos) {

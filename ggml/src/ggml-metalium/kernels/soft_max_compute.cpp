@@ -134,9 +134,9 @@ void update_online_softmax_values_internal(const uint32_t dst_index_in0, const u
         vFloat x = dst_reg[in_base_idx];
         vFloat sum = dst_reg[sum_base_idx];
         vFloat max = dst_reg[max_base_idx];
-        vFloat tile_mask = dst_reg[tile_mask_idx];
-
         vFloat new_max = max;
+        #ifdef NEED_TILE_MASK
+        vFloat tile_mask = dst_reg[tile_mask_idx];
         v_if(x > max && tile_mask == 1.f) {
             new_max = x;
         } v_endif;
@@ -145,6 +145,12 @@ void update_online_softmax_values_internal(const uint32_t dst_index_in0, const u
             sum = sum * _sfpu_exp_21f_<true>(max - new_max) + _sfpu_exp_21f_<true>(x - new_max);
         }
         v_endif;
+        #else
+        v_if(x > max) {
+            new_max = x;
+        } v_endif;
+        sum = sum * _sfpu_exp_21f_<true>(max - new_max) + _sfpu_exp_21f_<true>(x - new_max);
+        #endif
 
         dst_reg[sum_base_idx] = sum;
         dst_reg[max_base_idx] = new_max;
@@ -166,10 +172,14 @@ void compute_result_for_online_softmax_internal(const uint32_t dst_index_in0, co
         vFloat tile_mask = dst_reg[tile_mask_idx];
 
         vFloat res = 0;
+        #ifdef NEED_TILE_MASK
         v_if(tile_mask == 1.f) {
             res = _sfpu_exp_21f_<true>(x - x_max) * inv_sum;
         }
         v_endif;
+        #else
+        res = _sfpu_exp_21f_<true>(x - x_max) * inv_sum;
+        #endif
 
         dst_reg[in_base_idx] = res;
         dst_reg++;
@@ -251,15 +261,18 @@ void MAIN {
         fill_tile(0, 1.f);
         tile_regs_commit();
         tile_regs_wait();
+        pack_reconfig_data_format(cb_const1);
         pack_tile(0, cb_const1);
         tile_regs_release();
         cb_push_back(cb_const1, 1);
     }
 
     // Create mask tiles for different edge cases
+    #if NEED_TILE_MASK
     {
         tile_regs_acquire();
         cb_reserve_back(cb_tile_mask, 4);
+        pack_reconfig_data_format(cb_tile_mask);
         const uint32_t remaining_width = width % TILE_SIZE == 0 ? TILE_SIZE : width % TILE_SIZE;
         const uint32_t remaining_height = height % TILE_SIZE == 0 ? TILE_SIZE : height % TILE_SIZE;
         make_mask(32, 32, 0);                             // Full tile
@@ -268,7 +281,6 @@ void MAIN {
         make_mask(remaining_width, remaining_height, 3);  // Bottom-right corner
         tile_regs_commit();
         tile_regs_wait();
-        pack_reconfig_data_format(cb_tile_mask);
         pack_tile(0, cb_tile_mask, 0);
         pack_tile(1, cb_tile_mask, 1);
         pack_tile(2, cb_tile_mask, 2);
@@ -276,6 +288,7 @@ void MAIN {
         tile_regs_release();
         cb_push_back(cb_tile_mask, 4);
     }
+    #endif
 
     // ========================================================================
     // MAIN COMPUTATION LOOP
@@ -306,9 +319,11 @@ void MAIN {
                 add_binary_tile(0, 3, 0);
                 #endif
 
+                #ifdef NEED_TILE_MASK
                 cb_wait_front(cb_tile_mask, 4);
                 copy_tile_init(cb_tile_mask);
                 copy_tile(cb_tile_mask, select_tile_mask(y, x), 3); // tile mask -> tile 3
+                #endif
 
                 update_online_softmax_values(); // updates tiles 1,2 with running max/sum
                 cb_pop_front(cb_in0, 1);
@@ -341,12 +356,12 @@ void MAIN {
             cb_wait_front(cb_const1, 1);
             cb_reserve_back(cb_tmp, 1);
             reconfig_data_format(cb_max, cb_const1);
+            pack_reconfig_data_format(cb_tmp);
             reduce_init<PoolType::MAX, ReduceDim::REDUCE_ROW>(cb_max, cb_const1, cb_tmp);
             reduce_tile<PoolType::MAX, ReduceDim::REDUCE_ROW>(cb_max, cb_const1, 0, 0, 0);
             reduce_uninit();
             tile_regs_commit();
             tile_regs_wait();
-            pack_reconfig_data_format(cb_tmp);
             pack_tile(0, cb_tmp);
             tile_regs_release();
             cb_push_back(cb_tmp, 1);
@@ -365,15 +380,15 @@ void MAIN {
             copy_tile(cb_sum, 0, 1);      // partial sums -> tile 1
             copy_tile_init(cb_max);
             copy_tile(cb_max, 0, 2);      // partial maxes -> tile 2
-            // dprint_tensix_dest_reg(0);
-            // dprint_tensix_dest_reg(2);
 
             sub_binary_tile(2, 0, 3);     // m_vec - m_global -> tile 3
             exp_tile(3);                  // exp(m_vec - m_global) -> tile 3
             mul_binary_tile(1, 3, 3);     // s_vec * exp(m_vec - m_global) -> tile 3
+            #ifdef NEED_TILE_MASK
             copy_tile_init(cb_tile_mask);
             copy_tile(cb_tile_mask, select_reduce_mask(y), 2);  // apply mask
             mul_binary_tile(2, 3, 3);
+            #endif
 
             tile_regs_commit();
             tile_regs_wait();
@@ -393,12 +408,12 @@ void MAIN {
             cb_wait_front(cb_tmp2, 1);
             cb_reserve_back(cb_tmp, 1);
             reconfig_data_format(cb_tmp2, cb_const1);
+            pack_reconfig_data_format(cb_tmp);
             reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_tmp2, cb_const1, cb_tmp);
             reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_tmp2, cb_const1, 0, 0, 0);
             reduce_uninit();
             tile_regs_commit();
             tile_regs_wait();
-            pack_reconfig_data_format(cb_tmp);
             pack_tile(0, cb_tmp);
             tile_regs_release();
             cb_push_back(cb_tmp, 1);
@@ -446,8 +461,10 @@ void MAIN {
                 copy_tile(cb_global_sum, 0, 1);       // 1/sum -> tile 1
                 copy_tile_init(cb_global_max);
                 copy_tile(cb_global_max, 0, 2);       // global max -> tile 2
+                #ifdef NEED_TILE_MASK
                 copy_tile_init(cb_tile_mask);
                 copy_tile(cb_tile_mask, select_tile_mask(y, x), 3); // mask -> tile 3
+                #endif
                 cb_reserve_back(cb_out0, 1);
 
                 compute_result_for_online_softmax(); // exp(x-max) * (1/sum)
@@ -468,7 +485,9 @@ void MAIN {
         }
     }
 
+    #ifdef NEED_TILE_MASK
     cb_pop_front(cb_tile_mask, 4);
+    #endif
     cb_pop_front(cb_const1, 1);
 }
 }

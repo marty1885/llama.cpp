@@ -130,6 +130,8 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
     const uint32_t width_tiles = width / 32 + (width % 32 != 0);
     const uint32_t height_tiles = (height / 32 + (height % 32 != 0));
 
+    const bool need_tile_mask = width % 32 != 0 || height % 32 != 0;
+
     auto [num_cores,
         all_cores,
         core_group_1,
@@ -143,14 +145,16 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
         MakeCircularBuffer(program, all_cores, tt::CBIndex::c_1, 2, mask_tensor->dtype()); // cb_in1 (mask)
     }
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_16, 2, o_tensor.dtype()); // cb_out
-    MakeCircularBuffer(program, all_cores, tt::CBIndex::c_24, 1, tt::tt_metal::DataType::BFLOAT16); // cb_const1
+    MakeCircularBuffer(program, all_cores, tt::CBIndex::c_24, 1, tt::tt_metal::DataType::BFLOAT4_B); // cb_const1
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_25, 1, tt::tt_metal::DataType::BFLOAT16); // cb_sum
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_26, 1, tt::tt_metal::DataType::BFLOAT16); // cb_max
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_27, 1, tt::tt_metal::DataType::BFLOAT16); // cb_tmp
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_28, 1, tt::tt_metal::DataType::BFLOAT16); // cb_global_max
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_29, 1, tt::tt_metal::DataType::BFLOAT16); // cb_global_sum
     MakeCircularBuffer(program, all_cores, tt::CBIndex::c_30, 1, tt::tt_metal::DataType::BFLOAT16); // cb_tmp2
-    MakeCircularBuffer(program, all_cores, tt::CBIndex::c_31, 4, tt::tt_metal::DataType::BFLOAT16); // cb_tile_mask
+    if(need_tile_mask) {
+        MakeCircularBuffer(program, all_cores, tt::CBIndex::c_31, 4, tt::tt_metal::DataType::BFLOAT16); // cb_tile_mask
+    }
 
 
     std::map<std::string, std::string> reader_defines;
@@ -186,6 +190,9 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
     }
     if(mask) {
         defines["HAS_MASK"] = "1";
+    }
+    if(need_tile_mask) {
+        defines["NEED_TILE_MASK"] = "1";
     }
     KernelHandle compute = CreateMetaliumKernel(program, "soft_max_compute", all_cores, ComputeConfig{
         .fp32_dest_acc_en = true,

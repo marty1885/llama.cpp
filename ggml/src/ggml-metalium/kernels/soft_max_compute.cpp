@@ -316,6 +316,7 @@ void MAIN {
                 cb_wait_front(cb_in1, 1);
                 copy_tile_init(cb_in1);
                 copy_tile(cb_in1, 0, 3); // attn mask -> tile 3
+                add_binary_tile_init();
                 add_binary_tile(0, 3, 0);
                 #endif
 
@@ -332,6 +333,7 @@ void MAIN {
                 #endif
             }
             // dprint_tensix_dest_reg(2);
+            // WORKARROUND: (not working) wokroung FPU reduce only does partial result some times
             // max_cross_face_sfpu(2);
             // dprint_tensix_dest_reg(2);
 
@@ -356,6 +358,8 @@ void MAIN {
             cb_wait_front(cb_const1, 1);
             cb_reserve_back(cb_tmp, 1);
             reconfig_data_format(cb_max, cb_const1);
+            reconfig_data_format_srca(cb_max);
+            reconfig_data_format_srcb(cb_const1);
             pack_reconfig_data_format(cb_tmp);
             reduce_init<PoolType::MAX, ReduceDim::REDUCE_ROW>(cb_max, cb_const1, cb_tmp);
             reduce_tile<PoolType::MAX, ReduceDim::REDUCE_ROW>(cb_max, cb_const1, 0, 0, 0);
@@ -374,6 +378,7 @@ void MAIN {
             cb_reserve_back(cb_tmp2, 1);
 
             reconfig_data_format_srca(cb_tmp);
+            pack_reconfig_data_format(cb_global_max);
             unary_bcast_init<BroadcastType::COL>(cb_tmp, cb_global_max);
             unary_bcast<BroadcastType::COL>(cb_tmp, 0, 0);  // broadcast global maxs
             copy_tile_init(cb_sum);
@@ -381,6 +386,7 @@ void MAIN {
             copy_tile_init(cb_max);
             copy_tile(cb_max, 0, 2);      // partial maxes -> tile 2
 
+            sub_binary_tile_init();
             sub_binary_tile(2, 0, 3);     // m_vec - m_global -> tile 3
             exp_tile(3);                  // exp(m_vec - m_global) -> tile 3
             mul_binary_tile(1, 3, 3);     // s_vec * exp(m_vec - m_global) -> tile 3
@@ -392,7 +398,6 @@ void MAIN {
 
             tile_regs_commit();
             tile_regs_wait();
-            pack_reconfig_data_format(cb_global_max);
             pack_tile(0, cb_global_max);  // save global max
             pack_reconfig_data_format(cb_tmp2);
             pack_tile(3, cb_tmp2);        // save adjusted sum
@@ -408,9 +413,11 @@ void MAIN {
             cb_wait_front(cb_tmp2, 1);
             cb_reserve_back(cb_tmp, 1);
             reconfig_data_format(cb_tmp2, cb_const1);
+            reconfig_data_format_srca(cb_tmp2);
+            reconfig_data_format_srcb(cb_const1);
             pack_reconfig_data_format(cb_tmp);
-            reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_tmp2, cb_const1, cb_tmp);
-            reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_tmp2, cb_const1, 0, 0, 0);
+            reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW, true>(cb_tmp2, cb_const1, cb_tmp);
+            reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW, true>(cb_tmp2, cb_const1, 0, 0, 0);
             reduce_uninit();
             tile_regs_commit();
             tile_regs_wait();
@@ -422,13 +429,13 @@ void MAIN {
             cb_wait_front(cb_tmp, 1);
             cb_reserve_back(cb_global_sum, 1);
             reconfig_data_format_srca(cb_tmp);
+            pack_reconfig_data_format(cb_global_sum);
             unary_bcast_init<BroadcastType::COL>(cb_tmp, cb_global_sum);
             unary_bcast<BroadcastType::COL>(cb_tmp, 0, 0);
             recip_tile_init();
             recip_tile(0);                // 1/sum -> tile 0
             tile_regs_commit();
             tile_regs_wait();
-            pack_reconfig_data_format(cb_global_sum);
             pack_tile(0, cb_global_sum);
             tile_regs_release();
             cb_push_back(cb_global_sum, 1);
@@ -455,6 +462,7 @@ void MAIN {
                 cb_wait_front(cb_in1, 1);
                 copy_tile_init(cb_in1);
                 copy_tile(cb_in1, 0, 1); // attn mask -> tile 1
+                add_binary_tile_init();
                 add_binary_tile(0, 1, 0);
                 #endif
                 copy_tile_init(cb_global_sum);

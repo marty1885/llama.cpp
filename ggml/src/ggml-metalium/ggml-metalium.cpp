@@ -1538,7 +1538,6 @@ static bool ggml_backend_metalium_can_softmax(const struct ggml_tensor * dst)
 
 static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
 {
-#if 0
     GGML_UNUSED(ctx);
     GGML_METALIUM_OP_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
@@ -1546,7 +1545,7 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
     std::array<float, 2> params;
     memcpy(&params, dst->op_params, sizeof(params));
     auto [scale, max_bias] = params;
-
+#if 0
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
     auto x = *realize_ggml_view(dst->src[0]);
     if(dst->src[1] == NULL) {

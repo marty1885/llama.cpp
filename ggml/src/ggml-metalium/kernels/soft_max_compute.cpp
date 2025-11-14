@@ -91,38 +91,6 @@ inline void make_mask_internal(const uint32_t w, const uint32_t h, const int dst
     math::clear_addr_mod_base();
 }
 
-inline void max_cross_face_sfpu_internal(const int dst_tile_id) {
-    math::set_dst_write_addr<DstTileLayout::Default, DstTileShape::Tile32x32>(0);
-    math::set_addr_mod_base();
-    TTI_STALLWAIT(p_stall::STALL_SFPU, p_stall::MATH);
-
-    int offset = dst_tile_id * 32;
-    #pragma unroll 0
-    for (int half = 0; half < 2; half++) {
-        #pragma unroll 0
-        for(int i=0;i<8; i++) {
-            vFloat a = dst_reg[offset];
-            vFloat b = dst_reg[offset+8];
-            vFloat res = a;
-            v_if(b > a) {
-                res = b;
-            } v_endif;
-            dst_reg[offset] = res;
-            dst_reg[offset+8] = res;
-            dst_reg++;
-        }
-        TTI_SETRWC(p_setrwc::CLR_NONE, p_setrwc::CR_D, 8, 0, 0, p_setrwc::SET_D);
-        TTI_SETRWC(p_setrwc::CLR_NONE, p_setrwc::CR_D, 8, 0, 0, p_setrwc::SET_D);
-        TTI_SETRWC(p_setrwc::CLR_NONE, p_setrwc::CR_D, 8, 0, 0, p_setrwc::SET_D);
-        TTI_SETRWC(p_setrwc::CLR_NONE, p_setrwc::CR_D, 8, 0, 0, p_setrwc::SET_D);
-    }
-
-    math::clear_dst_reg_addr();
-    TTI_STALLWAIT(p_stall::STALL_CFG, p_stall::WAIT_SFPU);
-    math::clear_addr_mod_base();
-}
-
-
 void update_online_softmax_values_internal(const uint32_t dst_index_in0, const uint32_t dst_index_in1, const uint32_t dst_index_out) {
     constexpr uint32_t n_vector_in_tile = 32;
     const uint32_t in_base_idx = dst_index_in0 * n_vector_in_tile;
@@ -202,10 +170,6 @@ static void compute_result_for_online_softmax() {
 
 static void make_mask(const int w, const int h, const int dst_tile_id) {
     MATH(make_mask_internal(w, h, dst_tile_id));
-}
-
-static void max_cross_face_sfpu(const int dst_tile_id) {
-    MATH(max_cross_face_sfpu_internal(dst_tile_id));
 }
 
 // ============================================================================
@@ -332,10 +296,6 @@ void MAIN {
                 cb_pop_front(cb_in1, 1);
                 #endif
             }
-            // dprint_tensix_dest_reg(2);
-            // WORKARROUND: (not working) wokroung FPU reduce only does partial result some times
-            // max_cross_face_sfpu(2);
-            // dprint_tensix_dest_reg(2);
 
             tile_regs_commit();
             tile_regs_wait();

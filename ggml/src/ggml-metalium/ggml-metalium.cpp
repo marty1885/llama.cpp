@@ -1528,16 +1528,17 @@ static void ggml_backend_metalium_concat(ggml_backend_metalium_context * ctx, st
 
 static bool ggml_backend_metalium_can_softmax(const struct ggml_tensor * dst)
 {
-    // GGML_UNUSED(dst);
-    // return true;
-    std::array<float, 2> params;
-    memcpy(&params, dst->op_params, sizeof(params));
-    auto [scale, max_bias] = params;
-    return max_bias == 0.f;
+    GGML_UNUSED(dst);
+    return true;
+    // std::array<float, 2> params;
+    // memcpy(&params, dst->op_params, sizeof(params));
+    // auto [scale, max_bias] = params;
+    // return max_bias == 0.f;
 }
 
 static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
 {
+#if 0
     GGML_UNUSED(ctx);
     GGML_METALIUM_OP_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
@@ -1559,7 +1560,7 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
             .tensor = std::make_shared<tt::tt_metal::Tensor>(ttggml::soft_max(x, mask, scale))
         };
     }
-#if 0
+#else
 
     const ggml_tensor *src0 = dst->src[0];
     const ggml_tensor *src1 = dst->src[1];

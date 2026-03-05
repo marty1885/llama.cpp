@@ -605,6 +605,7 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
                 // The m edge is difficult to do because of the 4 conseqtive load hardware limitation
                 // And the k edge is impossible because that is encoded as `stride & 0xFFFFFFFFFFC0ULL` which becomes 0 for stride 16 (4x FP32) :(
                 // Can loosen but no real way to make them free. The n edge is the only free one
+                // FIXME: I don't think it should be 0xFFFFFFFFFFC0... PRM doesn't say so
                 int64_t m = op->src[0]->ne[1];
                 int64_t k = op->src[0]->ne[0];
                 if(op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && m % 16 == 0 && k % 16 == 0) {

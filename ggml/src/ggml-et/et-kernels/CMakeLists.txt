@@ -39,8 +39,20 @@ file(CONFIGURE OUTPUT ${ADDRESS_FILE} CONTENT "${ADDRESS}" @ONLY)
 # KERNELS defined in upper CMakeLists.txt
 foreach(KERNEL ${KERNELS})
     add_riscv_executable(${KERNEL})
+
+    # Find the kernel (could be C or C++)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/${KERNEL}.cpp)
+        set(KERNEL_SRC src/${KERNEL}.cpp)
+    elseif(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/${KERNEL}.cc)
+        set(KERNEL_SRC src/${KERNEL}.cc)
+    elseif(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/${KERNEL}.c)
+        set(KERNEL_SRC src/${KERNEL}.c)
+    else()
+        message(FATAL_ERROR "Source for kernel ${KERNEL} not found under src/. Supported extensions c, cpp")
+    endif()
+
     target_sources(${KERNEL}.elf PRIVATE
-        src/${KERNEL}.c
+        ${KERNEL_SRC}
         src/crt.S
     )
     target_include_directories(${KERNEL}.elf PRIVATE
@@ -49,19 +61,19 @@ foreach(KERNEL ${KERNELS})
     target_link_libraries(${KERNEL}.elf PRIVATE et-common-libs::cm-umode)
     # C-only flags — must not apply to .S files
     target_compile_options(${KERNEL}.elf PRIVATE
-        $<$<COMPILE_LANGUAGE:C>:-fno-zero-initialized-in-bss>
-        $<$<COMPILE_LANGUAGE:C>:-ffreestanding>
-        $<$<COMPILE_LANGUAGE:C>:-std=c99>
-        $<$<COMPILE_LANGUAGE:C>:-ffat-lto-objects>
-        $<$<COMPILE_LANGUAGE:C>:-mcmodel=medany>
-        $<$<COMPILE_LANGUAGE:C>:-mabi=lp64f>
-        $<$<COMPILE_LANGUAGE:C>:-march=rv64imf>
-        $<$<COMPILE_LANGUAGE:C>:-ffunction-sections>
-        $<$<COMPILE_LANGUAGE:C>:-fdata-sections>
-        $<$<COMPILE_LANGUAGE:C>:-O3>
-        $<$<COMPILE_LANGUAGE:C>:-g0>
-        $<$<COMPILE_LANGUAGE:C>:-nostdlib>
-        $<$<COMPILE_LANGUAGE:C>:-ffreestanding>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-fno-zero-initialized-in-bss>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-ffreestanding>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-std=c99>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-ffat-lto-objects>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-mcmodel=medany>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-mabi=lp64f>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-march=rv64imf>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-ffunction-sections>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-fdata-sections>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-O3>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-g0>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-nostdlib>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-ffreestanding>
     )
     target_link_options(${KERNEL}.elf PRIVATE
         -Wl,--defsym=BASE_ADDRESS=${ADDRESS}
@@ -77,9 +89,10 @@ foreach(KERNEL ${KERNELS})
         COMMAND ${CMAKE_STRIP} --strip-debug $<TARGET_FILE:${KERNEL}.elf>
         COMMAND ${CHECK_SCRIPT}
             ${CMAKE_OBJDUMP} ${CMAKE_ADDR2LINE} $<TARGET_FILE:${KERNEL}.elf>
-        DEPENDS ${CHECK_SCRIPT}
+        # DEPENDS ${CHECK_SCRIPT} # FIXME: CMake says this file is invalid...?
         VERBATIM
     )
+    message(${CHECK_SCRIPT})
 endforeach()
 
 # Print summary

@@ -9300,6 +9300,14 @@ bool llama_model_is_recurrent(const llama_model * model) {
     return llm_arch_is_recurrent(model->arch);
 }
 
+int32_t llama_model_n_embd_r(const llama_model * model) {
+    return (int32_t) model->hparams.n_embd_r();
+}
+
+int32_t llama_model_n_embd_s(const llama_model * model) {
+    return (int32_t) model->hparams.n_embd_s();
+}
+
 bool llama_model_is_hybrid(const llama_model * model) {
     return llm_arch_is_hybrid(model->arch);
 }

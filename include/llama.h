@@ -634,6 +634,33 @@ extern "C" {
     // Returns true if the model is recurrent (like Mamba, RWKV, etc.)
     LLAMA_API bool llama_model_is_recurrent(const struct llama_model * model);
 
+    // Recurrent state dimensions (return 0 for non-recurrent models).
+    // n_embd_r: token-shift state size per layer  (RWKV: 2 * n_embd)
+    // n_embd_s: WKV / SSM state size per layer    (RWKV: n_embd * wkv_head_size)
+    LLAMA_API int32_t llama_model_n_embd_r(const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_embd_s(const struct llama_model * model);
+
+    // Copy the current recurrent state for seq_id into caller-provided f32 buffers.
+    // Must be called immediately after llama_decode().
+    //   r_out : float[n_layer * n_embd_r]  — token-shift state  (may be NULL)
+    //   s_out : float[n_layer * n_embd_s]  — WKV / SSM state    (may be NULL)
+    // Returns false if the model is not recurrent or seq_id has no live state.
+    LLAMA_API bool llama_recurrent_state_get_f32(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            float                * r_out,
+            float                * s_out);
+
+    // Write f32 buffers back into the recurrent state for seq_id.
+    // Same layout as llama_recurrent_state_get_f32.
+    //   r_in : float[n_layer * n_embd_r]  (may be NULL to skip)
+    //   s_in : float[n_layer * n_embd_s]  (may be NULL to skip)
+    LLAMA_API bool llama_recurrent_state_set_f32(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            const float          * r_in,
+            const float          * s_in);
+
     // Returns true if the model is hybrid (like Jamba, Granite, etc.)
     LLAMA_API bool llama_model_is_hybrid(const struct llama_model * model);
 

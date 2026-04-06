@@ -534,6 +534,13 @@ public:
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
 
+    // optional hooks called from the inference thread.
+    // state is valid for llama_recurrent_state_get_f32() at call time.
+    //   on_prompt_done:  fires once after prompt is processed (first generated token sampled)
+    //   on_generation_done: fires when generation stops (EOG / stop word)
+    std::function<void(llama_context *, llama_token, llama_seq_id)> fn_on_prompt_done;
+    std::function<void(llama_context *, llama_token, llama_seq_id)> fn_on_generation_done;
+
     server_queue    queue_tasks;
     server_response queue_results;
 
@@ -2850,6 +2857,11 @@ private:
                     // prompt evaluated for next-token prediction
                     slot.state = SLOT_STATE_GENERATING;
 
+                    // fire prompt-done hook BEFORE first sample
+                    if (fn_on_prompt_done) {
+                        fn_on_prompt_done(ctx, -1, (llama_seq_id) slot.id);
+                    }
+
                     if (slot.can_speculate()) {
                         common_speculative_begin(slot.spec, slot.prompt.tokens.get_text_tokens());
                     }
@@ -2892,7 +2904,10 @@ private:
                 }
 
                 if (!process_token(result, slot)) {
-                    // release slot because of stop condition
+                    // generation stopped — fire hook before releasing slot
+                    if (fn_on_generation_done) {
+                        fn_on_generation_done(ctx, id, (llama_seq_id) slot.id);
+                    }
                     slot.print_timings();
                     send_final_response(slot);
                     metrics.on_prediction(slot);
@@ -3065,6 +3080,14 @@ struct server_res_generator : server_http_res {
 
 void server_context::on_sleeping_changed(std::function<void(bool)> callback) {
     impl->queue_tasks.on_sleeping_state(std::move(callback));
+}
+
+void server_context::on_prompt_done(std::function<void(llama_context *, llama_token, llama_seq_id)> fn) {
+    impl->fn_on_prompt_done = std::move(fn);
+}
+
+void server_context::on_generation_done(std::function<void(llama_context *, llama_token, llama_seq_id)> fn) {
+    impl->fn_on_generation_done = std::move(fn);
 }
 
 

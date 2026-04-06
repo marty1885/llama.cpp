@@ -5,6 +5,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -3199,6 +3200,129 @@ int32_t llama_set_adapter_cvec(
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     return ctx->get_memory();
+}
+
+bool llama_recurrent_state_get_f32(
+        llama_context * ctx,
+        llama_seq_id    seq_id,
+        float         * r_out,
+        float         * s_out) {
+    auto * mem = dynamic_cast<llama_memory_recurrent *>(ctx->get_memory());
+    if (!mem) {
+        return false;
+    }
+
+    // find the cell that belongs to seq_id
+    int32_t cell_idx = -1;
+    for (uint32_t i = 0; i < mem->size; ++i) {
+        if (mem->cells[i].has_seq_id(seq_id)) {
+            cell_idx = (int32_t) i;
+            break;
+        }
+    }
+    if (cell_idx < 0) {
+        return false;
+    }
+
+    const auto & hparams  = ctx->get_model().hparams;
+    const uint32_t n_layer  = hparams.n_layer;
+    const uint32_t n_embd_r = hparams.n_embd_r();
+    const uint32_t n_embd_s = hparams.n_embd_s();
+
+    if (r_out && n_embd_r > 0) {
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            ggml_tensor * t = mem->r_l[il];
+            if (!t) { continue; }
+            const size_t row_bytes = ggml_row_size(t->type, n_embd_r);
+            float * dst = r_out + (size_t)il * n_embd_r;
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_get(t, dst, (size_t)cell_idx * row_bytes, row_bytes);
+            } else if (t->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> tmp(n_embd_r);
+                ggml_backend_tensor_get(t, tmp.data(), (size_t)cell_idx * row_bytes, row_bytes);
+                ggml_fp16_to_fp32_row(tmp.data(), dst, (int64_t) n_embd_r);
+            }
+        }
+    }
+
+    if (s_out && n_embd_s > 0) {
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            ggml_tensor * t = mem->s_l[il];
+            if (!t) { continue; }
+            const size_t row_bytes = ggml_row_size(t->type, n_embd_s);
+            float * dst = s_out + (size_t)il * n_embd_s;
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_get(t, dst, (size_t)cell_idx * row_bytes, row_bytes);
+            } else if (t->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> tmp(n_embd_s);
+                ggml_backend_tensor_get(t, tmp.data(), (size_t)cell_idx * row_bytes, row_bytes);
+                ggml_fp16_to_fp32_row(tmp.data(), dst, (int64_t) n_embd_s);
+            }
+        }
+    }
+
+    return true;
+}
+
+bool llama_recurrent_state_set_f32(
+        llama_context  * ctx,
+        llama_seq_id     seq_id,
+        const float    * r_in,
+        const float    * s_in) {
+    auto * mem = dynamic_cast<llama_memory_recurrent *>(ctx->get_memory());
+    if (!mem) {
+        return false;
+    }
+
+    int32_t cell_idx = -1;
+    for (uint32_t i = 0; i < mem->size; ++i) {
+        if (mem->cells[i].has_seq_id(seq_id)) {
+            cell_idx = (int32_t) i;
+            break;
+        }
+    }
+    if (cell_idx < 0) {
+        return false;
+    }
+
+    const auto & hparams  = ctx->get_model().hparams;
+    const uint32_t n_layer  = hparams.n_layer;
+    const uint32_t n_embd_r = hparams.n_embd_r();
+    const uint32_t n_embd_s = hparams.n_embd_s();
+
+    if (r_in && n_embd_r > 0) {
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            ggml_tensor * t = mem->r_l[il];
+            if (!t) { continue; }
+            const size_t row_bytes = ggml_row_size(t->type, n_embd_r);
+            const float * src = r_in + (size_t)il * n_embd_r;
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(t, src, (size_t)cell_idx * row_bytes, row_bytes);
+            } else if (t->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> tmp(n_embd_r);
+                ggml_fp32_to_fp16_row(src, tmp.data(), (int64_t) n_embd_r);
+                ggml_backend_tensor_set(t, tmp.data(), (size_t)cell_idx * row_bytes, row_bytes);
+            }
+        }
+    }
+
+    if (s_in && n_embd_s > 0) {
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            ggml_tensor * t = mem->s_l[il];
+            if (!t) { continue; }
+            const size_t row_bytes = ggml_row_size(t->type, n_embd_s);
+            const float * src = s_in + (size_t)il * n_embd_s;
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(t, src, (size_t)cell_idx * row_bytes, row_bytes);
+            } else if (t->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> tmp(n_embd_s);
+                ggml_fp32_to_fp16_row(src, tmp.data(), (int64_t) n_embd_s);
+                ggml_backend_tensor_set(t, tmp.data(), (size_t)cell_idx * row_bytes, row_bytes);
+            }
+        }
+    }
+
+    return true;
 }
 
 void llama_memory_clear(llama_memory_t mem, bool data) {

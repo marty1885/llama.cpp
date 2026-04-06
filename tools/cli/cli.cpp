@@ -7,11 +7,15 @@
 #include "server-context.h"
 #include "server-task.h"
 
+#include "llama.h"
+
 #include <array>
 #include <atomic>
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <thread>
 #include <signal.h>
 
@@ -349,6 +353,33 @@ int main(int argc, char ** argv) {
 
     common_init();
 
+    // extract --steer args before common_params_parse (which rejects unknown flags)
+    // modes: nudge   — add alpha * direction to head state (default)
+    //        zero    — zero out the head state
+    //        scale   — multiply head state by alpha
+    //        rotate  — random permutation + sign flips (preserves norm, destroys direction)
+    //        random  — nudge with a random unit vector
+    std::string steer_path;
+    std::string steer_mode  = "nudge";
+    int         steer_head  = 9;
+    int         steer_layer = 0;
+    float       steer_alpha = 1.0f;
+    {
+        std::vector<char *> filtered;
+        for (int i = 0; i < argc; ++i) {
+            std::string a = argv[i];
+            if      (a == "--steer"        && i+1 < argc) { steer_path  = argv[++i]; }
+            else if (a == "--steer-mode"   && i+1 < argc) { steer_mode  = argv[++i]; }
+            else if (a == "--steer-head"   && i+1 < argc) { steer_head  = std::atoi(argv[++i]); }
+            else if (a == "--steer-layer"  && i+1 < argc) { steer_layer = std::atoi(argv[++i]); }
+            else if (a == "--steer-alpha"  && i+1 < argc) { steer_alpha = (float) std::atof(argv[++i]); }
+            else { filtered.push_back(argv[i]); }
+        }
+        argc = (int) filtered.size();
+        for (int i = 0; i < argc; ++i) { argv[i] = filtered[i]; }
+    }
+    const bool do_steer = !steer_path.empty() || steer_mode == "zero" || steer_mode == "scale" || steer_mode == "rotate" || steer_mode == "random";
+
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_CLI)) {
         return 1;
     }
@@ -396,6 +427,162 @@ int main(int argc, char ** argv) {
 
     console::spinner::stop();
     console::log("\n");
+
+    // ---- steering setup (optional) ------------------------------------------
+    if (do_steer) {
+        llama_context * lctx = ctx_cli.ctx_server.get_llama_context();
+        const llama_model * lmodel = llama_get_model(lctx);
+
+        if (!llama_model_is_recurrent(lmodel)) {
+            console::error("--steer requires a recurrent model (RWKV/Mamba)\n");
+            return 1;
+        }
+
+        const int n_layer   = llama_model_n_layer(lmodel);
+        const int n_embd    = llama_model_n_embd(lmodel);
+        const int n_embd_s  = llama_model_n_embd_s(lmodel);
+        const int head_size = n_embd_s / n_embd;
+        const int n_head    = n_embd / head_size;
+        const int hs2       = head_size * head_size;
+
+        const bool steer_all_heads  = (steer_head  == -1);
+        const bool steer_all_layers = (steer_layer == -1);
+        if (!steer_all_heads && (steer_head < 0 || steer_head >= n_head)) {
+            console::error("--steer-head %d out of range [0, %d) or -1 for all\n", steer_head, n_head); return 1;
+        }
+        if (!steer_all_layers && (steer_layer < 0 || steer_layer >= n_layer)) {
+            console::error("--steer-layer %d out of range [0, %d) or -1 for all\n", steer_layer, n_layer); return 1;
+        }
+
+        // load direction vector (only needed for "nudge" mode)
+        // auto-detect granularity from file size:
+        //   hs2              = one head   (head_size * head_size)
+        //   n_embd_s         = one layer  (all heads)
+        //   n_layer*n_embd_s = full state (all layers, all heads)
+        enum steer_scope_t { SCOPE_HEAD, SCOPE_LAYER, SCOPE_FULL };
+        steer_scope_t steer_scope = SCOPE_HEAD;
+        std::vector<float> direction;
+        if (steer_mode == "nudge") {
+            if (steer_path.empty()) { console::error("--steer FILE required for nudge mode\n"); return 1; }
+            std::ifstream ifs(steer_path);
+            if (!ifs) { console::error("cannot open --steer file: %s\n", steer_path.c_str()); return 1; }
+            float v; while (ifs >> v) { direction.push_back(v); }
+            const int dir_size = (int) direction.size();
+            if (dir_size == n_layer * n_embd_s) {
+                steer_scope = SCOPE_FULL;
+                console::log("direction: full state (%d values, all layers)\n", dir_size);
+            } else if (dir_size == n_embd_s) {
+                steer_scope = SCOPE_LAYER;
+                console::log("direction: one layer (%d values, all %d heads)\n", dir_size, n_head);
+            } else if (dir_size == hs2) {
+                steer_scope = SCOPE_HEAD;
+                console::log("direction: one head (%d values)\n", dir_size);
+            } else {
+                console::error("direction has %d values, expected %d (head), %d (layer), or %d (full)\n",
+                               dir_size, hs2, n_embd_s, n_layer * n_embd_s);
+                return 1;
+            }
+            float norm = 0;
+            for (float x : direction) { norm += x * x; }
+            norm = sqrtf(norm);
+            if (norm > 0) { for (float & x : direction) { x /= norm; } }
+        } else if (steer_mode == "random") {
+            direction.resize(hs2);
+            std::mt19937 rng(42);
+            std::normal_distribution<float> dist(0.0f, 1.0f);
+            for (float & x : direction) { x = dist(rng); }
+            float norm = 0;
+            for (float x : direction) { norm += x * x; }
+            norm = sqrtf(norm);
+            if (norm > 0) { for (float & x : direction) { x /= norm; } }
+        }
+
+        console::log("steering: mode=%s layer=%d head=%d alpha=%.3f\n",
+                      steer_mode.c_str(), steer_layer, steer_head, steer_alpha);
+
+        ctx_cli.ctx_server.on_prompt_done(
+            [direction, steer_mode, steer_scope, steer_layer, steer_head, steer_alpha,
+             steer_all_heads, steer_all_layers, n_embd_s, n_head, hs2]
+            (llama_context * ctx, llama_token, llama_seq_id seq_id) {
+                const int n_layer_total = llama_model_n_layer(llama_get_model(ctx));
+                const size_t total_s = (size_t) n_layer_total * n_embd_s;
+                std::vector<float> s_flat(total_s);
+
+                if (!llama_recurrent_state_get_f32(ctx, seq_id, nullptr, s_flat.data())) {
+                    fprintf(stderr, "[steer] ERROR: get_f32 failed\n"); return;
+                }
+
+                float norm_before = 0;
+                for (size_t j = 0; j < total_s; ++j) { norm_before += s_flat[j] * s_flat[j]; }
+                norm_before = sqrtf(norm_before);
+
+                if (steer_mode == "nudge" && !direction.empty()) {
+                    // apply direction based on its scope
+                    if (steer_scope == SCOPE_FULL) {
+                        // direction covers all layers × all heads
+                        for (size_t j = 0; j < total_s && j < direction.size(); ++j) {
+                            s_flat[j] += steer_alpha * direction[j];
+                        }
+                    } else if (steer_scope == SCOPE_LAYER) {
+                        // direction covers one layer (all heads) — apply to steer_layer
+                        float * layer_s = s_flat.data() + steer_layer * n_embd_s;
+                        for (int j = 0; j < n_embd_s && j < (int) direction.size(); ++j) {
+                            layer_s[j] += steer_alpha * direction[j];
+                        }
+                    } else {
+                        // direction covers one head — apply to steer_layer/steer_head
+                        float * head_s = s_flat.data() + steer_layer * n_embd_s + steer_head * hs2;
+                        for (int j = 0; j < hs2 && j < (int) direction.size(); ++j) {
+                            head_s[j] += steer_alpha * direction[j];
+                        }
+                    }
+                } else {
+                    // zero / scale / rotate / random — apply per head as before
+                    const int l_start = steer_all_layers ? 0 : steer_layer;
+                    const int l_end   = steer_all_layers ? n_layer_total : steer_layer + 1;
+                    const int h_start = steer_all_heads  ? 0 : steer_head;
+                    const int h_end   = steer_all_heads  ? n_head : steer_head + 1;
+
+                    for (int l = l_start; l < l_end; ++l) {
+                        float * layer_s = s_flat.data() + l * n_embd_s;
+                        for (int h = h_start; h < h_end; ++h) {
+                            float * head_s = layer_s + h * hs2;
+                            if (steer_mode == "zero") {
+                                for (int j = 0; j < hs2; ++j) { head_s[j] = 0.0f; }
+                            } else if (steer_mode == "scale") {
+                                for (int j = 0; j < hs2; ++j) { head_s[j] *= steer_alpha; }
+                            } else if (steer_mode == "rotate") {
+                                std::mt19937 rng(42 + l * n_head + h);
+                                std::vector<float> tmp(head_s, head_s + hs2);
+                                for (int j = hs2 - 1; j > 0; --j) {
+                                    std::uniform_int_distribution<int> dist(0, j);
+                                    std::swap(tmp[j], tmp[dist(rng)]);
+                                }
+                                std::uniform_int_distribution<int> coin(0, 1);
+                                for (int j = 0; j < hs2; ++j) {
+                                    head_s[j] = coin(rng) ? tmp[j] : -tmp[j];
+                                }
+                            } else if (steer_mode == "random" && !direction.empty()) {
+                                for (int j = 0; j < hs2; ++j) {
+                                    head_s[j] += steer_alpha * direction[j];
+                                }
+                            }
+                        }
+                    }
+                }
+
+                float norm_after = 0;
+                for (size_t j = 0; j < total_s; ++j) { norm_after += s_flat[j] * s_flat[j]; }
+                norm_after = sqrtf(norm_after);
+
+                fprintf(stderr, "[steer] %s alpha=%.1f  total_norm: %.2f -> %.2f\n",
+                        steer_mode.c_str(), steer_alpha, norm_before, norm_after);
+
+                if (!llama_recurrent_state_set_f32(ctx, seq_id, nullptr, s_flat.data())) {
+                    fprintf(stderr, "[steer] ERROR: set_f32 failed\n");
+                }
+            });
+    }
 
     std::thread inference_thread([&ctx_cli]() {
         ctx_cli.ctx_server.start_loop();

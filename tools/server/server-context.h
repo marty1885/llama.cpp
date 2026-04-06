@@ -78,6 +78,11 @@ struct server_context {
     // register a callback to be called when sleeping state changes
     // must be set before load_model() is called
     void on_sleeping_changed(std::function<void(bool)> callback);
+
+    // hooks for recurrent state capture — called from the inference thread.
+    // fn(ctx, token_id, seq_id) — state valid for llama_recurrent_state_get_f32().
+    void on_prompt_done(std::function<void(llama_context *, llama_token, llama_seq_id)> fn);
+    void on_generation_done(std::function<void(llama_context *, llama_token, llama_seq_id)> fn);
 };
 
 

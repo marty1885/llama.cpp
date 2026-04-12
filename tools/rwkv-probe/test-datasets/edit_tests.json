@@ -1,0 +1,123 @@
+[
+  {
+    "name": "basic_city_change",
+    "context": "Alice lives in Paris. Bob lives in Tokyo.",
+    "questions": [
+      {"query": " Where does Alice live? Alice lives in", "expect": "Paris", "label": "alice_city"},
+      {"query": " Where does Bob live? Bob lives in", "expect": "Tokyo", "label": "bob_city"}
+    ],
+    "edits": [
+      {
+        "op": "change",
+        "from": "Alice lives in Paris. Where does Alice live? Alice lives in",
+        "to": "Alice lives in London. Where does Alice live? Alice lives in",
+        "label": "alice Paris→London"
+      },
+      {
+        "op": "wipe",
+        "from": "Alice lives in Paris. Where does Alice live? Alice lives in",
+        "to": "Alice lives in London. Where does Alice live? Alice lives in",
+        "label": "wipe alice city"
+      },
+      {
+        "op": "donor-free",
+        "from": "Alice lives in Paris. Where does Alice live? Alice lives in",
+        "to": "Alice lives in London. Where does Alice live? Alice lives in",
+        "label": "donor-free Paris→London"
+      }
+    ]
+  },
+  {
+    "name": "cross_context_narrative",
+    "context": "Last year Alice moved to Paris. She enjoys the food and culture. Meanwhile Bob settled in Tokyo for work.",
+    "questions": [
+      {"query": " Where does Alice live? Alice lives in", "expect": "Paris", "label": "alice_city"},
+      {"query": " Where does Bob live? Bob lives in", "expect": "Tokyo", "label": "bob_city"}
+    ],
+    "edits": [
+      {
+        "op": "change",
+        "from": "Alice lives in Paris. Where does Alice live? Alice lives in",
+        "to": "Alice lives in London. Where does Alice live? Alice lives in",
+        "label": "alice Paris→London (cross-ctx)"
+      }
+    ]
+  },
+  {
+    "name": "five_entities",
+    "context": "Alice lives in Paris. Bob lives in Tokyo. Carol lives in London. Dave lives in Rome. Eve lives in Berlin.",
+    "questions": [
+      {"query": " Where does Alice live? Alice lives in", "expect": "Paris", "label": "alice"},
+      {"query": " Where does Bob live? Bob lives in", "expect": "Tokyo", "label": "bob"},
+      {"query": " Where does Carol live? Carol lives in", "expect": "London", "label": "carol"},
+      {"query": " Where does Dave live? Dave lives in", "expect": "Rome", "label": "dave"},
+      {"query": " Where does Eve live? Eve lives in", "expect": "Berlin", "label": "eve"}
+    ],
+    "edits": [
+      {
+        "op": "change",
+        "from": "Alice lives in Paris. Where does Alice live? Alice lives in",
+        "to": "Alice lives in Madrid. Where does Alice live? Alice lives in",
+        "label": "alice Paris→Madrid"
+      },
+      {
+        "op": "donor-free",
+        "from": "Alice lives in Paris. Where does Alice live? Alice lives in",
+        "to": "Alice lives in Madrid. Where does Alice live? Alice lives in",
+        "label": "donor-free alice Paris→Madrid"
+      }
+    ]
+  },
+  {
+    "name": "property_crosstalk",
+    "context": "Alice has a red hat and blue eyes. Bob has a green hat and brown eyes.",
+    "questions": [
+      {"query": " What color is Alice's hat? Alice's hat is", "expect": "red", "label": "alice_hat"},
+      {"query": " What color are Alice's eyes? Alice's eyes are", "expect": "blue", "label": "alice_eyes"},
+      {"query": " What color is Bob's hat? Bob's hat is", "expect": "green", "label": "bob_hat"},
+      {"query": " What color are Bob's eyes? Bob's eyes are", "expect": "brown", "label": "bob_eyes"}
+    ],
+    "edits": [
+      {
+        "op": "change",
+        "from": "Alice has a red hat. What color is Alice's hat? Alice's hat is",
+        "to": "Alice has a yellow hat. What color is Alice's hat? Alice's hat is",
+        "label": "alice hat red→yellow"
+      },
+      {
+        "op": "change",
+        "from": "Alice has blue eyes. What color are Alice's eyes? Alice's eyes are",
+        "to": "Alice has green eyes. What color are Alice's eyes? Alice's eyes are",
+        "label": "alice eyes blue→green"
+      }
+    ]
+  },
+  {
+    "name": "ambiguous_entity",
+    "context": "Alice Anderson has a red hat. Alice White has a blue hat.",
+    "questions": [
+      {"query": " What color is Alice Anderson's hat? Alice Anderson's hat is", "expect": "red", "label": "anderson"},
+      {"query": " What color is Alice White's hat? Alice White's hat is", "expect": "blue", "label": "white"}
+    ],
+    "edits": [
+      {
+        "op": "change",
+        "from": "Alice has a red hat. What color is Alice's hat? Alice's hat is",
+        "to": "Alice has a green hat. What color is Alice's hat? Alice's hat is",
+        "label": "ambiguous 'Alice' red→green"
+      },
+      {
+        "op": "change",
+        "from": "Alice Anderson has a red hat. What color is Alice Anderson's hat? Alice Anderson's hat is",
+        "to": "Alice Anderson has a green hat. What color is Alice Anderson's hat? Alice Anderson's hat is",
+        "label": "specific 'Anderson' red→green"
+      },
+      {
+        "op": "change",
+        "from": "Alice White has a blue hat. What color is Alice White's hat? Alice White's hat is",
+        "to": "Alice White has a green hat. What color is Alice White's hat? Alice White's hat is",
+        "label": "specific 'White' blue→green"
+      }
+    ]
+  }
+]

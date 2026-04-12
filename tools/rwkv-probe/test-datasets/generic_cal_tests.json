@@ -1,0 +1,98 @@
+[
+  {
+    "name": "generic_cal_city",
+    "context": "Alice lives in Paris. Bob lives in Tokyo.",
+    "questions": [
+      {"query": " Where does Alice live? Alice lives in", "expect": "Paris", "label": "alice"},
+      {"query": " Where does Bob live? Bob lives in", "expect": "Tokyo", "label": "bob"}
+    ],
+    "edits": [
+      {
+        "op": "change",
+        "from": "Alice lives in Paris. Where does Alice live? Alice lives in",
+        "to": "Alice lives in London. Where does Alice live? Alice lives in",
+        "label": "specific calibration (current approach)"
+      },
+      {
+        "op": "change",
+        "from": "The answer is Paris. The answer is",
+        "to": "The answer is London. The answer is",
+        "label": "generic 'The answer is X'"
+      },
+      {
+        "op": "change",
+        "from": "Paris. Paris is",
+        "to": "London. London is",
+        "label": "minimal 'X. X is'"
+      },
+      {
+        "op": "donor-free",
+        "from": "The answer is Paris. The answer is",
+        "to": "The answer is London. The answer is",
+        "label": "donor-free generic"
+      }
+    ]
+  },
+  {
+    "name": "generic_cal_hat",
+    "context": "Alice has a red hat. Bob has a green hat.",
+    "questions": [
+      {"query": " What color is Alice's hat? Alice's hat is", "expect": "red", "label": "alice"},
+      {"query": " What color is Bob's hat? Bob's hat is", "expect": "green", "label": "bob"}
+    ],
+    "edits": [
+      {
+        "op": "change",
+        "from": "Alice has a red hat. What color is Alice's hat? Alice's hat is",
+        "to": "Alice has a blue hat. What color is Alice's hat? Alice's hat is",
+        "label": "specific calibration"
+      },
+      {
+        "op": "change",
+        "from": "The answer is red. The answer is",
+        "to": "The answer is blue. The answer is",
+        "label": "generic 'The answer is X'"
+      },
+      {
+        "op": "change",
+        "from": "The color is red. The color is",
+        "to": "The color is blue. The color is",
+        "label": "generic 'The color is X'"
+      },
+      {
+        "op": "donor-free",
+        "from": "The answer is red. The answer is",
+        "to": "The answer is blue. The answer is",
+        "label": "donor-free generic"
+      }
+    ]
+  },
+  {
+    "name": "generic_cal_drink",
+    "context": "Alice likes tea. Bob likes milk.",
+    "questions": [
+      {"query": " What does Alice like? Alice likes", "expect": "tea", "label": "alice"},
+      {"query": " What does Bob like? Bob likes", "expect": "milk", "label": "bob"}
+    ],
+    "edits": [
+      {
+        "op": "change",
+        "from": "Alice likes tea. What does Alice like? Alice likes",
+        "to": "Alice likes coffee. What does Alice like? Alice likes",
+        "label": "specific calibration"
+      },
+      {
+        "op": "change",
+        "from": "The answer is tea. The answer is",
+        "to": "The answer is coffee. The answer is",
+        "label": "generic 'The answer is X'"
+      },
+      {
+        "op": "donor-free",
+        "from": "The answer is tea. The answer is",
+        "to": "The answer is coffee. The answer is",
+        "label": "donor-free generic"
+      }
+    ]
+  }
+]

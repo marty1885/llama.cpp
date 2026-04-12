@@ -1,0 +1,63 @@
+[
+  {
+    "name": "president_drink_not_pm",
+    "context": "The president likes tea. The prime minister likes milk.",
+    "questions": [
+      {"query": " What does the president like? The president likes", "expect": "tea", "label": "president"},
+      {"query": " What does the prime minister like? The prime minister likes", "expect": "milk", "label": "pm"}
+    ],
+    "edits": [
+      {
+        "op": "change",
+        "from": "The president likes tea. What does the president like? The president likes",
+        "to": "The president likes coffee. What does the president like? The president likes",
+        "label": "president tea→coffee"
+      },
+      {
+        "op": "donor-free",
+        "from": "The president likes tea. What does the president like? The president likes",
+        "to": "The president likes coffee. What does the president like? The president likes",
+        "label": "donor-free president tea→coffee"
+      }
+    ]
+  },
+  {
+    "name": "pm_drink_not_president",
+    "context": "The president likes tea. The prime minister likes milk.",
+    "questions": [
+      {"query": " What does the president like? The president likes", "expect": "tea", "label": "president"},
+      {"query": " What does the prime minister like? The prime minister likes", "expect": "milk", "label": "pm"}
+    ],
+    "edits": [
+      {
+        "op": "change",
+        "from": "The prime minister likes milk. What does the prime minister like? The prime minister likes",
+        "to": "The prime minister likes juice. What does the prime minister like? The prime minister likes",
+        "label": "pm milk→juice"
+      }
+    ]
+  },
+  {
+    "name": "three_roles_same_property",
+    "context": "The president likes tea. The prime minister likes milk. The king likes water.",
+    "questions": [
+      {"query": " What does the president like? The president likes", "expect": "tea", "label": "president"},
+      {"query": " What does the prime minister like? The prime minister likes", "expect": "milk", "label": "pm"},
+      {"query": " What does the king like? The king likes", "expect": "water", "label": "king"}
+    ],
+    "edits": [
+      {
+        "op": "change",
+        "from": "The president likes tea. What does the president like? The president likes",
+        "to": "The president likes coffee. What does the president like? The president likes",
+        "label": "president tea→coffee"
+      },
+      {
+        "op": "change",
+        "from": "The prime minister likes milk. What does the prime minister like? The prime minister likes",
+        "to": "The prime minister likes juice. What does the prime minister like? The prime minister likes",
+        "label": "pm milk→juice"
+      }
+    ]
+  }
+]

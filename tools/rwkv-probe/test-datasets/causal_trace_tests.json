@@ -1,0 +1,30 @@
+[
+  {
+    "name": "hat_color",
+    "prompt_a": "Alice has a red hat. Bob has a blue hat. Alice's hat color is",
+    "prompt_b": "Alice has a green hat. Bob has a yellow hat. Alice's hat color is",
+    "expect_a": "red",
+    "expect_b": "green"
+  },
+  {
+    "name": "animal",
+    "prompt_a": "The pet is a cat. The pet is a",
+    "prompt_b": "The pet is a dog. The pet is a",
+    "expect_a": "cat",
+    "expect_b": "dog"
+  },
+  {
+    "name": "city",
+    "prompt_a": "Tom lives in Paris. Where does Tom live? Tom lives in",
+    "prompt_b": "Tom lives in Tokyo. Where does Tom live? Tom lives in",
+    "expect_a": "Paris",
+    "expect_b": "Tokyo"
+  },
+  {
+    "name": "number",
+    "prompt_a": "The box has five balls. How many balls? The box has",
+    "prompt_b": "The box has nine balls. How many balls? The box has",
+    "expect_a": "five",
+    "expect_b": "nine"
+  }
+]

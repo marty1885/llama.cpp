@@ -1,0 +1,68 @@
+[
+  {
+    "name": "short_cal_hat",
+    "context": "Alice has a red hat wearing a blue shirt.",
+    "questions": [
+      {"query": " What color is Alice's hat? Alice's hat is", "expect": "red", "label": "hat"},
+      {"query": " What color is Alice's shirt? Alice's shirt is", "expect": "blue", "label": "shirt"}
+    ],
+    "edits": [
+      {
+        "op": "change",
+        "from": "Alice has a red hat.",
+        "to": "Alice has an orange hat.",
+        "label": "short: 'Alice has a red/orange hat.'"
+      },
+      {
+        "op": "change",
+        "from": "Alice has a red hat. What color is Alice's hat? Alice's hat is",
+        "to": "Alice has an orange hat. What color is Alice's hat? Alice's hat is",
+        "label": "long: with query suffix (reference)"
+      }
+    ]
+  },
+  {
+    "name": "short_cal_city",
+    "context": "Alice lives in Paris and works at a bakery. Bob lives in Tokyo and works at a bank.",
+    "questions": [
+      {"query": " Where does Alice live? Alice lives in", "expect": "Paris", "label": "alice_city"},
+      {"query": " Where does Bob live? Bob lives in", "expect": "Tokyo", "label": "bob_city"}
+    ],
+    "edits": [
+      {
+        "op": "change",
+        "from": "Alice lives in Paris.",
+        "to": "Alice lives in London.",
+        "label": "short: 'Alice lives in Paris/London.'"
+      },
+      {
+        "op": "change",
+        "from": "Alice lives in Paris. Where does Alice live? Alice lives in",
+        "to": "Alice lives in London. Where does Alice live? Alice lives in",
+        "label": "long: with query suffix (reference)"
+      }
+    ]
+  },
+  {
+    "name": "short_cal_drink",
+    "context": "Alice likes tea and reads books. Bob likes milk and plays chess.",
+    "questions": [
+      {"query": " What does Alice like to drink? Alice likes", "expect": "tea", "label": "alice"},
+      {"query": " What does Bob like to drink? Bob likes", "expect": "milk", "label": "bob"}
+    ],
+    "edits": [
+      {
+        "op": "change",
+        "from": "Alice likes tea.",
+        "to": "Alice likes coffee.",
+        "label": "short: 'Alice likes tea/coffee.'"
+      },
+      {
+        "op": "change",
+        "from": "Alice likes tea. What does Alice like? Alice likes",
+        "to": "Alice likes coffee. What does Alice like? Alice likes",
+        "label": "long: with query suffix (reference)"
+      }
+    ]
+  }
+]

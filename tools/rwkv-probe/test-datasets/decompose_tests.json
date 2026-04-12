@@ -1,0 +1,90 @@
+[
+  {
+    "name": "alice_red",
+    "prompt": "Alice has a red hat. What color is Alice's hat? Alice's hat is",
+    "entity": "Alice",
+    "property": "hat_color",
+    "value": "red",
+    "expect": "red"
+  },
+  {
+    "name": "alice_green",
+    "prompt": "Alice has a green hat. What color is Alice's hat? Alice's hat is",
+    "entity": "Alice",
+    "property": "hat_color",
+    "value": "green",
+    "expect": "green"
+  },
+  {
+    "name": "alice_blue",
+    "prompt": "Alice has a blue hat. What color is Alice's hat? Alice's hat is",
+    "entity": "Alice",
+    "property": "hat_color",
+    "value": "blue",
+    "expect": "blue"
+  },
+  {
+    "name": "bob_red",
+    "prompt": "Bob has a red hat. What color is Bob's hat? Bob's hat is",
+    "entity": "Bob",
+    "property": "hat_color",
+    "value": "red",
+    "expect": "red"
+  },
+  {
+    "name": "bob_green",
+    "prompt": "Bob has a green hat. What color is Bob's hat? Bob's hat is",
+    "entity": "Bob",
+    "property": "hat_color",
+    "value": "green",
+    "expect": "green"
+  },
+  {
+    "name": "eve_red",
+    "prompt": "Eve has a red hat. What color is Eve's hat? Eve's hat is",
+    "entity": "Eve",
+    "property": "hat_color",
+    "value": "red",
+    "expect": "red"
+  },
+  {
+    "name": "alice_paris",
+    "prompt": "Alice lives in Paris. Where does Alice live? Alice lives in",
+    "entity": "Alice",
+    "property": "city",
+    "value": "Paris",
+    "expect": "Paris"
+  },
+  {
+    "name": "alice_tokyo",
+    "prompt": "Alice lives in Tokyo. Where does Alice live? Alice lives in",
+    "entity": "Alice",
+    "property": "city",
+    "value": "Tokyo",
+    "expect": "Tokyo"
+  },
+  {
+    "name": "alice_london",
+    "prompt": "Alice lives in London. Where does Alice live? Alice lives in",
+    "entity": "Alice",
+    "property": "city",
+    "value": "London",
+    "expect": "London"
+  },
+  {
+    "name": "bob_paris",
+    "prompt": "Bob lives in Paris. Where does Bob live? Bob lives in",
+    "entity": "Bob",
+    "property": "city",
+    "value": "Paris",
+    "expect": "Paris"
+  },
+  {
+    "name": "bob_tokyo",
+    "prompt": "Bob lives in Tokyo. Where does Bob live? Bob lives in",
+    "entity": "Bob",
+    "property": "city",
+    "value": "Tokyo",
+    "expect": "Tokyo"
+  }
+]

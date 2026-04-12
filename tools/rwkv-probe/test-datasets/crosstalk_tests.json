@@ -1,0 +1,52 @@
+[
+  {
+    "name": "alice_hat_not_eyes",
+    "prompt_a": "Alice has a red hat and blue eyes. Bob has a green hat and brown eyes.",
+    "prompt_b": "Alice has a yellow hat and blue eyes. Bob has a green hat and brown eyes.",
+    "query_target": " What color is Alice's hat? Alice's hat is",
+    "query_control": " What color are Alice's eyes? Alice's eyes are",
+    "expect_a_target": "red",
+    "expect_b_target": "yellow",
+    "expect_control": "blue"
+  },
+  {
+    "name": "alice_eyes_not_hat",
+    "prompt_a": "Alice has a red hat and blue eyes. Bob has a green hat and brown eyes.",
+    "prompt_b": "Alice has a red hat and green eyes. Bob has a green hat and brown eyes.",
+    "query_target": " What color are Alice's eyes? Alice's eyes are",
+    "query_control": " What color is Alice's hat? Alice's hat is",
+    "expect_a_target": "blue",
+    "expect_b_target": "green",
+    "expect_control": "red"
+  },
+  {
+    "name": "alice_hat_not_bob_hat",
+    "prompt_a": "Alice has a red hat and blue eyes. Bob has a green hat and brown eyes.",
+    "prompt_b": "Alice has a yellow hat and blue eyes. Bob has a green hat and brown eyes.",
+    "query_target": " What color is Alice's hat? Alice's hat is",
+    "query_control": " What color is Bob's hat? Bob's hat is",
+    "expect_a_target": "red",
+    "expect_b_target": "yellow",
+    "expect_control": "green"
+  },
+  {
+    "name": "alice_hat_not_bob_eyes",
+    "prompt_a": "Alice has a red hat and blue eyes. Bob has a green hat and brown eyes.",
+    "prompt_b": "Alice has a yellow hat and blue eyes. Bob has a green hat and brown eyes.",
+    "query_target": " What color is Alice's hat? Alice's hat is",
+    "query_control": " What color are Bob's eyes? Bob's eyes are",
+    "expect_a_target": "red",
+    "expect_b_target": "yellow",
+    "expect_control": "brown"
+  },
+  {
+    "name": "bob_eyes_not_alice_eyes",
+    "prompt_a": "Alice has a red hat and blue eyes. Bob has a green hat and brown eyes.",
+    "prompt_b": "Alice has a red hat and blue eyes. Bob has a green hat and gray eyes.",
+    "query_target": " What color are Bob's eyes? Bob's eyes are",
+    "query_control": " What color are Alice's eyes? Alice's eyes are",
+    "expect_a_target": "brown",
+    "expect_b_target": "gray",
+    "expect_control": "blue"
+  }
+]

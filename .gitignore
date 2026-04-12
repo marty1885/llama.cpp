@@ -22,6 +22,11 @@
 *.tmp
 *.DS_Store
 
+# ROOT
+*.pcm
+*.d
+*.root
+
 # IDE / OS
 
 /.cache/

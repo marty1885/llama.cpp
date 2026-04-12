@@ -1,0 +1,52 @@
+[
+  {
+    "name": "donor_simple",
+    "prompt_a": "Alice lives in Paris. Bob lives in Tokyo.",
+    "prompt_b": "Alice lives in London. Bob lives in Tokyo.",
+    "query_target": " Where does Alice live? Alice lives in",
+    "query_control": " Where does Bob live? Bob lives in",
+    "expect_a_target": "Paris",
+    "expect_b_target": "London",
+    "expect_control": "Tokyo"
+  },
+  {
+    "name": "target_narrative",
+    "prompt_a": "Last year Alice moved to Paris. Meanwhile Bob settled in Tokyo. They both enjoy their cities.",
+    "prompt_b": "Last year Alice moved to London. Meanwhile Bob settled in Tokyo. They both enjoy their cities.",
+    "query_target": " Where does Alice live? Alice lives in",
+    "query_control": " Where does Bob live? Bob lives in",
+    "expect_a_target": "Paris",
+    "expect_b_target": "London",
+    "expect_control": "Tokyo"
+  },
+  {
+    "name": "target_qa",
+    "prompt_a": "Q: Where does Alice live? A: Paris. Q: Where does Bob live? A: Tokyo.",
+    "prompt_b": "Q: Where does Alice live? A: London. Q: Where does Bob live? A: Tokyo.",
+    "query_target": " Q: What city is Alice in? A:",
+    "query_control": " Q: What city is Bob in? A:",
+    "expect_a_target": "Paris",
+    "expect_b_target": "London",
+    "expect_control": "Tokyo"
+  },
+  {
+    "name": "donor_hat_simple",
+    "prompt_a": "Alice has a red hat. Bob has a green hat.",
+    "prompt_b": "Alice has a blue hat. Bob has a green hat.",
+    "query_target": " Alice's hat is",
+    "query_control": " Bob's hat is",
+    "expect_a_target": "red",
+    "expect_b_target": "blue",
+    "expect_control": "green"
+  },
+  {
+    "name": "target_hat_narrative",
+    "prompt_a": "Alice bought a red hat and Bob bought a green hat at the store today.",
+    "prompt_b": "Alice bought a blue hat and Bob bought a green hat at the store today.",
+    "query_target": " Alice's hat is",
+    "query_control": " Bob's hat is",
+    "expect_a_target": "red",
+    "expect_b_target": "blue",
+    "expect_control": "green"
+  }
+]

@@ -1,0 +1,150 @@
+[
+  {
+    "name": "alice_hat_only",
+    "prompt_a": "Alice has a red hat. Bob has a green hat.",
+    "prompt_b": "Alice has a blue hat. Bob has a green hat.",
+    "query_target": " Alice's hat is",
+    "query_control": " Bob's hat is",
+    "expect_a_target": "red",
+    "expect_b_target": "blue",
+    "expect_control": "green"
+  },
+  {
+    "name": "bob_hat_only",
+    "prompt_a": "Alice has a red hat. Bob has a green hat.",
+    "prompt_b": "Alice has a red hat. Bob has a yellow hat.",
+    "query_target": " Bob's hat is",
+    "query_control": " Alice's hat is",
+    "expect_a_target": "green",
+    "expect_b_target": "yellow",
+    "expect_control": "red"
+  },
+  {
+    "name": "alice_city_only",
+    "prompt_a": "Alice lives in Paris. Bob lives in Tokyo.",
+    "prompt_b": "Alice lives in London. Bob lives in Tokyo.",
+    "query_target": " Where does Alice live? Alice lives in",
+    "query_control": " Where does Bob live? Bob lives in",
+    "expect_a_target": "Paris",
+    "expect_b_target": "London",
+    "expect_control": "Tokyo"
+  },
+  {
+    "name": "bob_city_only",
+    "prompt_a": "Alice lives in Paris. Bob lives in Tokyo.",
+    "prompt_b": "Alice lives in Paris. Bob lives in London.",
+    "query_target": " Where does Bob live? Bob lives in",
+    "query_control": " Where does Alice live? Alice lives in",
+    "expect_a_target": "Tokyo",
+    "expect_b_target": "London",
+    "expect_control": "Paris"
+  },
+  {
+    "name": "alice_eyes_crosstalk",
+    "prompt_a": "Alice has a red hat and green eyes.",
+    "prompt_b": "Alice has a red hat and blue eyes.",
+    "query_target": " Alice's eyes are",
+    "query_control": " Alice's hat is",
+    "expect_a_target": "green",
+    "expect_b_target": "blue",
+    "expect_control": "red",
+    "edit_sentence_a": "Alice has green eyes.",
+    "edit_sentence_b": "Alice has blue eyes."
+  },
+  {
+    "name": "bob_city_freeform",
+    "prompt_a": "Alice lives in Paris. Bob lives in Tokyo.",
+    "prompt_b": "Alice lives in Paris. Bob lives in London.",
+    "query_target": " Where does Bob live? Bob lives in",
+    "query_control": " Where does Alice live? Alice lives in",
+    "expect_a_target": "Tokyo",
+    "expect_b_target": "London",
+    "expect_control": "Paris",
+    "edit_sentence_a": "Tokyo",
+    "edit_sentence_b": "London"
+  },
+  {
+    "name": "alice_city_freeform",
+    "prompt_a": "Alice lives in Paris. Bob lives in Tokyo.",
+    "prompt_b": "Alice lives in London. Bob lives in Tokyo.",
+    "query_target": " Where does Alice live? Alice lives in",
+    "query_control": " Where does Bob live? Bob lives in",
+    "expect_a_target": "Paris",
+    "expect_b_target": "London",
+    "expect_control": "Tokyo",
+    "edit_sentence_a": "Paris",
+    "edit_sentence_b": "London"
+  },
+  {
+    "name": "city_verb_mismatch",
+    "prompt_a": "Alice resides in Paris. Bob resides in Tokyo.",
+    "prompt_b": "Alice resides in London. Bob resides in Tokyo.",
+    "query_target": " Where does Alice live? Alice lives in",
+    "query_control": " Where does Bob live? Bob lives in",
+    "expect_a_target": "Paris",
+    "expect_b_target": "London",
+    "expect_control": "Tokyo",
+    "edit_sentence_a": "Alice lives in Paris",
+    "edit_sentence_b": "Alice lives in London"
+  },
+  {
+    "name": "ownership_has_vs_owns",
+    "prompt_a": "Alice has a red hat. Bob owns a car.",
+    "prompt_b": "Alice has a red hat. Bob owns a house.",
+    "query_target": " What does Bob own? Bob owns a",
+    "query_control": " Alice's hat is",
+    "expect_a_target": "car",
+    "expect_b_target": "house",
+    "expect_control": "red",
+    "edit_sentence_a": "Bob has a car",
+    "edit_sentence_b": "Bob has a house"
+  },
+  {
+    "name": "ownership_exact_match",
+    "prompt_a": "Alice has a red hat. Bob owns a car.",
+    "prompt_b": "Alice has a red hat. Bob owns a house.",
+    "query_target": " What does Bob own? Bob owns a",
+    "query_control": " Alice's hat is",
+    "expect_a_target": "car",
+    "expect_b_target": "house",
+    "expect_control": "red",
+    "edit_sentence_a": "Bob owns a car",
+    "edit_sentence_b": "Bob owns a house"
+  },
+  {
+    "name": "ownership_prompt_has_edit_owns",
+    "prompt_a": "Alice has a red hat. Bob has a car.",
+    "prompt_b": "Alice has a red hat. Bob has a house.",
+    "query_target": " What does Bob have? Bob has a",
+    "query_control": " Alice's hat is",
+    "expect_a_target": "car",
+    "expect_b_target": "house",
+    "expect_control": "red",
+    "edit_sentence_a": "Bob owns a car",
+    "edit_sentence_b": "Bob owns a house"
+  },
+  {
+    "name": "ownership_extreme_mismatch",
+    "prompt_a": "Alice has a red hat. Bob is in possession of a car.",
+    "prompt_b": "Alice has a red hat. Bob is in possession of a house.",
+    "query_target": " What does Bob have? Bob has a",
+    "query_control": " Alice's hat is",
+    "expect_a_target": "car",
+    "expect_b_target": "house",
+    "expect_control": "red",
+    "edit_sentence_a": "Bob has a car",
+    "edit_sentence_b": "Bob has a house"
+  },
+  {
+    "name": "alice_eyes_freeform",
+    "prompt_a": "Alice has a red hat and green eyes.",
+    "prompt_b": "Alice has a red hat and blue eyes.",
+    "query_target": " Alice's eyes are",
+    "query_control": " Alice's hat is",
+    "expect_a_target": "green",
+    "expect_b_target": "blue",
+    "expect_control": "red",
+    "edit_sentence_a": "green eyes",
+    "edit_sentence_b": "blue eyes"
+  }
+]

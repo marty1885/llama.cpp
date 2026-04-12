@@ -1,0 +1,51 @@
+[
+  {
+    "name": "city_simple",
+    "prompt_a": "Alice lives in Paris. Where does Alice live? Alice lives in",
+    "prompt_b": "Alice lives in London. Where does Alice live? Alice lives in",
+    "expect_a": "Paris",
+    "expect_b": "London"
+  },
+  {
+    "name": "city_narrative",
+    "prompt_a": "Last year Alice moved to Paris. She enjoys living there. Alice currently lives in",
+    "prompt_b": "Last year Alice moved to London. She enjoys living there. Alice currently lives in",
+    "expect_a": "Paris",
+    "expect_b": "London"
+  },
+  {
+    "name": "city_third_person",
+    "prompt_a": "We know that Alice lives in Paris. If someone asks where Alice lives, the answer is",
+    "prompt_b": "We know that Alice lives in London. If someone asks where Alice lives, the answer is",
+    "expect_a": "Paris",
+    "expect_b": "London"
+  },
+  {
+    "name": "city_qa",
+    "prompt_a": "Q: Where does Alice live? A: Alice lives in Paris. Q: What city is Alice in? A: Alice is in",
+    "prompt_b": "Q: Where does Alice live? A: Alice lives in London. Q: What city is Alice in? A: Alice is in",
+    "expect_a": "Paris",
+    "expect_b": "London"
+  },
+  {
+    "name": "hat_simple",
+    "prompt_a": "Alice has a red hat. What color is Alice's hat? Alice's hat is",
+    "prompt_b": "Alice has a green hat. What color is Alice's hat? Alice's hat is",
+    "expect_a": "red",
+    "expect_b": "green"
+  },
+  {
+    "name": "hat_narrative",
+    "prompt_a": "Alice bought a beautiful red hat yesterday. She wore it today. The color of Alice's hat is",
+    "prompt_b": "Alice bought a beautiful green hat yesterday. She wore it today. The color of Alice's hat is",
+    "expect_a": "red",
+    "expect_b": "green"
+  },
+  {
+    "name": "hat_third_person",
+    "prompt_a": "We know Alice wears a red hat. If asked about Alice's hat color, the answer is",
+    "prompt_b": "We know Alice wears a green hat. If asked about Alice's hat color, the answer is",
+    "expect_a": "red",
+    "expect_b": "green"
+  }
+]

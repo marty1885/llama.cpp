@@ -1,0 +1,63 @@
+[
+  {
+    "name": "change_president_not_pm",
+    "context": "The president is Alice. The prime minister is Bob.",
+    "questions": [
+      {"query": " Who is the president? The president is", "expect": "Alice", "label": "president"},
+      {"query": " Who is the prime minister? The prime minister is", "expect": "Bob", "label": "pm"}
+    ],
+    "edits": [
+      {
+        "op": "change",
+        "from": "The president is Alice. Who is the president? The president is",
+        "to": "The president is Carol. Who is the president? The president is",
+        "label": "president Alice→Carol"
+      },
+      {
+        "op": "donor-free",
+        "from": "The president is Alice. Who is the president? The president is",
+        "to": "The president is Carol. Who is the president? The president is",
+        "label": "donor-free president Alice→Carol"
+      }
+    ]
+  },
+  {
+    "name": "change_pm_not_president",
+    "context": "The president is Alice. The prime minister is Bob.",
+    "questions": [
+      {"query": " Who is the president? The president is", "expect": "Alice", "label": "president"},
+      {"query": " Who is the prime minister? The prime minister is", "expect": "Bob", "label": "pm"}
+    ],
+    "edits": [
+      {
+        "op": "change",
+        "from": "The prime minister is Bob. Who is the prime minister? The prime minister is",
+        "to": "The prime minister is Dave. Who is the prime minister? The prime minister is",
+        "label": "pm Bob→Dave"
+      }
+    ]
+  },
+  {
+    "name": "three_roles",
+    "context": "The president is Alice. The prime minister is Bob. The king is Carol.",
+    "questions": [
+      {"query": " Who is the president? The president is", "expect": "Alice", "label": "president"},
+      {"query": " Who is the prime minister? The prime minister is", "expect": "Bob", "label": "pm"},
+      {"query": " Who is the king? The king is", "expect": "Carol", "label": "king"}
+    ],
+    "edits": [
+      {
+        "op": "change",
+        "from": "The president is Alice. Who is the president? The president is",
+        "to": "The president is Dave. Who is the president? The president is",
+        "label": "president Alice→Dave"
+      },
+      {
+        "op": "change",
+        "from": "The prime minister is Bob. Who is the prime minister? The prime minister is",
+        "to": "The prime minister is Eve. Who is the prime minister? The prime minister is",
+        "label": "pm Bob→Eve"
+      }
+    ]
+  }
+]

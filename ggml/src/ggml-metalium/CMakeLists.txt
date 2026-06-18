@@ -89,6 +89,11 @@ target_compile_definitions(
     SPDLOG_FMT_EXTERNAL
 )
 
+option(GGML_METALIUM_HACK_DISABLE_CUSTOM_KERNELS "Disable Metalium custom kernels while they are being ported to the new TT interface" OFF)
+if(GGML_METALIUM_HACK_DISABLE_CUSTOM_KERNELS)
+    target_compile_definitions(ggml-metalium PRIVATE GGML_METALIUM_HACK_CUSTOM_KERNEL_BECAUSE_TT_UPDATED_THE_INTERFACE_AND_I_NEED_TO_FIGURE_OUT_HOW_TO_FIX_TEHM)
+endif()
+
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsized-deallocation")
 endif()

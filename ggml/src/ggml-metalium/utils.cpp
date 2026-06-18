@@ -41,6 +41,10 @@ KernelHandle CreateMetaliumKernel(
     const CoreSpec& core_spec,
     const std::variant<DataMovementConfig, ComputeConfig>& config) {
 
+#ifdef GGML_METALIUM_HACK_CUSTOM_KERNEL_BECAUSE_TT_UPDATED_THE_INTERFACE_AND_I_NEED_TO_FIGURE_OUT_HOW_TO_FIX_TEHM
+    throw std::runtime_error("Metalium custom kernels are disabled: TT updated the kernel interface and the custom kernels have not been ported yet (kernel: " + str + ")");
+#endif
+
     if(str.find_first_of(" \n\t") != std::string::npos) {
         return tt::tt_metal::CreateKernelFromString(program, str, core_spec, config);
     }

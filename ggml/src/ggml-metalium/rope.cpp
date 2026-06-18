@@ -2,7 +2,7 @@
 #include "tt-metalium/host_api.hpp"
 #include "tt-metalium/kernel_types.hpp"
 #include "tt-metalium/tt_backend_api_types.hpp"
-#include <ttnn/run_operation.hpp>
+#include <ttnn/device_operation.hpp>
 #include <ttnn/tensor/layout/layout.hpp>
 #include <cmath>
 #include <tt-metalium/work_split.hpp>
@@ -10,103 +10,73 @@
 #include "ttnn/tensor/tensor.hpp"
 #include "utils.hpp"
 
+#include <optional>
+#include <variant>
+
 using namespace tt::tt_metal;
 
+namespace {
+
+// Ported from the removed tt::tt_metal::operation::run framework to the
+// ttnn::device_operation framework. Invoked via
+// ttnn::device_operation::launch<RoPEDeviceOperation>(attrs, tensor_args).
 struct RoPEDeviceOperation {
-    const tt::tt_metal::MemoryConfig output_mem_config;
-    const uint32_t active_dim_size = 0;
-    const uint32_t n_ctx_orig = 512;
-    const ttggml::RoPEType rope_type = ttggml::RoPEType::Normal;
-    const float freq_base = 10000.0f;
-    const float freq_scale = 1.f;
-    const float ext_factor = 0.f;
-    const float attn_factor = 1.f;
-    const float beta_fast = 0.f;
-    const float beta_slow = 0.f;
+    struct operation_attributes_t {
+        tt::tt_metal::MemoryConfig output_mem_config;
+        uint32_t active_dim_size = 0;
+        uint32_t n_ctx_orig = 512;
+        ttggml::RoPEType rope_type = ttggml::RoPEType::Normal;
+        float freq_base = 10000.0f;
+        float freq_scale = 1.f;
+        float ext_factor = 0.f;
+        float attn_factor = 1.f;
+        float beta_fast = 0.f;
+        float beta_slow = 0.f;
+    };
 
-    void validate_with_output_tensors(
-        const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
-    std::vector<ttnn::TensorSpec> compute_output_specs(
-        const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
+    struct tensor_args_t {
+        const Tensor& src;
+        const Tensor& index;
+        std::optional<Tensor> freq_factor;
+    };
 
-    std::vector<Tensor> create_output_tensors(
-        const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
-    tt::tt_metal::operation::ProgramWithCallbacks create_program(
-        const std::vector<Tensor>& input_tensors, std::vector<Tensor>& output_tensors) const;
+    using spec_return_value_t = ttnn::TensorSpec;
+    using tensor_return_value_t = Tensor;
+
+    struct RoPEProgramFactory {
+        struct shared_variables_t {
+            tt::tt_metal::KernelHandle reader;
+            tt::tt_metal::KernelHandle writer;
+            tt::tt_metal::CoreRangeSet all_cores;
+        };
+        using cached_program_t = ttnn::device_operation::CachedProgram<shared_variables_t>;
+
+        static cached_program_t create(
+            const operation_attributes_t& operation_attributes,
+            const tensor_args_t& tensor_args,
+            tensor_return_value_t& tensor_return_value);
+        static void override_runtime_arguments(
+            cached_program_t& cached_program,
+            const operation_attributes_t& operation_attributes,
+            const tensor_args_t& tensor_args,
+            tensor_return_value_t& tensor_return_value);
+    };
+
+    using program_factory_t = std::variant<RoPEProgramFactory>;
+
+    static program_factory_t select_program_factory(const operation_attributes_t&, const tensor_args_t&) {
+        return RoPEProgramFactory{};
+    }
+
+    static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
+    static spec_return_value_t compute_output_specs(const operation_attributes_t&, const tensor_args_t&);
+    static tensor_return_value_t create_output_tensors(const operation_attributes_t&, const tensor_args_t&);
 };
 
-ttnn::Tensor ttggml::RoPEOperation::invoke(const Tensor& src_tensor, const Tensor& index_tensor, uint32_t active_dim_size, ttggml::RoPEType rope_type, uint32_t n_ctx_orig, float freq_base,
-    float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
-    return tt::tt_metal::operation::run(
-        RoPEDeviceOperation{
-            src_tensor.memory_config(),
-            active_dim_size,
-            n_ctx_orig,
-            rope_type,
-            freq_base,
-            freq_scale,
-            ext_factor,
-            attn_factor,
-            beta_fast,
-            beta_slow
-        },
-        {src_tensor, index_tensor},
-        {},
-        {})[0];
-}
-
-ttnn::Tensor ttggml::RoPEOperation::invoke(const Tensor& src_tensor, const Tensor& index_tensor, const Tensor& freq_factor, uint32_t active_dim_size, ttggml::RoPEType rope_type, uint32_t n_ctx_orig, float freq_base,
-    float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
-    return tt::tt_metal::operation::run(
-        RoPEDeviceOperation{
-            src_tensor.memory_config(),
-            active_dim_size,
-            n_ctx_orig,
-            rope_type,
-            freq_base,
-            freq_scale,
-            ext_factor,
-            attn_factor,
-            beta_fast,
-            beta_slow
-        },
-        {src_tensor, index_tensor, freq_factor},
-        {},
-        {})[0];
-}
-
-
-std::vector<ttnn::TensorSpec> RoPEDeviceOperation::compute_output_specs(
-    const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const
-{
-    if (!output_tensors.empty() && output_tensors[0].has_value()) {
-        return {output_tensors[0]->tensor_spec()};
-    }
-
-    const auto& input_tensor = input_tensors.at(0);
-    return {TensorSpec(
-        input_tensor.logical_shape(),
-        tt::tt_metal::TensorLayout(
-            input_tensor.dtype(),
-            tt::tt_metal::PageConfig(input_tensor.layout()),
-            output_mem_config)
-    )};
-}
-
-std::vector<ttnn::Tensor> RoPEDeviceOperation::create_output_tensors(
-    const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const {
-    if (!output_tensors.empty() && output_tensors[0].has_value()) {
-        return {output_tensors[0].value()};
-    }
-    const auto& input_tensor = input_tensors.at(0);
-    auto spec = compute_output_specs(input_tensors, output_tensors)[0];
-    return {create_device_tensor(spec, input_tensor.device())};
-}
-
-void RoPEDeviceOperation::validate_with_output_tensors(
-    const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const {
-    const auto& src_tensor = input_tensors.at(0);
-    const auto& index_tensor = input_tensors.at(1);
+void RoPEDeviceOperation::validate_on_program_cache_miss(
+    const operation_attributes_t& attrs, const tensor_args_t& tensor_args) {
+    const auto& src_tensor = tensor_args.src;
+    const auto& index_tensor = tensor_args.index;
 
     // expect src to have shape [batch, n_token, vec_dim]
     // expect index to have shape [batch]
@@ -122,50 +92,71 @@ void RoPEDeviceOperation::validate_with_output_tensors(
     TT_FATAL(index_tensor.storage_type() == tt::tt_metal::StorageType::DEVICE, "Index tensor must be on device");
     TT_FATAL(src_tensor.storage_type() == tt::tt_metal::StorageType::DEVICE, "Source tensor must be on device");
 
-    if(input_tensors.size() >= 3) {
-        const auto& freq_factor = input_tensors.at(2);
+    if(tensor_args.freq_factor.has_value()) {
+        const auto& freq_factor = tensor_args.freq_factor.value();
         const auto& freq_factor_shape = freq_factor.logical_shape();
-        TT_FATAL(freq_factor_shape[-1] == active_dim_size/2, "Frequency factor must have the same size as active dimension");
+        TT_FATAL(freq_factor_shape[-1] == attrs.active_dim_size/2, "Frequency factor must have the same size as active dimension");
         for(size_t i=0;i<freq_factor_shape.size()-1;i++) {
             TT_FATAL(freq_factor_shape[i] == 1, "Frequency factor shape must have shape [active_dim_size/2], got {}", freq_factor_shape);
         }
 
-        if(rope_type == ttggml::RoPEType::Normal) {
+        if(attrs.rope_type == ttggml::RoPEType::Normal) {
             TT_FATAL(freq_factor.dtype() == tt::tt_metal::DataType::BFLOAT16,
                     "Frequency factor tensor must be of type BFLOAT16 for Normal RoPE");
         }
     }
 
-    if (!output_tensors.empty() && output_tensors.at(0).has_value()) {
-        const auto& out_tensor = output_tensors.at(0).value();
-        TT_FATAL(out_tensor.logical_shape() == src_shape, "Output tensor shape must match source tensor shape");
-        TT_FATAL(out_tensor.padded_shape() == src_tensor.padded_shape(), "Output tensor padded shape must match source tensor padded shape");
-    }
-
-    if(rope_type == ttggml::RoPEType::NeoX) {
-        TT_FATAL(active_dim_size % 64 == 0, "For NeoX RoPE, active_dim must be a multiple of 64");
+    if(attrs.rope_type == ttggml::RoPEType::NeoX) {
+        TT_FATAL(attrs.active_dim_size % 64 == 0, "For NeoX RoPE, active_dim must be a multiple of 64");
     } else {
-        TT_FATAL(active_dim_size % 32 == 0, "For Normal RoPE, active_dim must be a multiple of 32");
+        TT_FATAL(attrs.active_dim_size % 32 == 0, "For Normal RoPE, active_dim must be a multiple of 32");
     }
-    TT_FATAL(active_dim_size <= src_tensor.padded_shape()[-1], "active_dim must be less than the last dimension of the source tensor");
-    TT_FATAL(freq_base >= 0, "base_freq must be non-negative");
-    TT_FATAL(freq_scale > 0, "freq_scale must be positive");
+    TT_FATAL(attrs.active_dim_size <= src_tensor.padded_shape()[-1], "active_dim must be less than the last dimension of the source tensor");
+    TT_FATAL(attrs.freq_base >= 0, "base_freq must be non-negative");
+    TT_FATAL(attrs.freq_scale > 0, "freq_scale must be positive");
 }
 
-tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_program(
-    const std::vector<Tensor>& input_tensors, std::vector<Tensor>& output_tensors) const
-{
+RoPEDeviceOperation::spec_return_value_t RoPEDeviceOperation::compute_output_specs(
+    const operation_attributes_t& attrs, const tensor_args_t& tensor_args) {
+    const auto& input_tensor = tensor_args.src;
+    return TensorSpec(
+        input_tensor.logical_shape(),
+        tt::tt_metal::TensorLayout(
+            input_tensor.dtype(),
+            tt::tt_metal::PageConfig(input_tensor.layout()),
+            attrs.output_mem_config));
+}
+
+RoPEDeviceOperation::tensor_return_value_t RoPEDeviceOperation::create_output_tensors(
+    const operation_attributes_t& attrs, const tensor_args_t& tensor_args) {
+    auto spec = compute_output_specs(attrs, tensor_args);
+    return create_device_tensor(spec, tensor_args.src.device());
+}
+
+RoPEDeviceOperation::RoPEProgramFactory::cached_program_t
+RoPEDeviceOperation::RoPEProgramFactory::create(
+    const operation_attributes_t& attrs, const tensor_args_t& tensor_args, tensor_return_value_t& tensor_return_value) {
     tt::tt_metal::Program program{};
-    const auto& src_tensor = input_tensors.at(0);
-    const auto& index_tensor = input_tensors.at(1);
-    const auto& output_tensor = output_tensors.at(0);
+    const auto& src_tensor = tensor_args.src;
+    const auto& index_tensor = tensor_args.index;
+    const auto& output_tensor = tensor_return_value;
+
+    const uint32_t active_dim_size = attrs.active_dim_size;
+    const uint32_t n_ctx_orig = attrs.n_ctx_orig;
+    const ttggml::RoPEType rope_type = attrs.rope_type;
+    const float freq_base = attrs.freq_base;
+    const float freq_scale = attrs.freq_scale;
+    const float ext_factor = attrs.ext_factor;
+    const float attn_factor = attrs.attn_factor;
+    const float beta_fast = attrs.beta_fast;
+    const float beta_slow = attrs.beta_slow;
 
     const uint32_t B = src_tensor.logical_shape()[-3];
     const uint32_t D = src_tensor.logical_shape()[-1];
     const uint32_t D_active = active_dim_size;
     const uint32_t N = src_tensor.logical_shape()[-2];
 
-    std::optional<Tensor> freq_factor = at_index(input_tensors, 2);
+    const std::optional<Tensor>& freq_factor = tensor_args.freq_factor;
 
     tt::tt_metal::IDevice* device = src_tensor.device();
 
@@ -302,42 +293,78 @@ tt::tt_metal::operation::ProgramWithCallbacks RoPEDeviceOperation::create_progra
         }
     }
 
-    auto override_runtime_args_callback = [reader, writer, all_cores, has_freq_factor=bool(freq_factor)](
-                                                  const void* operation,
-                                                  Program& program,
-                                                  const std::vector<Tensor>& input_tensors,
-                                                  const std::vector<std::optional<const Tensor>>&,
-                                                  const std::vector<Tensor>& output_tensors) {
-            (void)operation;
-            if(has_freq_factor) {
-                TT_FATAL(input_tensors.size() >= 3, "Expecting frequency factor, did not get it from TTNN");
-            }
-            else {
-                TT_FATAL(input_tensors.size() == 2, "Expecting two input tensors w/o freqnency factor, got too much from TTNN");
-            }
-            auto* src_buffer = input_tensors.at(0).buffer();
-            auto* idx_buffer = input_tensors.at(1).buffer();
-            auto* dst_buffer = output_tensors.at(0).buffer();
+    return {std::move(program), {reader, writer, all_cores}};
+}
 
-            for(const auto& range : all_cores.ranges()) {
-                for (const auto& core : range) {
-                    {
-                        auto& runtime_args = GetRuntimeArgs(program, reader, core);
-                        runtime_args[0] = src_buffer->address();
-                        runtime_args[4] = idx_buffer->address();
-                        if(has_freq_factor) {
-                            runtime_args[11] = input_tensors.at(2).buffer()->address();
-                        }
-                    }
+void RoPEDeviceOperation::RoPEProgramFactory::override_runtime_arguments(
+    cached_program_t& cached_program,
+    const operation_attributes_t& /*attrs*/,
+    const tensor_args_t& tensor_args,
+    tensor_return_value_t& tensor_return_value) {
+    auto& program = cached_program.program;
+    const auto reader = cached_program.shared_variables.reader;
+    const auto writer = cached_program.shared_variables.writer;
+    const auto& all_cores = cached_program.shared_variables.all_cores;
 
-                    {
-                        auto& runtime_args = GetRuntimeArgs(program, writer, core);
-                        runtime_args[0] = dst_buffer->address();
-                    }
+    const bool has_freq_factor = tensor_args.freq_factor.has_value();
+
+    auto* src_buffer = tensor_args.src.buffer();
+    auto* idx_buffer = tensor_args.index.buffer();
+    auto* dst_buffer = tensor_return_value.buffer();
+
+    for(const auto& range : all_cores.ranges()) {
+        for (const auto& core : range) {
+            {
+                auto& runtime_args = GetRuntimeArgs(program, reader, core);
+                runtime_args[0] = src_buffer->address();
+                runtime_args[4] = idx_buffer->address();
+                if(has_freq_factor) {
+                    runtime_args[11] = tensor_args.freq_factor->buffer()->address();
                 }
             }
-        };
 
-        return {std::move(program), override_runtime_args_callback};
+            {
+                auto& runtime_args = GetRuntimeArgs(program, writer, core);
+                runtime_args[0] = dst_buffer->address();
+            }
+        }
+    }
+}
 
+} // namespace
+
+ttnn::Tensor ttggml::RoPEOperation::invoke(const Tensor& src_tensor, const Tensor& index_tensor, uint32_t active_dim_size, ttggml::RoPEType rope_type, uint32_t n_ctx_orig, float freq_base,
+    float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
+    return ttnn::device_operation::launch<RoPEDeviceOperation>(
+        RoPEDeviceOperation::operation_attributes_t{
+            src_tensor.memory_config(),
+            active_dim_size,
+            n_ctx_orig,
+            rope_type,
+            freq_base,
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow
+        },
+        RoPEDeviceOperation::tensor_args_t{src_tensor, index_tensor, std::nullopt});
+}
+
+ttnn::Tensor ttggml::RoPEOperation::invoke(const Tensor& src_tensor, const Tensor& index_tensor, const Tensor& freq_factor, uint32_t active_dim_size, ttggml::RoPEType rope_type, uint32_t n_ctx_orig, float freq_base,
+    float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
+    return ttnn::device_operation::launch<RoPEDeviceOperation>(
+        RoPEDeviceOperation::operation_attributes_t{
+            src_tensor.memory_config(),
+            active_dim_size,
+            n_ctx_orig,
+            rope_type,
+            freq_base,
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow
+        },
+        RoPEDeviceOperation::tensor_args_t{src_tensor, index_tensor, freq_factor});
 }

@@ -1,4 +1,5 @@
 #include "arg.h"
+#include "debug.h"
 #include "log.h"
 #include "common.h"
 #include "sampling.h"
@@ -12,6 +13,7 @@
 #include <vector>
 #include <limits.h>
 #include <cinttypes>
+#include <clocale>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -65,7 +67,7 @@ static void sigint_handler(int signo) {
 
 struct mtmd_cli_context {
     mtmd::context_ptr ctx_vision;
-    common_init_result llama_init;
+    common_init_result_ptr llama_init;
 
     llama_model       * model;
     llama_context     * lctx;
@@ -75,6 +77,7 @@ struct mtmd_cli_context {
     int                 n_batch;
 
     mtmd::bitmaps bitmaps;
+    std::vector<mtmd_helper::video_ptr> videos;
 
     // chat template
     common_chat_templates_ptr tmpls;
@@ -88,9 +91,11 @@ struct mtmd_cli_context {
     int n_threads    = 1;
     llama_pos n_past = 0;
 
+    common_debug_cb_user_data cb_data;
+
     mtmd_cli_context(common_params & params) : llama_init(common_init_from_params(params)) {
-        model = llama_init.model.get();
-        lctx = llama_init.context.get();
+        model = llama_init->model();
+        lctx = llama_init->context();
         vocab = llama_model_get_vocab(model);
         smpl = common_sampler_init(model, params.sampling);
         n_threads = params.cpuparams.n_threads;
@@ -135,10 +140,14 @@ struct mtmd_cli_context {
         mparams.use_gpu          = params.mmproj_use_gpu;
         mparams.print_timings    = true;
         mparams.n_threads        = params.cpuparams.n_threads;
-        mparams.verbosity        = params.verbosity > 0 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_INFO;
         mparams.flash_attn_type  = params.flash_attn_type;
+        mparams.warmup           = params.warmup;
         mparams.image_min_tokens = params.image_min_tokens;
         mparams.image_max_tokens = params.image_max_tokens;
+        if (std::getenv("MTMD_DEBUG_GRAPH") != nullptr) {
+            mparams.cb_eval_user_data = &cb_data;
+            mparams.cb_eval = common_debug_cb_eval;
+        }
         ctx_vision.reset(mtmd_init_from_file(clip_path, model, mparams));
         if (!ctx_vision.get()) {
             LOG_ERR("Failed to load vision model from %s\n", clip_path);
@@ -158,11 +167,14 @@ struct mtmd_cli_context {
     }
 
     bool load_media(const std::string & fname) {
-        mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_file(ctx_vision.get(), fname.c_str()));
-        if (!bmp.ptr) {
+        auto res = mtmd_helper_bitmap_init_from_file(ctx_vision.get(), fname.c_str(), false);
+        if (!res.bitmap) {
             return false;
         }
-        bitmaps.entries.push_back(std::move(bmp));
+        bitmaps.entries.emplace_back(res.bitmap);
+        if (res.video_ctx) {
+            videos.emplace_back(res.video_ctx);
+        }
         return true;
     }
 };
@@ -245,6 +257,7 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
     }
 
     ctx.bitmaps.entries.clear();
+    ctx.videos.clear();
 
     llama_pos new_n_past;
     if (mtmd_helper_eval_chunks(ctx.ctx_vision.get(),
@@ -267,16 +280,19 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
 }
 
 int main(int argc, char ** argv) {
+    std::setlocale(LC_NUMERIC, "C");
+
     ggml_time_init();
 
     common_params params;
-    params.sampling.temp = 0.2; // lower temp by default for better quality
+
+    common_init();
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_MTMD, show_additional_info)) {
         return 1;
     }
 
-    common_init();
+    mtmd_helper_log_set(common_log_default_callback, nullptr);
 
     if (params.mmproj.path.empty()) {
         show_additional_info(argc, argv);
@@ -284,8 +300,10 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    ggml_backend_load_all();
+
     mtmd_cli_context ctx(params);
-    LOG("%s: loading model: %s\n", __func__, params.model.path.c_str());
+    LOG_INF("%s: loading model: %s\n", __func__, params.model.path.c_str());
 
     bool is_single_turn = !params.prompt.empty() && !params.image.empty();
 
@@ -309,13 +327,34 @@ int main(int argc, char ** argv) {
 
     if (g_is_interrupted) return 130;
 
+    auto eval_system_prompt_if_present = [&] {
+        if (params.system_prompt.empty()) {
+            return 0;
+        }
+
+        common_chat_msg msg;
+        msg.role = "system";
+        msg.content = params.system_prompt;
+        return eval_message(ctx, msg);
+    };
+
+    LOG_WRN("WARN: This is an experimental CLI for testing multimodal capability.\n");
+    LOG_WRN("      For normal use cases, please use the standard llama-cli\n");
+
+    if (eval_system_prompt_if_present()) {
+        return 1;
+    }
+
     if (is_single_turn) {
         g_is_generating = true;
         if (params.prompt.find(mtmd_default_marker()) == std::string::npos) {
             for (size_t i = 0; i < params.image.size(); i++) {
-                params.prompt += mtmd_default_marker();
+                // most models require the marker before each image
+                // ref: https://github.com/ggml-org/llama.cpp/pull/17616
+                params.prompt = mtmd_default_marker() + params.prompt;
             }
         }
+
         common_chat_msg msg;
         msg.role = "user";
         msg.content = params.prompt;
@@ -339,6 +378,9 @@ int main(int argc, char ** argv) {
         if (mtmd_support_audio(ctx.ctx_vision.get())) {
             LOG("\n   /audio <path>    load an audio");
         }
+        if (mtmd_helper_support_video(ctx.ctx_vision.get())) {
+            LOG("\n   /video <path>    load a video");
+        }
         LOG("\n   /clear           clear the chat history");
         LOG("\n   /quit or /exit   exit the program");
         LOG("\n");
@@ -348,11 +390,11 @@ int main(int argc, char ** argv) {
         while (!g_is_interrupted) {
             g_is_generating = false;
             LOG("\n> ");
-            console::set_display(console::user_input);
+            console::set_display(DISPLAY_TYPE_USER_INPUT);
             std::string line;
             console::readline(line, false);
             if (g_is_interrupted) break;
-            console::set_display(console::reset);
+            console::set_display(DISPLAY_TYPE_RESET);
             line = string_strip(line);
             if (line.empty()) {
                 continue;
@@ -364,20 +406,24 @@ int main(int argc, char ** argv) {
                 ctx.n_past = 0;
                 ctx.chat_history.clear();
                 llama_memory_clear(llama_get_memory(ctx.lctx), true);
+                if (eval_system_prompt_if_present()) {
+                    return 1;
+                }
                 LOG("Chat history cleared\n\n");
                 continue;
             }
             g_is_generating = true;
             bool is_image = line == "/image" || line.find("/image ") == 0;
             bool is_audio = line == "/audio" || line.find("/audio ") == 0;
-            if (is_image || is_audio) {
+            bool is_video = line == "/video" || line.find("/video ") == 0;
+            if (is_image || is_audio || is_video) {
                 if (line.size() < 8) {
                     LOG_ERR("ERR: Missing media filename\n");
                     continue;
                 }
                 std::string media_path = line.substr(7);
                 if (ctx.load_media(media_path)) {
-                    LOG("%s %s loaded\n", media_path.c_str(), is_image ? "image" : "audio");
+                    LOG("%s %s loaded\n", media_path.c_str(), is_image ? "image" : is_audio ? "audio" : "video");
                     content += mtmd_default_marker();
                 }
                 // else, error is already printed by libmtmd

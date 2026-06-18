@@ -13,7 +13,7 @@ tt::tt_metal::KernelHandle CreateMetaliumKernel(
     tt::tt_metal::Program& program,
     const std::string& str, // could be path or actual kenrel
     const CoreSpec& core_spec,
-    const std::variant<tt::tt_metal::DataMovementConfig, tt::tt_metal::ComputeConfig, tt::tt_metal::EthernetConfig>& config);
+    const std::variant<tt::tt_metal::DataMovementConfig, tt::tt_metal::ComputeConfig>& config);
 
 std::string to_string_precise(float value);
 

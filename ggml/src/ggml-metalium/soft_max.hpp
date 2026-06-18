@@ -1,6 +1,6 @@
-#include <ttnn/decorators.hpp>
 #include <ttnn/tensor/tensor.hpp>
 #include <ttnn/tensor/types.hpp>
+#include <utility>
 
 namespace ttggml {
 using namespace ttnn;
@@ -10,5 +10,9 @@ struct SoftMaxOperation {
     static ttnn::Tensor invoke(const Tensor& a, const Tensor& mask, float scale = 1.f);
 };
 
-constexpr auto soft_max = ttnn::register_operation<"ttggml::soft_max", ttggml::SoftMaxOperation>();
+// TTNN removed the ttnn::register_operation<> decorator framework; expose as a forwarding function.
+template <typename... Args>
+inline ttnn::Tensor soft_max(Args&&... args) {
+    return SoftMaxOperation::invoke(std::forward<Args>(args)...);
+}
 }

@@ -4,6 +4,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <clocale>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -14,14 +15,19 @@ static void print_usage(int, char ** argv) {
     LOG("\n");
 }
 
-int main(int argc, char ** argv) {
+// satisfies -Wmissing-declarations
+int llama_batched_bench(int argc, char ** argv);
+
+int llama_batched_bench(int argc, char ** argv) {
+    std::setlocale(LC_NUMERIC, "C");
+
     common_params params;
+
+    common_init();
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_BENCH, print_usage)) {
         return 1;
     }
-
-    common_init();
 
     int is_pp_shared   = params.is_pp_shared;
     int is_tg_separate = params.is_tg_separate;
@@ -55,6 +61,7 @@ int main(int argc, char ** argv) {
 
     if (ctx == NULL) {
         fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
+        llama_model_free(model);
         return 1;
     }
 
@@ -108,6 +115,8 @@ int main(int argc, char ** argv) {
 
         if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
             LOG_ERR("%s: llama_decode() failed\n", __func__);
+            llama_free(ctx);
+            llama_model_free(model);
             return 1;
         }
     }
@@ -147,6 +156,8 @@ int main(int argc, char ** argv) {
 
                 if (!decode_helper(ctx, batch, ctx_params.n_batch, false)) {
                     LOG_ERR("%s: llama_decode() failed\n", __func__);
+                    llama_free(ctx);
+                    llama_model_free(model);
                     return 1;
                 }
 
@@ -165,6 +176,8 @@ int main(int argc, char ** argv) {
                         common_batch_add(batch, get_token_rand(), pp + 0, { 0 }, true);
                         if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
                             LOG_ERR("%s: llama_decode() failed\n", __func__);
+                            llama_free(ctx);
+                            llama_model_free(model);
                             return 1;
                         }
                         llama_memory_seq_rm(mem, 0, pp, -1);
@@ -184,6 +197,8 @@ int main(int argc, char ** argv) {
 
                             if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
                                 LOG_ERR("%s: llama_decode() failed\n", __func__);
+                                llama_free(ctx);
+                                llama_model_free(model);
                                 return 1;
                             }
                         }
@@ -200,6 +215,8 @@ int main(int argc, char ** argv) {
 
                         if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
                             LOG_ERR("%s: llama_decode() failed\n", __func__);
+                            llama_free(ctx);
+                            llama_model_free(model);
                             return 1;
                         }
                     }

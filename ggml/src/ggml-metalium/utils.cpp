@@ -39,7 +39,7 @@ KernelHandle CreateMetaliumKernel(
     Program& program,
     const std::string& str, // could be path or actual kenrel
     const CoreSpec& core_spec,
-    const std::variant<DataMovementConfig, ComputeConfig, EthernetConfig>& config) {
+    const std::variant<DataMovementConfig, ComputeConfig>& config) {
 
     if(str.find_first_of(" \n\t") != std::string::npos) {
         return tt::tt_metal::CreateKernelFromString(program, str, core_spec, config);

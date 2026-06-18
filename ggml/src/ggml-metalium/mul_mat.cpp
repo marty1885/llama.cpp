@@ -3,13 +3,15 @@
 #include "tt-metalium/host_api.hpp"
 #include "tt-metalium/kernel_types.hpp"
 #include "tt-metalium/tt_backend_api_types.hpp"
-#include <ttnn/run_operation.hpp>
+#include <ttnn/device_operation.hpp>
 #include <ttnn/tensor/layout/layout.hpp>
 #include <tt-metalium/work_split.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include "tt_stl/assert.hpp"
 #include "ttnn/types.hpp"
 #include "utils.hpp"
+
+#include <variant>
 
 // NOTE: This is a terribly inefficient implementation of MUL_MAT on TT hardware. Just a simple SPMD parallelization
 // NOTE: GGML's MUL_MAT is *not* a standard MatMul/GEMM.
@@ -38,72 +40,60 @@
 
 using namespace tt::tt_metal;
 
+namespace {
+
+// Ported from the removed tt::tt_metal::operation::run framework to the
+// ttnn::device_operation framework. Invoked via
+// ttnn::device_operation::launch<MulMatDeviceOperation>(attrs, tensor_args).
 struct MulMatDeviceOperation {
-    const tt::tt_metal::MemoryConfig output_mem_config;
-    const tt::tt_metal::DataType output_dtype{};
-    const bool high_percision = false;
+    struct operation_attributes_t {
+        tt::tt_metal::MemoryConfig output_mem_config;
+        tt::tt_metal::DataType output_dtype{};
+        bool high_percision = false;
+    };
 
-    void validate_with_output_tensors(
-        const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
-    std::vector<ttnn::TensorSpec> compute_output_specs(
-        const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
+    struct tensor_args_t {
+        const Tensor& a;
+        const Tensor& b;
+    };
 
-    std::vector<Tensor> create_output_tensors(
-        const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
-    tt::tt_metal::operation::ProgramWithCallbacks create_program(
-        const std::vector<Tensor>& input_tensors, std::vector<Tensor>& output_tensors) const;
+    using spec_return_value_t = ttnn::TensorSpec;
+    using tensor_return_value_t = Tensor;
+
+    struct MulMatProgramFactory {
+        struct shared_variables_t {
+            tt::tt_metal::KernelHandle reader;
+            tt::tt_metal::KernelHandle writer;
+            tt::tt_metal::CoreRangeSet all_cores;
+        };
+        using cached_program_t = ttnn::device_operation::CachedProgram<shared_variables_t>;
+
+        static cached_program_t create(
+            const operation_attributes_t& operation_attributes,
+            const tensor_args_t& tensor_args,
+            tensor_return_value_t& tensor_return_value);
+        static void override_runtime_arguments(
+            cached_program_t& cached_program,
+            const operation_attributes_t& operation_attributes,
+            const tensor_args_t& tensor_args,
+            tensor_return_value_t& tensor_return_value);
+    };
+
+    using program_factory_t = std::variant<MulMatProgramFactory>;
+
+    static program_factory_t select_program_factory(const operation_attributes_t&, const tensor_args_t&) {
+        return MulMatProgramFactory{};
+    }
+
+    static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
+    static spec_return_value_t compute_output_specs(const operation_attributes_t&, const tensor_args_t&);
+    static tensor_return_value_t create_output_tensors(const operation_attributes_t&, const tensor_args_t&);
 };
 
-ttnn::Tensor ttggml::MulMatOperation::invoke(const Tensor& a, const Tensor& b, bool high_percision) {
-    return tt::tt_metal::operation::run(
-        MulMatDeviceOperation{
-            b.memory_config(),
-            b.dtype(),
-            high_percision,
-        },
-        {a, b},
-        {},
-        {})[0];
-}
-
-std::vector<ttnn::TensorSpec> MulMatDeviceOperation::compute_output_specs(
-    const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const
-{
-    if (!output_tensors.empty() && output_tensors[0].has_value()) {
-        return {output_tensors[0]->tensor_spec()};
-    }
-
-    const auto& a = input_tensors.at(0);
-    const auto& b = input_tensors.at(1);
-    ttnn::Shape output_shape({
-        std::max(a.logical_shape()[0], b.logical_shape()[0]),
-        std::max(a.logical_shape()[1], b.logical_shape()[1]),
-        b.logical_shape()[2],
-        a.logical_shape()[2],
-    });
-    return {TensorSpec(
-        output_shape,
-        tt::tt_metal::TensorLayout(
-            output_dtype,
-            tt::tt_metal::PageConfig(ttnn::TILE_LAYOUT),
-            output_mem_config)
-    )};
-}
-
-std::vector<ttnn::Tensor> MulMatDeviceOperation::create_output_tensors(
-    const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const {
-    if (!output_tensors.empty() && output_tensors[0].has_value()) {
-        return {output_tensors[0].value()};
-    }
-    const auto& input_tensor = input_tensors.at(0);
-    auto spec = compute_output_specs(input_tensors, output_tensors)[0];
-    return {create_device_tensor(spec, input_tensor.device())};
-}
-
-void MulMatDeviceOperation::validate_with_output_tensors(
-    const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const {
-    const auto& a = input_tensors.at(0);
-    const auto& b = input_tensors.at(1);
+void MulMatDeviceOperation::validate_on_program_cache_miss(
+    const operation_attributes_t&, const tensor_args_t& tensor_args) {
+    const auto& a = tensor_args.a;
+    const auto& b = tensor_args.b;
     const auto& a_shape = a.logical_shape();
     const auto& b_shape = b.logical_shape();
     const auto& a_shape4d = a.logical_shape().to_array_4D();
@@ -118,28 +108,40 @@ void MulMatDeviceOperation::validate_with_output_tensors(
         a_shape4d[2] > 0 && b_shape4d[2] > 0,
         "Expcted format a: [B, N, M, K], b: [B*x, C*x, N, K] but get a: {}, b: {}",
         a_shape, b_shape);
-
-    if(!output_tensors.empty()) {
-        const auto& o = output_tensors.at(0);
-        const auto& o_shape = o->logical_shape();
-        const auto& o_shape4d = o->logical_shape().to_array_4D();
-        TT_FATAL(o->layout() == ttnn::TILE_LAYOUT, "Expected layout TILE_LAYOUT for tensor o");
-        TT_FATAL(o_shape4d[0] == b_shape4d[0] &&
-                 o_shape4d[1] == b_shape4d[1] &&
-                 o_shape4d[2] == a_shape4d[2] &&
-                 o_shape4d[3] == a_shape4d[3],
-                 "Expected output shape: [B*x, C*x, M, N], but got: {}. Input shapes were a: {}, b: {}",
-                 o_shape, a_shape, b_shape);
-    }
 }
 
-tt::tt_metal::operation::ProgramWithCallbacks MulMatDeviceOperation::create_program(
-    const std::vector<Tensor>& input_tensors, std::vector<Tensor>& output_tensors) const
-{
+MulMatDeviceOperation::spec_return_value_t MulMatDeviceOperation::compute_output_specs(
+    const operation_attributes_t& attrs, const tensor_args_t& tensor_args) {
+    const auto& a = tensor_args.a;
+    const auto& b = tensor_args.b;
+    ttnn::Shape output_shape({
+        std::max(a.logical_shape()[0], b.logical_shape()[0]),
+        std::max(a.logical_shape()[1], b.logical_shape()[1]),
+        b.logical_shape()[2],
+        a.logical_shape()[2],
+    });
+    return TensorSpec(
+        output_shape,
+        tt::tt_metal::TensorLayout(
+            attrs.output_dtype,
+            tt::tt_metal::PageConfig(ttnn::TILE_LAYOUT),
+            attrs.output_mem_config));
+}
+
+MulMatDeviceOperation::tensor_return_value_t MulMatDeviceOperation::create_output_tensors(
+    const operation_attributes_t& attrs, const tensor_args_t& tensor_args) {
+    auto spec = compute_output_specs(attrs, tensor_args);
+    return create_device_tensor(spec, tensor_args.a.device());
+}
+
+MulMatDeviceOperation::MulMatProgramFactory::cached_program_t
+MulMatDeviceOperation::MulMatProgramFactory::create(
+    const operation_attributes_t& attrs, const tensor_args_t& tensor_args, tensor_return_value_t& tensor_return_value) {
     tt::tt_metal::Program program{};
-    const auto& a_tensor = input_tensors.at(0);
-    const auto& b_tensor = input_tensors.at(1);
-    const auto& o_tensor = output_tensors.at(0);
+    const auto& a_tensor = tensor_args.a;
+    const auto& b_tensor = tensor_args.b;
+    const auto& o_tensor = tensor_return_value;
+    const bool high_percision = attrs.high_percision;
 
     const uint32_t K = a_tensor.logical_shape()[-1];
     const uint32_t N = b_tensor.logical_shape()[2];
@@ -219,32 +221,43 @@ tt::tt_metal::operation::ProgramWithCallbacks MulMatDeviceOperation::create_prog
         }
     }
 
-    auto override_runtime_args_callback = [reader, writer, all_cores](
-                                                  const void* operation,
-                                                  Program& program,
-                                                  const std::vector<Tensor>& input_tensors,
-                                                  const std::vector<std::optional<const Tensor>>&,
-                                                  const std::vector<Tensor>& output_tensors) {
-            (void)operation;
-            auto* a = input_tensors.at(0).buffer();
-            auto* b = input_tensors.at(1).buffer();
-            auto* o = output_tensors.at(0).buffer();
+    return {std::move(program), {reader, writer, all_cores}};
+}
 
-            for(const auto& range : all_cores.ranges()) {
-                for (const auto& core : range) {
-                    {
-                        auto& runtime_args = GetRuntimeArgs(program, reader, core);
-                        runtime_args[0] = a->address();
-                        runtime_args[1] = b->address();
-                    }
+void MulMatDeviceOperation::MulMatProgramFactory::override_runtime_arguments(
+    cached_program_t& cached_program,
+    const operation_attributes_t& /*attrs*/,
+    const tensor_args_t& tensor_args,
+    tensor_return_value_t& tensor_return_value) {
+    auto& program = cached_program.program;
+    const auto reader = cached_program.shared_variables.reader;
+    const auto writer = cached_program.shared_variables.writer;
+    const auto& all_cores = cached_program.shared_variables.all_cores;
 
-                    {
-                        auto& runtime_args = GetRuntimeArgs(program, writer, core);
-                        runtime_args[0] = o->address();
-                    }
-                }
+    auto* a = tensor_args.a.buffer();
+    auto* b = tensor_args.b.buffer();
+    auto* o = tensor_return_value.buffer();
+
+    for(const auto& range : all_cores.ranges()) {
+        for (const auto& core : range) {
+            {
+                auto& runtime_args = GetRuntimeArgs(program, reader, core);
+                runtime_args[0] = a->address();
+                runtime_args[1] = b->address();
             }
-        };
 
-        return {std::move(program), override_runtime_args_callback};
+            {
+                auto& runtime_args = GetRuntimeArgs(program, writer, core);
+                runtime_args[0] = o->address();
+            }
+        }
+    }
+}
+
+} // namespace
+
+ttnn::Tensor ttggml::MulMatOperation::invoke(const Tensor& a, const Tensor& b, bool high_percision) {
+    return ttnn::device_operation::launch<MulMatDeviceOperation>(
+        MulMatDeviceOperation::operation_attributes_t{b.memory_config(), b.dtype(), high_percision},
+        MulMatDeviceOperation::tensor_args_t{a, b});
 }

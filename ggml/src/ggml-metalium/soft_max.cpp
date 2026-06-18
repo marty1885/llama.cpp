@@ -3,7 +3,7 @@
 #include "tt-metalium/hal_types.hpp"
 #include "tt-metalium/host_api.hpp"
 #include "tt-metalium/kernel_types.hpp"
-#include <ttnn/run_operation.hpp>
+#include <ttnn/device_operation.hpp>
 #include <ttnn/tensor/layout/layout.hpp>
 #include <tt-metalium/work_split.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
@@ -13,114 +13,111 @@
 #include "ttnn/types.hpp"
 #include "utils.hpp"
 
+#include <optional>
+#include <variant>
+
 
 using namespace tt::tt_metal;
 
+namespace {
+
+// Ported from the removed tt::tt_metal::operation::run framework to the
+// ttnn::device_operation framework. The op is invoked via
+// ttnn::device_operation::launch<SoftMaxDeviceOperation>(attrs, tensor_args).
 struct SoftMaxDeviceOperation {
-    const tt::tt_metal::MemoryConfig output_mem_config;
-    const tt::tt_metal::DataType output_dtype{};
-    float scale = 1.f;
+    struct operation_attributes_t {
+        tt::tt_metal::MemoryConfig output_mem_config;
+        tt::tt_metal::DataType output_dtype{};
+        float scale = 1.f;
+    };
 
-    void validate_with_output_tensors(
-        const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
-    std::vector<ttnn::TensorSpec> compute_output_specs(
-        const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
+    struct tensor_args_t {
+        const Tensor& input;
+        std::optional<Tensor> mask;
+    };
 
-    std::vector<Tensor> create_output_tensors(
-        const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
-    tt::tt_metal::operation::ProgramWithCallbacks create_program(
-        const std::vector<Tensor>& input_tensors, std::vector<Tensor>& output_tensors) const;
+    using spec_return_value_t = ttnn::TensorSpec;
+    using tensor_return_value_t = Tensor;
+
+    struct SoftMaxProgramFactory {
+        struct shared_variables_t {
+            tt::tt_metal::KernelHandle reader;
+            tt::tt_metal::KernelHandle writer;
+            tt::tt_metal::CoreRangeSet all_cores;
+        };
+        using cached_program_t = ttnn::device_operation::CachedProgram<shared_variables_t>;
+
+        static cached_program_t create(
+            const operation_attributes_t& operation_attributes,
+            const tensor_args_t& tensor_args,
+            tensor_return_value_t& tensor_return_value);
+        static void override_runtime_arguments(
+            cached_program_t& cached_program,
+            const operation_attributes_t& operation_attributes,
+            const tensor_args_t& tensor_args,
+            tensor_return_value_t& tensor_return_value);
+    };
+
+    using program_factory_t = std::variant<SoftMaxProgramFactory>;
+
+    static program_factory_t select_program_factory(const operation_attributes_t&, const tensor_args_t&) {
+        return SoftMaxProgramFactory{};
+    }
+
+    static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
+    static spec_return_value_t compute_output_specs(const operation_attributes_t&, const tensor_args_t&);
+    static tensor_return_value_t create_output_tensors(const operation_attributes_t&, const tensor_args_t&);
 };
 
-ttnn::Tensor ttggml::SoftMaxOperation::invoke(const Tensor& a, float scale) {
-    return tt::tt_metal::operation::run(
-        SoftMaxDeviceOperation{
-            a.memory_config(),
-            a.dtype(),
-            scale
-        },
-        {a},
-        {},
-        {})[0];
-}
+void SoftMaxDeviceOperation::validate_on_program_cache_miss(
+    const operation_attributes_t& attrs, const tensor_args_t& tensor_args) {
+    const auto& a_tensor = tensor_args.input;
 
-ttnn::Tensor ttggml::SoftMaxOperation::invoke(const Tensor& a, const Tensor& mask, float scale) {
-    return tt::tt_metal::operation::run(
-        SoftMaxDeviceOperation{
-            a.memory_config(),
-            a.dtype(),
-            scale
-        },
-        {a, mask},
-        {},
-        {})[0];
-}
+    // XXX: We will deal with alternative data type support later
+    TT_FATAL(a_tensor.dtype() == tt::tt_metal::DataType::BFLOAT16, "Input data type must be BFLOAT16");
+    TT_FATAL(attrs.output_dtype == tt::tt_metal::DataType::BFLOAT16, "Output data type must be BFLOAT16");
 
-std::vector<ttnn::TensorSpec> SoftMaxDeviceOperation::compute_output_specs(
-    const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const
-{
-    if (!output_tensors.empty() && output_tensors[0].has_value()) {
-        return {output_tensors[0]->tensor_spec()};
+    if(tensor_args.mask.has_value()) {
+        const auto& mask_tensor = tensor_args.mask.value();
+        TT_FATAL(mask_tensor.dtype() == tt::tt_metal::DataType::BFLOAT16, "Mask data type must be BFLOAT16");
+        TT_FATAL(a_tensor.logical_shape()[0] % mask_tensor.logical_shape()[0] == 0 &&
+            a_tensor.logical_shape()[1] % mask_tensor.logical_shape()[1] == 0 &&
+            a_tensor.logical_shape()[2] == mask_tensor.logical_shape()[2] &&
+            a_tensor.logical_shape()[3] == mask_tensor.logical_shape()[3], "Mask shape must be broadcastable in the first 2 dimensions and same to input in the last 2");
     }
+}
 
-    const auto& a = input_tensors.at(0);
-    return {TensorSpec(
+SoftMaxDeviceOperation::spec_return_value_t SoftMaxDeviceOperation::compute_output_specs(
+    const operation_attributes_t& attrs, const tensor_args_t& tensor_args) {
+    const auto& a = tensor_args.input;
+    return TensorSpec(
         a.logical_shape(),
         tt::tt_metal::TensorLayout(
-            output_dtype,
+            attrs.output_dtype,
             tt::tt_metal::PageConfig(ttnn::TILE_LAYOUT),
-            output_mem_config)
-    )};
+            attrs.output_mem_config));
 }
 
-std::vector<ttnn::Tensor> SoftMaxDeviceOperation::create_output_tensors(
-    const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const {
-    if (!output_tensors.empty() && output_tensors[0].has_value()) {
-        return {output_tensors[0].value()};
-    }
-    const auto& input_tensor = input_tensors.at(0);
-    auto spec = compute_output_specs(input_tensors, output_tensors)[0];
-    return {create_device_tensor(spec, input_tensor.device())};
+SoftMaxDeviceOperation::tensor_return_value_t SoftMaxDeviceOperation::create_output_tensors(
+    const operation_attributes_t& attrs, const tensor_args_t& tensor_args) {
+    auto spec = compute_output_specs(attrs, tensor_args);
+    return create_device_tensor(spec, tensor_args.input.device());
 }
 
-void SoftMaxDeviceOperation::validate_with_output_tensors(
-    const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const {
-        const auto& a_tensor = input_tensors.at(0);
-        if(!output_tensors.empty() && output_tensors[0].has_value()) {
-            const auto& o_tensor = output_tensors[0].value();
-            TT_FATAL(input_tensors.at(0).logical_shape() == output_tensors[0].value().logical_shape(), "Expect shape be same");
-            // XXX: We will deal with alternative data type support later
-            TT_FATAL(o_tensor.dtype() == tt::tt_metal::DataType::BFLOAT16, "Output data type must be BFLOAT16");
-        }
-
-        // XXX: We will deal with alternative data type support later
-        TT_FATAL(a_tensor.dtype() == tt::tt_metal::DataType::BFLOAT16, "Input data type must be BFLOAT16");
-
-        if(input_tensors.size() > 1) {
-            const auto& mask_tensor = input_tensors.at(1);
-            TT_FATAL(mask_tensor.dtype() == tt::tt_metal::DataType::BFLOAT16, "Mask data type must be BFLOAT16");
-            TT_FATAL(a_tensor.logical_shape()[0] % mask_tensor.logical_shape()[0] == 0 &&
-                a_tensor.logical_shape()[1] % mask_tensor.logical_shape()[1] == 0 &&
-                a_tensor.logical_shape()[2] == mask_tensor.logical_shape()[2] &&
-                a_tensor.logical_shape()[3] == mask_tensor.logical_shape()[3], "Mask shape must be broadcastable in the first 2 dimensions and same to input in the last 2");
-        }
-
-}
-
-tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_program(
-    const std::vector<Tensor>& input_tensors, std::vector<Tensor>& output_tensors) const
-{
+SoftMaxDeviceOperation::SoftMaxProgramFactory::cached_program_t
+SoftMaxDeviceOperation::SoftMaxProgramFactory::create(
+    const operation_attributes_t& attrs, const tensor_args_t& tensor_args, tensor_return_value_t& tensor_return_value) {
     tt::tt_metal::Program program{};
-    const auto& a_tensor = input_tensors.at(0);
-    const auto& o_tensor = output_tensors.at(0);
-    const auto mask_tensor = at_index(input_tensors, 1);
+    const auto& a_tensor = tensor_args.input;
+    const auto& o_tensor = tensor_return_value;
+    const auto& mask_tensor = tensor_args.mask;
+    const float scale = attrs.scale;
 
     const uint32_t width = a_tensor.logical_shape()[-1];
     const uint32_t height = a_tensor.logical_shape()[-2];
     const uint32_t n_head = a_tensor.logical_shape()[-3];
     const uint32_t batch = a_tensor.logical_shape()[-4];
 
-    // tt::tt_metal::IDevice* device = a_tensor.device();
     tt::tt_metal::CoreCoord core_grid = tt::tt_metal::CoreCoord(1, 1);
 
     auto* a = a_tensor.buffer();
@@ -218,35 +215,52 @@ tt::tt_metal::operation::ProgramWithCallbacks SoftMaxDeviceOperation::create_pro
         }
     }
 
-    auto override_runtime_args_callback = [reader, writer, all_cores](
-                                                  const void* operation,
-                                                  Program& program,
-                                                  const std::vector<Tensor>& input_tensors,
-                                                  const std::vector<std::optional<const Tensor>>&,
-                                                  const std::vector<Tensor>& output_tensors) {
-            (void)operation;
-            auto* a = input_tensors.at(0).buffer();
-            auto* o = output_tensors.at(0).buffer();
+    return {std::move(program), {reader, writer, all_cores}};
+}
 
-            for(const auto& range : all_cores.ranges()) {
-                for (const auto& core : range) {
-                    {
-                        auto& runtime_args = GetRuntimeArgs(program, reader, core);
-                        runtime_args[0] = a->address();
+void SoftMaxDeviceOperation::SoftMaxProgramFactory::override_runtime_arguments(
+    cached_program_t& cached_program,
+    const operation_attributes_t& /*attrs*/,
+    const tensor_args_t& tensor_args,
+    tensor_return_value_t& tensor_return_value) {
+    auto& program = cached_program.program;
+    const auto reader = cached_program.shared_variables.reader;
+    const auto writer = cached_program.shared_variables.writer;
+    const auto& all_cores = cached_program.shared_variables.all_cores;
 
-                        if(input_tensors.size() > 1) {
-                            auto* mask = input_tensors.at(1).buffer();
-                            runtime_args[5] = mask->address();
-                        }
-                    }
+    auto* a = tensor_args.input.buffer();
+    auto* o = tensor_return_value.buffer();
 
-                    {
-                        auto& runtime_args = GetRuntimeArgs(program, writer, core);
-                        runtime_args[0] = o->address();
-                    }
+    for(const auto& range : all_cores.ranges()) {
+        for (const auto& core : range) {
+            {
+                auto& runtime_args = GetRuntimeArgs(program, reader, core);
+                runtime_args[0] = a->address();
+
+                if(tensor_args.mask.has_value()) {
+                    auto* mask = tensor_args.mask->buffer();
+                    runtime_args[5] = mask->address();
                 }
             }
-        };
 
-        return {std::move(program), override_runtime_args_callback};
+            {
+                auto& runtime_args = GetRuntimeArgs(program, writer, core);
+                runtime_args[0] = o->address();
+            }
+        }
+    }
+}
+
+} // namespace
+
+ttnn::Tensor ttggml::SoftMaxOperation::invoke(const Tensor& a, float scale) {
+    return ttnn::device_operation::launch<SoftMaxDeviceOperation>(
+        SoftMaxDeviceOperation::operation_attributes_t{a.memory_config(), a.dtype(), scale},
+        SoftMaxDeviceOperation::tensor_args_t{a, std::nullopt});
+}
+
+ttnn::Tensor ttggml::SoftMaxOperation::invoke(const Tensor& a, const Tensor& mask, float scale) {
+    return ttnn::device_operation::launch<SoftMaxDeviceOperation>(
+        SoftMaxDeviceOperation::operation_attributes_t{a.memory_config(), a.dtype(), scale},
+        SoftMaxDeviceOperation::tensor_args_t{a, mask});
 }

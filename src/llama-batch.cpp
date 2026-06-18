@@ -394,11 +394,13 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
     clear();
     split_reset();
 
+    const int64_t n_pos_all = (int64_t) n_tokens*n_pos_per_embd;
+
     auto udata = std::make_shared<llama_ubatch::data_t>();
 
     udata->token     .resize(n_tokens);
     udata->embd      .clear();
-    udata->pos       .resize(n_tokens);
+    udata->pos       .resize(n_pos_all);
     udata->n_seq_id  .resize(n_tokens);
     udata->seq_id    .resize(n_tokens);
     udata->seq_id_unq.resize(0);
@@ -695,6 +697,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
     udata->output    .resize(n_tokens);
 
+    udata->seq_id_data.reserve(n_tokens);
+
     seq_set_t seq_set_unq;
 
     for (size_t i = 0; i < idxs.size(); ++i) {
@@ -716,16 +720,24 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         }
 
         udata->n_seq_id[i] = batch.n_seq_id[idxs[i]];
-        udata->seq_id[i]   = batch.seq_id[idxs[i]];
         udata->output[i]   = batch.logits[idxs[i]];
 
         for (int s = 0; s < udata->n_seq_id[i]; ++s) {
-            seq_set_unq.set(udata->seq_id[i][s]);
+            const llama_seq_id seq_id = batch.seq_id[idxs[i]][s];
+
+            udata->seq_id_data.push_back(seq_id);
+            seq_set_unq.set(seq_id);
         }
 
         if (udata->output[i]) {
             out_ids.push_back(idxs[i]);
         }
+    }
+
+    llama_seq_id * seq_id_ptr = udata->seq_id_data.data();
+    for (size_t i = 0; i < idxs.size(); ++i) {
+        udata->seq_id[i] = seq_id_ptr;
+        seq_id_ptr += udata->n_seq_id[i];
     }
 
     for (uint32_t s = 0; s < n_seq_max; ++s) {

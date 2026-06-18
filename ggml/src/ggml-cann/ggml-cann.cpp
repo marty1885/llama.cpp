@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024 The ggml authors
+ * Copyright (c) 2023-2026 The ggml authors
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
@@ -22,24 +22,27 @@
 
 #include "ggml-cann.h"
 
-#include <acl/acl.h>
-#include <stdarg.h>
-#include <aclnnop/aclnn_trans_matmul_weight.h>
-
-#include <cmath>
-#include <cstdio>
-#include <cstring>
-#include <mutex>
-#include <queue>
-#include <chrono>
-#include <unordered_set>
-#include <optional>
-
-#include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cann/aclnn_ops.h"
 #include "ggml-cann/common.h"
+#include "ggml-impl.h"
 #include "ggml.h"
+
+#include <acl/acl.h>
+#include <aclnnop/aclnn_trans_matmul_weight.h>
+#include <stdarg.h>
+
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <queue>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #define GGML_COMMON_DECL_C
 
@@ -94,21 +97,10 @@ void ggml_cann_set_device(const int32_t device) {
 }
 
 /**
- * @brief Retrieves the current device ID.
- *
- * @return The current device ID.
- */
-int32_t ggml_cann_get_device() {
-    int32_t id;
-    ACL_CHECK(aclrtGetDevice(&id));
-    return id;
-}
-
-/**
- * @brief Get the value of the specified environment variable (name).
+ * @brief Get the value of the specified environment variable (name) as lowercase.
  *        if not empty, return a std::string object
  */
-std::optional<std::string> get_env(const std::string & name) {
+std::optional<std::string> get_env_as_lowercase(const std::string & name) {
     const char * val = std::getenv(name.c_str());
     if (!val) {
         return std::nullopt;
@@ -122,7 +114,7 @@ std::optional<std::string> get_env(const std::string & name) {
  * @brief Verify whether the environment variable is a valid value.
  */
 bool parse_bool(const std::string & value) {
-    std::unordered_set<std::string> valid_values = { "on", "1", "yes", "y", "enable", "true" };
+    static const std::unordered_set<std::string> valid_values = { "on", "1", "yes", "y", "enable", "true" };
     return valid_values.find(value) != valid_values.end();
 }
 
@@ -259,7 +251,7 @@ struct ggml_cann_pool_buf_prio : public ggml_cann_pool {
      * @param device The device ID to associate with this buffer pool.
      */
     explicit ggml_cann_pool_buf_prio(int device) : device(device) {
-        disable_clean = parse_bool(get_env("GGML_CANN_DISABLE_BUF_POOL_CLEAN").value_or(""));
+        disable_clean = parse_bool(get_env_as_lowercase("GGML_CANN_DISABLE_BUF_POOL_CLEAN").value_or(""));
     }
 
     /**
@@ -452,7 +444,7 @@ struct ggml_cann_pool_buf : public ggml_cann_pool {
      * @param device The device ID to associate with this buffer pool.
      */
     explicit ggml_cann_pool_buf(int device) : device(device) {
-        disable_clean = parse_bool(get_env("GGML_CANN_DISABLE_BUF_POOL_CLEAN").value_or(""));
+        disable_clean = parse_bool(get_env_as_lowercase("GGML_CANN_DISABLE_BUF_POOL_CLEAN").value_or(""));
     }
 
     /**
@@ -764,7 +756,7 @@ struct ggml_cann_pool_vmm : public ggml_cann_pool {
  * @return A unique pointer to the created CANN pool.
  */
 std::unique_ptr<ggml_cann_pool> ggml_backend_cann_context::new_pool_for_device(int device) {
-    std::string mem_pool_type = get_env("GGML_CANN_MEM_POOL").value_or("");
+    std::string mem_pool_type = get_env_as_lowercase("GGML_CANN_MEM_POOL").value_or("");
 
     if (mem_pool_type == "prio") {
         GGML_LOG_INFO("%s: device %d use buffer pool with priority queue\n", __func__, device);
@@ -781,6 +773,21 @@ std::unique_ptr<ggml_cann_pool> ggml_backend_cann_context::new_pool_for_device(i
 }
 
 // cann buffer
+
+/**
+ * @brief Tracks multi-threaded write progress for a single tensor.
+ *
+ * When multiple threads call set_tensor on different chunks of the same tensor,
+ * this tracker accumulates progress and defers post-processing (quantized format
+ * transform or ND-to-NZ conversion) until all data has been written.
+ */
+struct TensorSetTracker {
+    std::mutex mtx;                   ///< Protects concurrent access to this tracker
+    size_t bytes_written = 0;         ///< Accumulated bytes written so far
+    size_t total_bytes = 0;           ///< Target size (full tensor)
+    std::vector<uint8_t> host_buffer; ///< Host staging buffer for quantized tensors
+};
+
 /**
  * @brief Context for managing a CANN buffer associated with a specific device.
  *
@@ -790,6 +797,9 @@ std::unique_ptr<ggml_cann_pool> ggml_backend_cann_context::new_pool_for_device(i
 struct ggml_backend_cann_buffer_context {
     int32_t device;             ///< The device ID associated with this buffer context.
     void *  dev_ptr = nullptr;  ///< Pointer to the device memory allocated for the buffer.
+
+    std::mutex tracker_mutex;   ///< Protects the trackers map
+    std::unordered_map<void *, std::unique_ptr<TensorSetTracker>> trackers;
 
     /**
      * @brief Constructor to initialize the CANN buffer context.
@@ -803,21 +813,71 @@ struct ggml_backend_cann_buffer_context {
      * @brief Destructor to free the device memory allocated for the buffer.
      */
     ~ggml_backend_cann_buffer_context() { ACL_CHECK(aclrtFree(dev_ptr)); }
+
+    /**
+     * @brief Get or create a tracker for the given tensor.
+     */
+    TensorSetTracker * get_or_create_tracker(ggml_tensor * tensor) {
+        std::lock_guard<std::mutex> lock(tracker_mutex);
+        auto key = tensor->data;
+        auto it = trackers.find(key);
+        if (it == trackers.end()) {
+            auto tracker = std::make_unique<TensorSetTracker>();
+            tracker->total_bytes = ggml_nbytes(tensor);
+            auto * ptr = tracker.get();
+            trackers[key] = std::move(tracker);
+            return ptr;
+        }
+        return it->second.get();
+    }
+
+    /**
+     * @brief Remove the tracker for the given tensor.
+     */
+    void remove_tracker(ggml_tensor * tensor) {
+        std::lock_guard<std::mutex> lock(tracker_mutex);
+        trackers.erase(tensor->data);
+    }
+};
+
+// cann buffer type
+/**
+ * @brief Structure representing context information for a specific backend
+ * buffer type.
+ */
+struct ggml_backend_cann_buffer_type_context {
+    int32_t     device; /**< Device identifier associated with the buffer context. */
+    std::string name;   /**< Name associated with the buffer context. */
 };
 
 /**
- * @brief Check if a buffer is a CANN buffer.
+ * @brief Retrieves the name associated with a CANN buffer type.
  *
- * This function checks if a given buffer is a CANN buffer by comparing its
- * `get_name` function pointer to `ggml_backend_cann_buffer_get_name`.
+ * This function returns the descriptive name associated with the specified
+ * CANN buffer type context.
  *
- * @param buffer The buffer to check.
- * @return true if the buffer is a CANN buffer, false otherwise.
+ * @param buft Pointer to the buffer type context.
+ * @return Const pointer to the C-style string containing the name.
  */
-static bool ggml_backend_buft_is_cann(ggml_backend_buffer_type_t buft);
+static const char * ggml_backend_cann_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    ggml_backend_cann_buffer_type_context * buft_ctx = (ggml_backend_cann_buffer_type_context *) buft->context;
 
-static bool ggml_backend_buffer_is_cann(ggml_backend_buffer_t buffer) {
-    return ggml_backend_buft_is_cann(buffer->buft);
+    return buft_ctx->name.c_str();
+}
+
+/**
+ * @brief Checks if the backend buffer type is associated with the CANN backend.
+ *
+ * This function checks whether the provided backend buffer type is associated
+ * with the CANN backend based on the comparison of its name retrieval function
+ * pointer.
+ *
+ * @param buft Pointer to the backend buffer type to check.
+ * @return bool Returns true if the buffer type is associated with the CANN
+ * backend, otherwise false.
+ */
+static bool ggml_backend_buft_is_cann(ggml_backend_buffer_type_t buft) {
+    return buft->iface.get_name == ggml_backend_cann_buffer_type_name;
 }
 
 /**
@@ -1110,6 +1170,7 @@ static enum ggml_status ggml_backend_cann_buffer_init_tensor(ggml_backend_buffer
  * designed to be used with a global array, one per device.
  */
 struct ggml_cann_nz_workspace {
+    std::mutex mtx;    // Protects ptr/allocated from concurrent access
     void * ptr;        // Pointer to allocated device buffer
     size_t allocated;  // Size of currently allocated buffer in bytes
 
@@ -1176,20 +1237,21 @@ static ggml_cann_nz_workspace g_nz_workspaces[GGML_CANN_MAX_DEVICES];
  * @note The workspace buffer used in this function is managed globally and reused
  *       across calls. This reduces overhead from repeated memory allocation and deallocation.
  */
-static void weight_format_to_nz(ggml_tensor * tensor, size_t offset, int device) {
-    aclTensor * weightTransposed = ggml_cann_create_tensor(tensor, tensor->ne, tensor->nb, 2, ACL_FORMAT_ND, offset);
-    uint64_t    workspaceSize    = 0;
+static void weight_format_to_nz(ggml_tensor * tensor, int device) {
+    acl_tensor_ptr weightTransposed = ggml_cann_create_tensor(tensor, tensor->ne, tensor->nb, 2, ACL_FORMAT_ND, 0);
+    uint64_t       workspaceSize    = 0;
     aclOpExecutor * executor;
 
     // TransMatmulWeight
-    ACL_CHECK(aclnnTransMatmulWeightGetWorkspaceSize(weightTransposed, &workspaceSize, &executor));
+    ACL_CHECK(aclnnTransMatmulWeightGetWorkspaceSize(weightTransposed.get(), &workspaceSize, &executor));
+
+    std::lock_guard<std::mutex> lock(g_nz_workspaces[device].mtx);
     // Avoid frequent malloc/free of the workspace.
     g_nz_workspaces[device].realloc(workspaceSize);
 
     void * g_nz_workspace = g_nz_workspaces[device].get();
 
     ACL_CHECK(aclnnTransMatmulWeight(g_nz_workspace, workspaceSize, executor, nullptr));
-    ACL_CHECK(aclDestroyTensor(weightTransposed));
 }
 
 // TODO: need handle tensor which has paddings.
@@ -1197,7 +1259,13 @@ static void weight_format_to_nz(ggml_tensor * tensor, size_t offset, int device)
  * @brief Set tensor data in a CANN buffer.
  *
  * This function sets tensor data in a CANN buffer, handling transformations
- * if needed based on the tensor's type.
+ * if needed based on the tensor's type. It supports multi-threaded calls
+ * where different threads write different chunks of the same tensor.
+ *
+ * For quantized tensors (Q4_0/Q8_0), data is staged in a host buffer and
+ * the format transform is deferred until all chunks are written.
+ * For NZ weight tensors, chunks are uploaded directly but the ND-to-NZ
+ * conversion is deferred until all chunks are written.
  *
  * @param buffer The CANN buffer where the tensor data will be set.
  * @param tensor Pointer to the tensor whose data will be set.
@@ -1213,25 +1281,72 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
     ggml_cann_set_device(ctx->device);
-    // TODO: refer to cann(#6017), it use thread's default stream.
-    // For acl, synchronous functions use this default stream.
-    // Why aclrtSynchronizeDevice?
 
     // Only check env once.
-    static bool weight_to_nz = parse_bool(get_env("GGML_CANN_WEIGHT_NZ").value_or("on"));
-    if (!need_transform(tensor->type)) {
+    static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
+
+    bool is_quantized = need_transform(tensor->type);
+    bool is_nz        = !is_quantized && tensor->type != GGML_TYPE_BF16 && weight_to_nz &&
+                 is_matmul_weight((const ggml_tensor *) tensor);
+
+    // Plain tensor (not quantized, not NZ): direct copy, no tracking needed
+    if (!is_quantized && !is_nz) {
         ACL_CHECK(aclrtMemcpy((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
-        if (weight_to_nz && is_matmul_weight((const ggml_tensor *) tensor)) {
+        return;
+    }
+
+    // Single-shot write (full tensor at once): handle directly without tracking overhead
+    if (offset == 0 && size == ggml_nbytes(tensor)) {
+        if (is_quantized) {
+            void * transform_buffer = malloc(size);
+            ggml_backend_cann_transform(tensor, data, transform_buffer);
+            ACL_CHECK(aclrtMemcpy(tensor->data, size, transform_buffer, size, ACL_MEMCPY_HOST_TO_DEVICE));
+            free(transform_buffer);
+        } else {
+            // NZ weight
             GGML_ASSERT(tensor->ne[2] == 1);
             GGML_ASSERT(tensor->ne[3] == 1);
-            weight_format_to_nz(tensor, offset, ctx->device);
+            ACL_CHECK(aclrtMemcpy(tensor->data, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
+            weight_format_to_nz(tensor, ctx->device);
         }
-    } else {
-        void * transform_buffer = malloc(size);
-        ggml_backend_cann_transform(tensor, data, transform_buffer);
+        return;
+    }
 
-        ACL_CHECK(aclrtMemcpy((char *) tensor->data + offset, size, transform_buffer, size, ACL_MEMCPY_HOST_TO_DEVICE));
-        free(transform_buffer);
+    // Chunked write: use tracker to accumulate progress and defer transform/conversion
+    TensorSetTracker * tracker = ctx->get_or_create_tracker(tensor);
+    std::unique_lock<std::mutex> lock(tracker->mtx);
+
+    if (is_quantized) {
+        // Stage data in host buffer; transform requires full tensor data
+        if (tracker->host_buffer.empty()) {
+            tracker->host_buffer.resize(tracker->total_bytes);
+        }
+        memcpy(tracker->host_buffer.data() + offset, data, size);
+    } else {
+        // NZ weight: upload chunk to device immediately, defer conversion
+        ACL_CHECK(aclrtMemcpy((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
+    }
+
+    tracker->bytes_written += size;
+
+    // All chunks received: perform deferred transform/conversion
+    if (tracker->bytes_written >= tracker->total_bytes) {
+        if (is_quantized) {
+            void * transform_buffer = malloc(tracker->total_bytes);
+            ggml_backend_cann_transform(tensor, tracker->host_buffer.data(), transform_buffer);
+            ACL_CHECK(aclrtMemcpy(tensor->data, tracker->total_bytes, transform_buffer, tracker->total_bytes, ACL_MEMCPY_HOST_TO_DEVICE));
+            free(transform_buffer);
+        }
+
+        if (is_nz) {
+            GGML_ASSERT(tensor->ne[2] == 1);
+            GGML_ASSERT(tensor->ne[3] == 1);
+            weight_format_to_nz(tensor, ctx->device);
+        }
+
+        // Unlock before removing tracker, as remove_tracker destroys the mutex
+        lock.unlock();
+        ctx->remove_tracker(tensor);
     }
 }
 
@@ -1283,7 +1398,7 @@ static void ggml_backend_cann_buffer_get_tensor(ggml_backend_buffer_t buffer,
 static bool ggml_backend_cann_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
                                                 const ggml_tensor *   src,
                                                 ggml_tensor *         dst) {
-    if (ggml_backend_buffer_is_cann(src->buffer)) {
+    if (ggml_backend_buft_is_cann(src->buffer->buft)) {
         ggml_backend_cann_buffer_context * src_ctx = (ggml_backend_cann_buffer_context *) src->buffer->context;
         ggml_backend_cann_buffer_context * dst_ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
@@ -1314,6 +1429,22 @@ static bool ggml_backend_cann_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
 }
 
 /**
+ * @brief Set a region of a tensor's device memory to a specified value.
+ *
+ * @param buffer The CANN buffer containing the tensor.
+ * @param tensor Pointer to the tensor whose memory will be set.
+ * @param value The value to which each byte in the region will be set.
+ * @param offset Byte offset within the tensor's data to start setting.
+ * @param size Number of bytes to set.
+ */
+static void ggml_backend_cann_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
+
+    ggml_cann_set_device(ctx->device);
+    ACL_CHECK(aclrtMemset((char *) tensor->data + offset, size, value, size));
+}
+
+/**
  * @brief Clear a CANN buffer by setting all its memory to a specified value.
  *
  * This function clears a CANN buffer by setting all its memory to a specified
@@ -1339,38 +1470,15 @@ static const ggml_backend_buffer_i ggml_backend_cann_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_cann_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_cann_buffer_get_base,
     /* .init_tensor     = */ ggml_backend_cann_buffer_init_tensor,
-    /* .memset_tensor   = */ NULL,
+    /* .memset_tensor   = */ ggml_backend_cann_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_cann_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_cann_buffer_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
     /* .cpy_tensor      = */ ggml_backend_cann_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_cann_buffer_clear,
     /* .reset           = */ NULL,
 };
-
-// cann buffer type
-/**
- * @brief Structure representing context information for a specific backend
- * buffer type.
- */
-struct ggml_backend_cann_buffer_type_context {
-    int32_t     device; /**< Device identifier associated with the buffer context. */
-    std::string name;   /**< Name associated with the buffer context. */
-};
-
-/**
- * @brief Retrieves the name associated with a CANN buffer type.
- *
- * This function returns the descriptive name associated with the specified
- * CANN buffer type context.
- *
- * @param buft Pointer to the buffer type context.
- * @return Const pointer to the C-style string containing the name.
- */
-static const char * ggml_backend_cann_buffer_type_name(ggml_backend_buffer_type_t buft) {
-    ggml_backend_cann_buffer_type_context * buft_ctx = (ggml_backend_cann_buffer_type_context *) buft->context;
-
-    return buft_ctx->name.c_str();
-}
 
 /**
  * @brief Allocates a new CANN buffer of the specified type and size.
@@ -1443,7 +1551,7 @@ static size_t ggml_backend_cann_buffer_type_get_alloc_size(ggml_backend_buffer_t
     int64_t ne0  = tensor->ne[0];
 
     // Only check env once.
-    static bool weight_to_nz = parse_bool(get_env("GGML_CANN_WEIGHT_NZ").value_or("on"));
+    static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
 
     // last line must bigger than 32, because every single op deal at
     // least 32 bytes.
@@ -1455,7 +1563,8 @@ static size_t ggml_backend_cann_buffer_type_get_alloc_size(ggml_backend_buffer_t
         if (ne0 % MATRIX_ROW_PADDING != 0) {
             size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
         }
-    } else if (weight_to_nz && is_matmul_weight((const ggml_tensor *) tensor)) {
+    } else if (weight_to_nz && tensor->type != GGML_TYPE_BF16
+               && is_matmul_weight((const ggml_tensor *) tensor)) {
         // NZ format weight are not support quantized yet.
         // If ND tensor transform to NZ, size may changed.
         int64_t shape[] = { tensor->ne[1], tensor->ne[0] };
@@ -1641,7 +1750,7 @@ ggml_backend_buffer_type_t ggml_backend_cann_host_buffer_type() {
                            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
                            },
         /* .device   = */
-         ggml_backend_reg_dev_get(ggml_backend_cann_reg(), 0),
+        ggml_backend_reg_dev_get(ggml_backend_cann_reg(), 0),
         /* .context  = */ nullptr,
     };
 
@@ -1742,6 +1851,9 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
                 case GGML_UNARY_OP_STEP:
                     ggml_cann_step(ctx, dst);
                     break;
+                case GGML_UNARY_OP_SOFTPLUS:
+                    ggml_cann_softplus(ctx, dst);
+                    break;
                 default:
                     return false;
             }
@@ -1752,20 +1864,16 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
                     GGML_CANN_CALL_OP_UNARY_GATED(Relu);
                     break;
                 case GGML_GLU_OP_GEGLU:
+                    ggml_cann_geglu(ctx, dst, 0);  // approximate=0 → tanh
+                    break;
                 case GGML_GLU_OP_GEGLU_ERF:
-                    // aclnnGelu internally uses the erf-based approximation.
-                    GGML_CANN_CALL_OP_UNARY_GATED(Gelu);
+                    ggml_cann_geglu(ctx, dst, 1);  // approximate=1 → erf
                     break;
                 case GGML_GLU_OP_SWIGLU:
-                    GGML_CANN_CALL_OP_UNARY_GATED(Silu);
+                    ggml_cann_swiglu(ctx, dst);
                     break;
                 case GGML_GLU_OP_GEGLU_QUICK:
-                    {
-                        auto lambda = [](ggml_backend_cann_context & ctx, aclTensor * acl_src, aclTensor * acl_dst) {
-                            GGML_CANN_CALL_ACLNN_OP(ctx, GeluV2, acl_src, 0, acl_dst);
-                        };
-                        ggml_cann_op_unary_gated(lambda, ctx, dst);
-                    }
+                    ggml_cann_geglu_quick(ctx, dst);
                     break;
                 default:
                     return false;
@@ -1827,6 +1935,9 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
         case GGML_OP_CPY:
             ggml_cann_cpy(ctx, dst);
             break;
+        case GGML_OP_SET:
+            ggml_cann_set(ctx, dst);
+            break;
         case GGML_OP_CONT:
             ggml_cann_dup(ctx, dst);
             break;
@@ -1886,6 +1997,30 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cann_flash_attn_ext(ctx, dst);
+            break;
+        case GGML_OP_OUT_PROD:
+            ggml_cann_out_prod(ctx, dst);
+            break;
+        case GGML_OP_GATED_LINEAR_ATTN:
+            ggml_cann_gated_linear_attn(ctx, dst);
+            break;
+        case GGML_OP_SSM_CONV:
+            ggml_cann_ssm_conv(ctx, dst);
+            break;
+        case GGML_OP_CUMSUM:
+            ggml_cann_cumsum(ctx, dst);
+            break;
+        case GGML_OP_TRI:
+            ggml_cann_tri(ctx, dst);
+            break;
+        case GGML_OP_FILL:
+            ggml_cann_fill(ctx, dst);
+            break;
+        case GGML_OP_DIAG:
+            ggml_cann_diag(ctx, dst);
+            break;
+        case GGML_OP_SOLVE_TRI:
+            ggml_cann_solve_tri(ctx, dst);
             break;
         default:
             return false;
@@ -1949,7 +2084,8 @@ static void ggml_backend_cann_set_tensor_async(ggml_backend_t backend,
     GGML_ASSERT(buf->buft == ggml_backend_cann_buffer_type(cann_ctx->device) && "unsupported buffer type");
     GGML_ASSERT(!ggml_is_quantized(tensor->type));
 
-    ggml_cann_async_memcpy(cann_ctx, (char *) tensor->data + offset, data, size, ACL_MEMCPY_HOST_TO_DEVICE);
+    ACL_CHECK(aclrtMemcpyAsync((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE,
+                               cann_ctx->stream()));
 }
 
 /**
@@ -1974,7 +2110,8 @@ static void ggml_backend_cann_get_tensor_async(ggml_backend_t      backend,
     GGML_ASSERT(buf->buft == ggml_backend_cann_buffer_type(cann_ctx->device) && "unsupported buffer type");
     GGML_ASSERT(!ggml_is_quantized(tensor->type));
 
-    ggml_cann_async_memcpy(cann_ctx, data, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST);
+    ACL_CHECK(aclrtMemcpyAsync(data, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST,
+                               cann_ctx->stream()));
 }
 
 /**
@@ -1998,7 +2135,7 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
 
     GGML_ASSERT(!is_matmul_weight((const ggml_tensor *) src));
 
-    if (!ggml_backend_buffer_is_cann(src->buffer) || !ggml_backend_buffer_is_cann(dst->buffer)) {
+    if (!ggml_backend_buft_is_cann(src->buffer->buft) || !ggml_backend_buft_is_cann(dst->buffer->buft)) {
         return false;
     }
 
@@ -2035,7 +2172,6 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
         ACL_CHECK(aclrtDeviceEnablePeerAccess(cann_ctx_dst->device, 0));
 
         // wait for task_queue empty to keep task order.
-        cann_ctx_src->task_queue.wait();
         ACL_CHECK(aclrtMemcpyAsync(dst->data, copy_size, src->data, copy_size, ACL_MEMCPY_DEVICE_TO_DEVICE,
                                    cann_ctx_src->stream()));
         // record event on src stream after the copy
@@ -2068,166 +2204,43 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
  */
 static void ggml_backend_cann_synchronize(ggml_backend_t backend) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
-    cann_ctx->task_queue.wait();
     ggml_cann_set_device(cann_ctx->device);
     ACL_CHECK(aclrtSynchronizeStream(cann_ctx->stream()));
 }
 
-#ifdef USE_ACL_GRAPH
 /**
- * @brief Add a new CANN graph to the LRU cache by populating node properties from the ggml graph.
+ * @brief Check if CANN backend can fuse the specified operation sequence
  *
- * This function creates a new ggml_cann_graph object and fills its node properties
- * (operation type, dimensions, strides, input sources, and operation parameters)
- * based on the current ggml computation graph.
+ * This function determines whether an operation sequence starting from the specified node
+ * can be fused into an optimized operation in the CANN backend. Operation fusion can reduce
+ * memory access overhead and improve computational efficiency.
  *
- * Each node in the ggml graph is mapped to a property entry in the new CANN graph:
- * - node address
- * - operation type
- * - shape (ne) and strides (nb)
- * - source tensor addresses
- * - operation parameters
- *
- * After initialization, the new graph is pushed into the LRU cache owned by the
- * CANN backend context. The cache takes ownership of the graph and manages its
- * lifetime (including deletion upon eviction).
- *
- * @param cann_ctx  The CANN backend context containing the graph cache.
- * @param cgraph    The current ggml computation graph.
+ * @param cgraph Pointer to the computation graph
+ * @param node_idx Index of the starting node in the computation graph
+ * @param ops Sequence of operation types to check for fusion
+ * @return true if the operations can be fused
+ * @return false if the operations cannot be fused
  */
-static void add_lru_matched_graph_node_properties(ggml_backend_cann_context * cann_ctx, ggml_cgraph * cgraph) {
-    // Create a new ggml_cann_graph object on the heap (its lifetime is managed by the cache).
-    ggml_cann_graph * new_graph = new ggml_cann_graph();
-    new_graph->ggml_graph_properties.resize(cgraph->n_nodes);
-
-    for (int node_idx = 0; node_idx < cgraph->n_nodes; ++node_idx) {
-        ggml_tensor * node = cgraph->nodes[node_idx];
-        auto &        prop = new_graph->ggml_graph_properties[node_idx];
-
-        prop.node_address = node->data;
-        prop.node_op      = node->op;
-
-        std::copy_n(node->ne, GGML_MAX_DIMS, prop.ne);
-        std::copy_n(node->nb, GGML_MAX_DIMS, prop.nb);
-
-        for (int src = 0; src < GGML_MAX_SRC; ++src) {
-            if (node->src[src]) {
-                prop.src_address[src] = node->src[src]->data;
-                std::copy_n(node->src[src]->ne, GGML_MAX_DIMS, prop.src_ne[src]);
-                std::copy_n(node->src[src]->nb, GGML_MAX_DIMS, prop.src_nb[src]);
-            } else {
-                prop.src_address[src] = nullptr;
-                std::fill_n(prop.src_ne[src], GGML_MAX_DIMS, 0);
-                std::fill_n(prop.src_nb[src], GGML_MAX_DIMS, 0);
-            }
-        }
-
-        memcpy(prop.op_params, node->op_params, GGML_MAX_OP_PARAMS);
-    }
-
-    // Insert into the LRU cache (cache takes ownership and will delete it when evicted).
-    cann_ctx->graph_lru_cache.push(new_graph);
-}
-
-/**
- * @brief Check if a ggml tensor node matches a previously captured CANN graph node.
- *
- * This function compares all relevant fields (address, op type, shape, source inputs, op params)
- * to determine whether the current node matches a previously recorded version.
- *
- * @param node                  The current ggml tensor node.
- * @param graph_node_properties The stored properties of a CANN graph node.
- * @return true if all fields match (excluding GGML_OP_VIEW); false otherwise.
- */
-static bool ggml_graph_node_has_matching_properties(ggml_tensor *                node,
-                                                    ggml_graph_node_properties * graph_node_properties) {
-    if (node->data != graph_node_properties->node_address && node->op != GGML_OP_VIEW) {
+static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
+                               int                                 node_idx,
+                               std::initializer_list<enum ggml_op> ops) {
+    if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
 
-    if (node->op != graph_node_properties->node_op) {
-        return false;
-    }
-
-    for (int i = 0; i < GGML_MAX_DIMS; i++) {
-        if (node->ne[i] != graph_node_properties->ne[i]) {
+    // CANN backend supports fusing ADD + RMS_NORM operations
+    if ((ops.size() == 2) && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_RMS_NORM) {
+        ggml_tensor * add_node = cgraph->nodes[node_idx];
+        // TODO: support broadcast for ADD + RMS_NORM
+        if (add_node->src[0]->ne[0] != add_node->src[1]->ne[0] || add_node->src[0]->ne[1] != add_node->src[1]->ne[1] ||
+            add_node->src[0]->ne[2] != add_node->src[1]->ne[2] || add_node->src[0]->ne[3] != add_node->src[1]->ne[3]) {
             return false;
         }
-        if (node->nb[i] != graph_node_properties->nb[i]) {
-            return false;
-        }
-    }
-
-    for (int i = 0; i < GGML_MAX_SRC; i++) {
-        if (node->src[i]) {
-            if (node->src[i]->data != graph_node_properties->src_address[i] && node->op != GGML_OP_VIEW) {
-                return false;
-            }
-
-            for (int d = 0; d < GGML_MAX_DIMS; d++) {
-                if (node->src[i]->ne[d] != graph_node_properties->src_ne[i][d]) {
-                    return false;
-                }
-                if (node->src[i]->nb[d] != graph_node_properties->src_nb[i][d]) {
-                    return false;
-                }
-            }
-        } else {
-            if (graph_node_properties->src_address[i] != nullptr) {
-                return false;
-            }
-        }
-    }
-
-    if (node->op == GGML_OP_SCALE || node->op == GGML_OP_UNARY || node->op == GGML_OP_GLU) {
-        return memcmp(graph_node_properties->op_params, node->op_params, GGML_MAX_OP_PARAMS) == 0;
-    }
-    return true;
-}
-
-/**
- * @brief Check whether there is a cached CANN graph that matches the current ggml graph.
- *
- * This function iterates through the cached CANN graphs stored in the LRU cache and
- * compares them against the given ggml computation graph. A match requires that the
- * number of nodes is the same and that each node’s properties (operation type,
- * dimensions, strides, inputs, and operation parameters) are identical.
- *
- * If a matching graph is found, it is promoted to the front of the LRU cache and the
- * function returns true. Otherwise, the function returns false, indicating that a new
- * CANN graph needs to be captured.
- *
- * @param cann_ctx  The CANN backend context containing the graph cache.
- * @param cgraph    The current ggml computation graph.
- * @return true if a matching cached graph exists; false otherwise.
- */
-static bool is_matched_graph(ggml_backend_cann_context * cann_ctx, ggml_cgraph * cgraph) {
-    ggml_cann_graph_lru_cache & lru_cache = cann_ctx->graph_lru_cache;
-    for (auto & graph_ptr : lru_cache.cache_list) {
-        // Skip graphs with a different number of nodes.
-        if (graph_ptr->ggml_graph_properties.size() != static_cast<size_t>(cgraph->n_nodes)) {
-            continue;
-        }
-
-        // Check if all nodes match.
-        bool all_match = true;
-        for (int i = 0; i < cgraph->n_nodes; ++i) {
-            if (!ggml_graph_node_has_matching_properties(cgraph->nodes[i], &graph_ptr->ggml_graph_properties[i])) {
-                all_match = false;
-                break;
-            }
-        }
-
-        if (all_match) {
-            // update cache_list && renturn graph_ptr
-            lru_cache.move_to_front(graph_ptr);
-            return true;
-        }
+        return true;
     }
 
     return false;
 }
-#endif  // USE_ACL_GRAPH
 
 /**
  * @brief Evaluate the computation graph and optionally capture or execute it using CANN graph API.
@@ -2237,29 +2250,41 @@ static bool is_matched_graph(ggml_backend_cann_context * cann_ctx, ggml_cgraph *
  *
  * Otherwise, it falls back to op-by-op execution using the CANN compute kernel dispatcher.
  *
- * @param cann_ctx                 The CANN backend context.
- * @param cgraph                   The ggml computation graph.
- * @param use_cann_graph           Whether to use CANN graph execution.
- * @param cann_graph_update_required Whether graph capture is needed due to graph changes.
+ * @param cann_ctx                     The CANN backend context.
+ * @param cgraph                       The ggml computation graph.
+ * @param use_cann_graph               Whether to use CANN graph execution.
+ * @param cann_graph_capture_required  Whether graph capture is needed due to graph changes.
  */
 static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx,
                                             ggml_cgraph *               cgraph,
-                                            bool &                      use_cann_graph,
-                                            bool &                      cann_graph_update_required) {
+                                            bool                        use_cann_graph,
+                                            bool                        cann_graph_capture_required) {
 #ifdef USE_ACL_GRAPH
-    ggml_cann_graph * matched_graph = cann_ctx->graph_lru_cache.cache_list.front();
-    if (use_cann_graph && cann_graph_update_required) {
+    if (use_cann_graph && cann_graph_capture_required) {  // Begin CANN graph capture
         ACL_CHECK(aclmdlRICaptureBegin(cann_ctx->stream(), ACL_MODEL_RI_CAPTURE_MODE_GLOBAL));
     }
 #endif  // USE_ACL_GRAPH
     // Only perform the graph execution if CANN graphs are not enabled, or we are capturing the graph.
     // With the use of CANN graphs, the execution will be performed by the graph launch.
-    if (!use_cann_graph || cann_graph_update_required) {
+    static bool opt_fusion = parse_bool(get_env_as_lowercase("GGML_CANN_OPERATOR_FUSION").value_or(""));
+
+    if (!use_cann_graph || cann_graph_capture_required) {
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
+            if (opt_fusion) {
+                if (ggml_cann_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM })) {
+                    ggml_cann_op_add_rms_norm_fused(*cann_ctx, node, cgraph->nodes[i + 1]);
+                    i++;
+                    continue;
+                }
+            }
 
             if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
                 node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+                continue;
+            }
+
+            if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                 continue;
             }
 
@@ -2272,12 +2297,15 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
     }
 
 #ifdef USE_ACL_GRAPH
-    if (use_cann_graph && cann_graph_update_required) {  // End CANN graph capture
-        ACL_CHECK(aclmdlRICaptureEnd(cann_ctx->stream(), &matched_graph->graph));
-    }
-
     if (use_cann_graph) {
-        // Execute graph
+        GGML_ASSERT(!cann_ctx->graph_lru_cache.cache_list.empty());
+        ggml_cann_graph * matched_graph = cann_ctx->graph_lru_cache.cache_list.front();
+
+        if (cann_graph_capture_required) {  // End CANN graph capture
+            ACL_CHECK(aclmdlRICaptureEnd(cann_ctx->stream(), &matched_graph->graph));
+        }
+
+        // Execute CANN graph
         ACL_CHECK(aclmdlRIExecuteAsync(matched_graph->graph, cann_ctx->stream()));
     }
 #endif  // USE_ACL_GRAPH
@@ -2303,11 +2331,11 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
     // calculate rope cache for fist layer in current device.
     cann_ctx->rope_cache.cached = false;
 
+    bool graph_capture_required = false;
 #ifdef USE_ACL_GRAPH
-    bool use_cann_graph             = true;
-    bool cann_graph_update_required = false;
+    bool use_cann_graph = true;
 
-    static bool prefill_use_graph = parse_bool(get_env("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
+    static bool prefill_use_graph = parse_bool(get_env_as_lowercase("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
     if (!prefill_use_graph) {
         // Do not use acl_graph for prefill.
         for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -2328,17 +2356,31 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
 
     if (use_cann_graph) {
         // If no matching graph is found, the graph needs to be recaptured.
-        cann_graph_update_required = !is_matched_graph(cann_ctx, cgraph);
-        if (cann_graph_update_required) {
+        graph_capture_required = !cann_ctx->graph_lru_cache.find_and_move_to_front(cgraph);
+
+        if (graph_capture_required) {
             // If no matching graph is found, add a new ACL graph.
-            add_lru_matched_graph_node_properties(cann_ctx, cgraph);
+            ggml_cann_graph * new_graph = ggml_cann_graph::create_from_cgraph(cgraph);
+            cann_ctx->graph_lru_cache.push(new_graph);
+
+            // Pre-load rope cache before graph capture.  During capture the
+            // stream cannot perform host-to-device memcpy or device memory
+            // malloc/free.  Running the full cache init now populates the
+            // cache metadata so these branches are skipped during capture,
+            // while also warming up the memory pool.
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                ggml_tensor * node = cgraph->nodes[i];
+                if (node->op == GGML_OP_ROPE) {
+                    ggml_cann_rope_cache_preload(*cann_ctx, node);
+                    break;
+                }
+            }
         }
     }
 #else
-    bool use_cann_graph             = false;
-    bool cann_graph_update_required = false;
+    bool use_cann_graph = false;
 #endif  // USE_ACL_GRAPH
-    evaluate_and_capture_cann_graph(cann_ctx, cgraph, use_cann_graph, cann_graph_update_required);
+    evaluate_and_capture_cann_graph(cann_ctx, cgraph, use_cann_graph, graph_capture_required);
 
     return GGML_STATUS_SUCCESS;
 }
@@ -2374,6 +2416,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 case GGML_UNARY_OP_SGN:
                 case GGML_UNARY_OP_STEP:
                 case GGML_UNARY_OP_GELU_ERF:
+                case GGML_UNARY_OP_SOFTPLUS:
                     return true;
                 default:
                     return false;
@@ -2393,6 +2436,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_MUL_MAT:
             {
                 switch (op->src[0]->type) {
+#ifndef ASCEND_310P
+                    case GGML_TYPE_BF16:
+#endif
                     case GGML_TYPE_F16:
                     case GGML_TYPE_F32:
                         return true;
@@ -2430,6 +2476,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
+#ifndef ASCEND_310P
+                    case GGML_TYPE_BF16:
+#endif
                     case GGML_TYPE_Q8_0:
                         return true;
                     default:
@@ -2442,6 +2491,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 switch (op->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
+#ifndef ASCEND_310P
+                    case GGML_TYPE_BF16:
+#endif
                         return true;
                     default:
                         return false;
@@ -2451,20 +2503,30 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_CPY:
             {
                 ggml_tensor * src = op->src[0];
+#ifdef ASCEND_310P
                 if ((op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) ||
                     (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16)) {
-                    // only support F32 and F16.
+                    // only support F32 and F16 on 310P.
                     return false;
                 }
+#else
+                if ((op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16 && op->type != GGML_TYPE_BF16) ||
+                    (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16 && src->type != GGML_TYPE_BF16)) {
+                    // only support F32, F16 and BF16.
+                    return false;
+                }
+#endif
                 return true;
             }
             break;
         case GGML_OP_CONT:
             {
-                // TODO: support GGML_TYPE_BF16
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
+#ifndef ASCEND_310P
+                    case GGML_TYPE_BF16:
+#endif
                         return true;
                     default:
                         return false;
@@ -2472,20 +2534,14 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             }
         case GGML_OP_ROPE:
             {
-                // TODO: with ops-test v == 1
-                // TODO: n_dims <= ne0
-                if (op->src[0]->ne[0] != op->op_params[1]) {
-                    return false;
-                }
-
-                const int mode = ((const int32_t *) op->op_params)[2];
-                if (mode & GGML_ROPE_TYPE_MROPE) {
-                    return false;
-                }
-                if (mode & GGML_ROPE_TYPE_VISION) {
+                if (op->src[0]->ne[0] > 896) {
                     return false;
                 }
 #ifdef ASCEND_310P
+                // TODO: Support rope_dim < ne00(dim)
+                if (op->src[0]->ne[0] != op->op_params[1]) {
+                    return false;
+                }
                 if (!ggml_is_contiguous(op->src[0])) {
                     return false;
                 }
@@ -2500,6 +2556,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     return false;
                 }
                 if (op->op_params[0] != GGML_SCALE_MODE_NEAREST) {
+                    return false;
+                }
+                if (op->op_params[0] & GGML_SCALE_FLAG_ANTIALIAS) {
                     return false;
                 }
                 return true;
@@ -2521,10 +2580,11 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 // value of paddingW should be at most half of kernelW
                 return (p0 <= (k0 / 2)) && (p1 <= (k1 / 2));
             }
+        case GGML_OP_SUM:
+            return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_L2_NORM:
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_DUP:
-        case GGML_OP_SUM:
         case GGML_OP_IM2COL:
         case GGML_OP_CONCAT:
         case GGML_OP_REPEAT:
@@ -2547,8 +2607,12 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_SUM_ROWS:
         case GGML_OP_ARGSORT:
         case GGML_OP_ACC:
+        case GGML_OP_SET:
         case GGML_OP_GROUP_NORM:
+            return true;
         case GGML_OP_PAD:
+            // TODO: add circular padding support for cann, see https://github.com/ggml-org/llama.cpp/pull/16985
+            return ggml_get_op_params_i32(op, 8) == 0;
         case GGML_OP_ARANGE:
         case GGML_OP_TIMESTEP_EMBEDDING:
         case GGML_OP_LEAKY_RELU:
@@ -2559,10 +2623,24 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_MEAN:
         case GGML_OP_PAD_REFLECT_1D:
         case GGML_OP_COUNT_EQUAL:
+        case GGML_OP_GATED_LINEAR_ATTN:
             return true;
+        case GGML_OP_OUT_PROD:
+            {
+#ifdef ASCEND_310P
+                // Ger is not supported on 310p device
+                return false;
+#endif
+                switch (op->src[0]->type) {
+                    case GGML_TYPE_F16:
+                    case GGML_TYPE_F32:
+                        return true;
+                    default:
+                        return false;
+                }
+            }
         case GGML_OP_CONV_TRANSPOSE_1D:
-            // TODO: ((weightL - 1) * dilationW - padLeft)=1336 should not be larger than 255.
-            return (op->src[0]->ne[0] - 1) <= 255;
+            return true;
         case GGML_OP_SCALE:
             float bias;
             memcpy(&bias, (const float *) (op->op_params) + 1, sizeof(float));
@@ -2598,10 +2676,6 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     // different head sizes of K and V are not supported yet
                     return false;
                 }
-                if (op->src[0]->ne[0] % 16 != 0) {
-                    // TODO: padding to support
-                    return false;
-                }
                 float logitSoftcap = 0.0f;
                 memcpy(&logitSoftcap, (const float *) (op->op_params) + 2, sizeof(float));
                 if (logitSoftcap != 0.0f) {
@@ -2609,47 +2683,23 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 }
                 return true;
             }
+        case GGML_OP_SSM_CONV:
+            return true;
+        case GGML_OP_CUMSUM:
+            return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_TRI:
+            return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_FILL:
+            return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_DIAG:
+            return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_SOLVE_TRI:
+            return op->src[0]->type == GGML_TYPE_F32;
         default:
             return false;
     }
 
     GGML_UNUSED(dev);
-}
-
-/**
- * @brief Checks if the backend buffer type is associated with the CANN backend.
- *
- * This function checks whether the provided backend buffer type is associated
- * with the CANN backend based on the comparison of its name retrieval function
- * pointer.
- *
- * @param buft Pointer to the backend buffer type to check.
- * @return bool Returns true if the buffer type is associated with the CANN
- * backend, otherwise false.
- */
-static bool ggml_backend_buft_is_cann(ggml_backend_buffer_type_t buft) {
-    return buft->iface.get_name == ggml_backend_cann_buffer_type_name;
-}
-
-/**
- * @brief Determines if a tensor operation should be offloaded to the CANN
- * backend.
- *
- * This function checks if a given tensor operation should be offloaded to the
- * CANN backend based on the operation type and the size of the tensor. It
- * returns true if the second dimension (ne[1]) of the tensor is greater than or
- * equal to the minimum batch size and the operation is not GGML_OP_GET_ROWS.
- *
- * @param backend Pointer to the CANN backend.
- * @param op Pointer to the tensor operation to check.
- * @return bool Returns true if the operation should be offloaded, otherwise
- * false.
- */
-static bool ggml_backend_cann_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    const int min_batch_size = 32;
-    GGML_UNUSED(dev);
-
-    return op->ne[1] >= min_batch_size && op->op != GGML_OP_GET_ROWS;
 }
 
 /**
@@ -2696,6 +2746,8 @@ static const ggml_backend_i ggml_backend_cann_interface = {
     /* .free                    = */ ggml_backend_cann_free,
     /* .set_tensor_async        = */ ggml_backend_cann_set_tensor_async,
     /* .get_tensor_async        = */ ggml_backend_cann_get_tensor_async,
+    /* .set_tensor_2d_async     = */ NULL,
+    /* .get_tensor_2d_async     = */ NULL,
     /* .cpy_tensor_async        = */ ggml_backend_cann_cpy_tensor_async,
     /* .synchronize             = */ ggml_backend_cann_synchronize,
     /* .graph_plan_create       = */ NULL,
@@ -2727,6 +2779,7 @@ struct ggml_backend_cann_device_context {
     int         device;
     std::string name;
     std::string description;
+    int op_offload_min_batch_size;
 };
 
 static const char * ggml_backend_cann_device_get_name(ggml_backend_dev_t dev) {
@@ -2801,6 +2854,26 @@ static ggml_backend_buffer_type_t ggml_backend_cann_device_get_buffer_type(ggml_
 static ggml_backend_buffer_type_t ggml_backend_cann_device_get_host_buffer_type(ggml_backend_dev_t dev) {
     GGML_UNUSED(dev);
     return ggml_backend_cann_host_buffer_type();
+}
+
+/**
+ * @brief Determines if a tensor operation should be offloaded to the CANN
+ * backend.
+ *
+ * This function checks if a given tensor operation should be offloaded to the
+ * CANN backend based on the operation type and the size of the tensor. It
+ * returns true if the second dimension (ne[1]) of the tensor is greater than or
+ * equal to the minimum batch size and the operation is not GGML_OP_GET_ROWS.
+ *
+ * @param backend Pointer to the CANN backend.
+ * @param op Pointer to the tensor operation to check.
+ * @return bool Returns true if the operation should be offloaded, otherwise
+ * false.
+ */
+static bool ggml_backend_cann_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    ggml_backend_cann_device_context * dev_ctx = (ggml_backend_cann_device_context *)dev->context;
+
+    return op->ne[1] >= dev_ctx->op_offload_min_batch_size && op->op != GGML_OP_GET_ROWS;
 }
 
 /**
@@ -2919,12 +2992,14 @@ ggml_backend_reg_t ggml_backend_cann_reg() {
         if (!initialized) {
             aclInit(nullptr);
             ggml_backend_cann_reg_context * ctx = new ggml_backend_cann_reg_context;
+            const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
 
             for (int i = 0; i < ggml_cann_info().device_count; i++) {
                 ggml_backend_cann_device_context * dev_ctx = new ggml_backend_cann_device_context();
                 dev_ctx->description                       = aclrtGetSocName();
                 dev_ctx->device                            = i;
                 dev_ctx->name                              = GGML_CANN_NAME + std::to_string(i);
+                dev_ctx->op_offload_min_batch_size         = min_batch_size;
                 ggml_cann_set_device(i);
                 ggml_backend_dev_t dev = new ggml_backend_device{ /* .iface   = */ ggml_backend_cann_device_interface,
                                                                   /* .reg     = */ &reg,

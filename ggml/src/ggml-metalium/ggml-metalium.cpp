@@ -24,6 +24,7 @@
 #include "types/arch.hpp"
 #include "umd/device/types/arch.hpp"
 #include "umd/device/types/cluster_descriptor_types.hpp"
+#include <tt-logger/tt-logger.hpp>
 #include <string.h>
 #include <sys/types.h>
 #include <algorithm>
@@ -49,7 +50,7 @@
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
 #include <ttnn/operations/data_movement/untilize/untilize.hpp>
 #include <ttnn/operations/experimental/transformer/nlp_kv_cache_load_slice/nlp_kv_cache_load_slice.hpp>
-#include <ttnn/operations/creation.hpp>
+#include <ttnn/operations/creation/creation.hpp>
 #include <ttnn/operations/eltwise/unary/unary_composite.hpp>
 #include <ttnn/operations/data_movement/transpose/transpose.hpp>
 #include <ttnn/operations/data_movement/permute/permute.hpp>
@@ -57,7 +58,7 @@
 #include <ttnn/operations/data_movement/concat/concat.hpp>
 #include <ttnn/operations/copy/typecast/typecast.hpp>
 #include <ttnn/operations/normalization/softmax/softmax.hpp>
-#include <tt-metalium/persistent_kernel_cache.hpp>
+#include <tt-metalium/experimental/kernel_cache.hpp>
 #include <ttnn/operations/data_movement/reshape_view/reshape.hpp>
 #include <ttnn/operations/reduction/generic/generic_reductions.hpp>
 #include <ttnn/cpp/ttnn/operations/data_movement/gather/tosa/gather_tosa.hpp>
@@ -240,7 +241,11 @@ static size_t g_metalium_base_offset = 0;
 static tt::tt_metal::DataType ggml2tt_type_internal(ggml_type ggtype, tt::ARCH arch) {
     // This table is consulted to map GGML types to TT types dueing tensor creation
     if(arch == tt::ARCH::WORMHOLE_B0) {
-        static constexpr std::array<tt::tt_metal::DataType, GGML_TYPE_COUNT> table = {
+        // NOTE: size is deduced from the entries below (NOT GGML_TYPE_COUNT) on purpose. If GGML
+        // adds new types, they fall past the end of this table and the guard below maps them to
+        // INVALID - the backend keeps working and simply rejects the unknown type instead of
+        // silently treating it as BFLOAT16 (DataType == 0) or failing to build.
+        static constexpr tt::tt_metal::DataType table[] = {
             /*GGML_TYPE_F32        = */ tt::tt_metal::DataType::BFLOAT16,
             /*GGML_TYPE_F16        = */ tt::tt_metal::DataType::BFLOAT16,
             /*GGML_TYPE_Q4_0       = */ tt::tt_metal::DataType::BFLOAT8_B,
@@ -281,9 +286,16 @@ static tt::tt_metal::DataType ggml2tt_type_internal(ggml_type ggtype, tt::ARCH a
             /*GGML_TYPE_IQ4_NL_4_8 = */ tt::tt_metal::DataType::INVALID, // Support removed from GGML
             /*GGML_TYPE_IQ4_NL_8_8 = */ tt::tt_metal::DataType::INVALID, // Support removed from GGML
             /*GGML_TYPE_MXFP4      = */ tt::tt_metal::DataType::BFLOAT4_B,
+            /*GGML_TYPE_NVFP4      = */ tt::tt_metal::DataType::INVALID,
+            /*GGML_TYPE_Q1_0       = */ tt::tt_metal::DataType::INVALID,
         };
-        // safeguard against OOB read from outdated table
-        if(ggtype >= table.size()) {
+        // The table must never claim to map more types than GGML defines (catches a stale table
+        // after a type is removed). It is allowed to be shorter than GGML_TYPE_COUNT - any type
+        // not covered is handled by the OOB guard below.
+        static_assert(std::size(table) <= GGML_TYPE_COUNT, "Type conversion table is out of sync with ggml_type");
+        // Stop-gap for newly invented GGML types: anything beyond what the table covers is
+        // treated as unsupported rather than read out of bounds (or mis-mapped to BFLOAT16).
+        if((size_t)ggtype >= std::size(table)) {
             return tt::tt_metal::DataType::INVALID;
         }
         tt::tt_metal::DataType type = table[ggtype];
@@ -989,15 +1001,16 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
         GGML_ASSERT(aT.is_allocated() && "Matrix aT is not allocated");
         // TODO: Ask TT to support multiplication of pre-transposed tensors. Calling transpose here is inefficient
         // https://github.com/tenstorrent/tt-metal/issues/9709
-        ttnn::operations::matmul::Matmul cfg = ttnn::operations::matmul::Matmul{
-            .compute_kernel_config = make_compute_kernel_config(a.device()),
-            // XXX: Why output_tile doesn't have a default value?
-            .output_tile = std::nullopt,
-            .global_cb = std::nullopt,
-            .sub_device_id = std::nullopt,
-        };
         *dst_meta = {
-            .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::operations::matmul::matmul(b, aT, std::nullopt, cfg)),
+            .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::operations::matmul::matmul(
+                b, aT,
+                /* transpose_a            = */ false,
+                /* transpose_b            = */ false,
+                /* memory_config          = */ std::nullopt,
+                /* dtype                  = */ std::nullopt,
+                /* program_config         = */ std::nullopt,
+                /* activation             = */ std::nullopt,
+                /* compute_kernel_config  = */ make_compute_kernel_config(a.device()))),
         };
     }
     else {
@@ -1274,7 +1287,7 @@ static void ggml_backend_metalium_scale(ggml_backend_metalium_context * ctx, str
     };
 }
 
-static bool ggml_backend_metalium_can_get_rows(const struct ggml_tensor * dst)
+static bool ggml_backend_metalium_can_get_rows(const struct ggml_tensor * dst, tt::ARCH arch)
 {
     const ggml_tensor *idxs = dst->src[1];
     // effectivly no-op
@@ -1284,6 +1297,15 @@ static bool ggml_backend_metalium_can_get_rows(const struct ggml_tensor * dst)
 
     const ggml_tensor* src = dst->src[0];
     if(is_integer_type(src->type)) {
+        return false;
+    }
+
+    // The non-trivial path goes through ttnn::tosa::gather, which tile-pads the source via
+    // TTNN's fill_pad op. fill_pad only supports BFLOAT16/FLOAT32/UINT16/UINT32/INT32 - the
+    // block-float types (BFLOAT8_B/BFLOAT4_B) are rejected, so we can't gather quantized
+    // sources and must fall back to the CPU for them.
+    tt::tt_metal::DataType src_tt_type = ggml2tt_type(src->type, arch);
+    if(src_tt_type == tt::tt_metal::DataType::BFLOAT8_B || src_tt_type == tt::tt_metal::DataType::BFLOAT4_B) {
         return false;
     }
 
@@ -2496,6 +2518,8 @@ static struct ggml_backend_buffer_i ggml_backend_metalium_buffer_interface = {
     /* .memset_tensor   = */ nullptr,
     /* .set_tensor      = */ ggml_backend_metalium_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_metalium_buffer_get_tensor,
+    /* .set_tensor_2d   = */ nullptr,
+    /* .get_tensor_2d   = */ nullptr,
     /* .cpy_tensor      = */ ggml_backend_metalium_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_metalium_buffer_clear,
     /* .reset           = */ ggml_backend_metalium_buffer_reset,
@@ -2888,7 +2912,7 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
         case GGML_OP_SOFT_MAX:
             return ggml_backend_metalium_can_softmax(op);
         case GGML_OP_GET_ROWS:
-            return tensor_supported(src1) && ggml_backend_metalium_can_get_rows(op);
+            return tensor_supported(src1) && ggml_backend_metalium_can_get_rows(op, ctx->device->arch());
         case GGML_OP_CONCAT:
             return tensor_supported(src1) && ggml_backend_metalium_can_concat(op);
         case GGML_OP_REPEAT:
@@ -2929,6 +2953,8 @@ static struct ggml_backend_i metalium_backend_i = {
     /* .free                    = */ ggml_backend_metalium_free,
     /* .set_tensor_async        = */ NULL,
     /* .get_tensor_async        = */ NULL,
+    /* .set_tensor_2d_async     = */ NULL,
+    /* .get_tensor_2d_async     = */ NULL,
     /* .cpy_tensor_async        = */ NULL,
     /* .synchronize             = */ ggml_backend_metalium_synchronize,
     /* .graph_plan_create       = */ NULL,
@@ -3079,6 +3105,11 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
     static ggml_backend_reg reg;
     static std::once_flag once;
     std::call_once(once, [&]() {
+        // TTNN's tilize/untilize ops read the (trivial) tile spec out of ROW_MAJOR input tensors,
+        // which spams a "extract tile information out of a ROW MAJOR layout" deprecation warning
+        // (tt-metal #18536) on every tensor upload. The warning is internal to TTNN and harmless
+        // for us, so quiet the LogMetal channel down to errors only.
+        tt::LoggerRegistry::instance().get(tt::LogMetal)->set_level(spdlog::level::err);
         metalium_register_all_kernel();
         // TODO: TTNN though not have peoper system packaging yet. Does support working in installed for (via Python packages rn)
         // Remove this limitation
@@ -3086,11 +3117,12 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
             fmt::println(stderr, "The TT_METAL_RUNTIME_ROOT environment variables must be set to use the Metalium backend");
             abort();
         }
-        if(!g_debug_flags.disable_program_cache) {
-            tt::tt_metal::detail::EnablePersistentKernelCache();
-        }
-        else {
+        // Persistent kernel caching is now always-on in the TTNN SDK; the explicit
+        // EnablePersistentKernelCache() toggle was removed. Honor the debug flag by
+        // clearing the in-memory cache so kernels are recompiled instead.
+        if(g_debug_flags.disable_program_cache) {
             fmt::println("Disabling persistent kernel cache. Things will be slower");
+            tt::tt_metal::experimental::ClearKernelCache();
         }
         // TODO: Support multiple devices (TT supports mesh configuration so it's going to be tricky)
         // but for now we just work on 1 device at a time

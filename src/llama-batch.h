@@ -18,7 +18,7 @@ struct llama_ubatch {
     }
 
     // typical for M-RoPE cases:
-    //   0 - sequantial position of the tokens/embeddings in the sequence
+    //   0 - sequential position of the tokens/embeddings in the sequence
     //   1 - y position in the image
     //   2 - x position in the image
     //   3 - other
@@ -56,13 +56,15 @@ struct llama_ubatch {
         std::vector<float>          embd;
         std::vector<llama_pos>      pos;
         std::vector<int32_t>        n_seq_id;
-        std::vector<llama_seq_id *> seq_id;
+        std::vector<llama_seq_id *> seq_id;      // these point into the seq_id_data below
         std::vector<llama_seq_id>   seq_id_unq;
         std::vector<int32_t>        seq_idx;
         std::vector<int8_t>         output;
+
+        std::vector<llama_seq_id> seq_id_data;
     };
 
-    // the llama_ubatch pointers above point to this data if set. otherwise - points to non-owning data
+    // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
 };
 

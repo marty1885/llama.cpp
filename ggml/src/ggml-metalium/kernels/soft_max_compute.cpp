@@ -1,23 +1,23 @@
-#include "compute_kernel_api/pack.h"
-#include "compute_kernel_api/reg_api.h"
+#include "api/compute/pack.h"
+#include "api/compute/reg_api.h"
 #define REDUCE_OP PoolType::MAX
 #define REDUCE_DIM ReduceDim::REDUCE_ROW
 
 #include <cstdint>
-#include "compute_kernel_api/common.h"
-#include "compute_kernel_api/tile_move_copy.h"
-#include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
-#include "compute_kernel_api/eltwise_unary/fill.h"
-#include "compute_kernel_api/eltwise_unary/exp.h"
-#include "compute_kernel_api/eltwise_unary/recip.h"
-#include "compute_kernel_api/matmul.h"
-#include "compute_kernel_api/reduce.h"
-#include "compute_kernel_api/bcast.h"
-#include "compute_kernel_api/eltwise_binary_sfpu.h"
-#include "compute_kernel_api/eltwise_binary.h"
-#include "compute_kernel_api/eltwise_unary/binop_with_scalar.h"
+#include "api/compute/common.h"
+#include "api/compute/tile_move_copy.h"
+#include "api/compute/eltwise_unary/eltwise_unary.h"
+#include "api/compute/eltwise_unary/fill.h"
+#include "api/compute/eltwise_unary/exp.h"
+#include "api/compute/eltwise_unary/recip.h"
+#include "api/compute/matmul.h"
+#include "api/compute/reduce.h"
+#include "api/compute/bcast.h"
+#include "api/compute/eltwise_binary_sfpu.h"
+#include "api/compute/eltwise_binary.h"
+#include "api/compute/eltwise_unary/binop_with_scalar.h"
 
-#include <debug/dprint_tensix.h>
+#include "api/debug/dprint_tensix.h"
 
 using std::uint32_t;
 
@@ -74,8 +74,7 @@ inline void make_mask_face(const int w, const int h, const int dst_tile_id) {
 }
 
 inline void make_mask_internal(const uint32_t w, const uint32_t h, const int dst_tile_id) {
-    math::set_dst_write_addr<DstTileLayout::Default, DstTileShape::Tile32x32>(0);
-    math::set_addr_mod_base();
+    math::set_dst_write_addr<DstTileShape::Tile32x32, UnpackDestination::SrcRegs>(dst_index);
     TTI_STALLWAIT(p_stall::STALL_SFPU, p_stall::MATH);
 
     for (int face = 0; face < 4; face++) {
@@ -88,7 +87,8 @@ inline void make_mask_internal(const uint32_t w, const uint32_t h, const int dst
 
     math::clear_dst_reg_addr();
     TTI_STALLWAIT(p_stall::STALL_CFG, p_stall::WAIT_SFPU);
-    math::clear_addr_mod_base();
+    // math::clear_addr_mod_base();
+    TTI_SETC16(2, 0); // equivalent to addr mod
 }
 
 void update_online_softmax_values_internal(const uint32_t dst_index_in0, const uint32_t dst_index_in1, const uint32_t dst_index_out) {
@@ -176,8 +176,7 @@ static void make_mask(const int w, const int h, const int dst_tile_id) {
 // MAIN KERNEL
 // ============================================================================
 
-namespace NAMESPACE {
-void MAIN {
+void kernel_main() {
     uint32_t width = get_arg_val<uint32_t>(0);
     uint32_t height = get_arg_val<uint32_t>(1);
     uint32_t n_head = get_arg_val<uint32_t>(3);
@@ -457,5 +456,4 @@ void MAIN {
     cb_pop_front(cb_tile_mask, 4);
     #endif
     cb_pop_front(cb_const1, 1);
-}
 }

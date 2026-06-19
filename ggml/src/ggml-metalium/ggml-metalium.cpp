@@ -64,6 +64,8 @@
 #include <ttnn/cpp/ttnn/operations/data_movement/gather/tosa/gather_tosa.hpp>
 #include <ttnn/cpp/ttnn/operations/data_movement/scatter/tosa_scatter.hpp>
 #include <ttnn/cpp/ttnn/operations/transformer/sdpa_decode/sdpa_decode.hpp>
+#include <ttnn/cpp/ttnn/operations/transformer/sdpa/sdpa.hpp>
+#include <ttnn/cpp/ttnn/operations/data_movement/slice/slice.hpp>
 
 
 #include <memory>
@@ -1466,6 +1468,33 @@ static void ggml_backend_metalium_norm(ggml_backend_metalium_context * ctx, stru
     };
 }
 
+static void ggml_backend_metalium_l2_norm(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
+{
+    GGML_UNUSED(ctx);
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
+
+    ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
+
+    float eps = 0;
+    memcpy(&eps, dst->op_params, sizeof(eps));
+
+    auto t = realize_ggml_view(dst->src[0]);
+
+    // L2 norm: y = x / max(sqrt(sum(x^2)), eps), reduction along the last (ne[0]) dimension
+    ttnn::WormholeComputeKernelConfig cfg{
+        .math_fidelity = MathFidelity::HiFi4,
+        .math_approx_mode = false,
+        .fp32_dest_acc_en = true,
+        .packer_l1_acc = true
+    };
+    auto sumsq = ttnn::sum(ttnn::square(*t), 3, /*keepdim=*/true, std::nullopt, cfg);
+    auto denom = ttnn::clamp(ttnn::sqrt(sumsq), eps, std::numeric_limits<float>::max());
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::divide(*t, denom)),
+    };
+}
+
 static void ggml_backend_metalium_add1(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
 {
     GGML_UNUSED(ctx);
@@ -1949,6 +1978,14 @@ static void ggml_backend_metalium_glu(ggml_backend_metalium_context * ctx, struc
 
 static bool ggml_backend_metalium_can_rope(const struct ggml_tensor * dst)
 {
+    // In-place RoPE (dst is a view aliasing src0) whose source is a non-contiguous
+    // view is mishandled by the backend's view write-back, so the result is wrong.
+    // Decline it and let the CPU backend handle those cases. (Maps to the
+    // test-backend-ops inplace=1,v=1 variants.)
+    if(dst->view_src != nullptr && !ggml_is_contiguous(dst->src[0])) {
+        return false;
+    }
+
     std::array<int32_t, 5> int_params;
     memcpy(int_params.data(), dst->op_params, sizeof(int_params));
     auto [
@@ -2060,7 +2097,10 @@ static bool ggml_backend_metalium_can_flash_attn(const struct ggml_tensor * dst)
     memcpy(params.data(), dst->op_params, sizeof(float) * 3);
     auto [scale, max_bias, logit_softcap] = params;
 
-    if(max_bias != 0.f) {
+    if(max_bias != 0.f) {  // ALiBi: ttnn SDPA has no per-head slope bias
+        return false;
+    }
+    if(logit_softcap != 0.f) {  // tanh logit gating (Gemma2): unsupported by ttnn SDPA
         return false;
     }
 
@@ -2098,13 +2138,35 @@ static bool ggml_backend_metalium_can_flash_attn(const struct ggml_tensor * dst)
     if(k->ne[1] < 32 || v->ne[1] < 32 || k->ne[1] % 32 != 0 || v->ne[1] % 32 != 0) {
         return false;
     }
+    // ttnn SDPA forbids padding on the head_dim (last ttnn dim == ggml ne[0]).
+    // A non-tile head dim (e.g. 40/72/80) gets padded up to a TILE multiple when
+    // realized, which trips "Padding is not supported on the head_dim dimension".
+    // Restrict to tile-aligned head dims (models here use 64/128).
+    if(q->ne[0] % 32 != 0 || k->ne[0] % 32 != 0 || v->ne[0] % 32 != 0) {
+        return false;
+    }
+    // EXPERIMENT (prefill SDPA): attention sinks (src[4]) are not forwarded; reject.
+    if(dst->src[4]) {
+        return false;
+    }
+    // EXPERIMENT: trimming the padded mask requires a TILE-aligned Q seq length,
+    // otherwise the mask slice faults on device. Restrict to Sq % 32 == 0 for now.
+    if(q->ne[1] % 32 != 0) {
+        return false;
+    }
     int64_t b = q->ne[1];
     // Either we don't need to broadcast or we broadcast for them
     if(mask && mask->ne[2] != 1 && !(mask->ne[3] == 1 || mask->ne[3] == b)) {
         return false;
     }
-    // The op does not support broadcasting mask
-    if(mask && (mask->ne[0] != k->ne[1] || mask->ne[1] != q->ne[1])) {
+    // The op does not support broadcasting mask. mask->ne[1] (Sq rows) may be
+    // padded up (GGML_KQ_MASK_PAD) above q->ne[1]; the dispatch trims it, so only
+    // reject if it's too small or the kv width mismatches.
+    if(mask && (mask->ne[0] != k->ne[1] || mask->ne[1] < q->ne[1])) {
+        return false;
+    }
+    // ttnn SDPA GQA: Q heads must be a multiple of KV heads.
+    if(q->ne[2] % k->ne[2] != 0) {
         return false;
     }
 
@@ -2136,46 +2198,57 @@ static void ggml_backend_metalium_flash_attn(ggml_backend_metalium_context * ctx
     memcpy(params.data(), dst->op_params, sizeof(float) * 3);
     auto [scale, max_bias, logit_softcap] = params;
 
+    GGML_UNUSED(max_bias);
+    GGML_UNUSED(logit_softcap);
+
+    // ggml's FLASH_ATTN_EXT inputs map 1:1 onto ttnn's prefill
+    // scaled_dot_product_attention (ggml ne[] is the reverse of ttnn's shape):
+    //   q ne[Dk, Nq, n_head,    ne3] -> qt [B, n_head,    Sq, Dh]
+    //   k ne[Dk, Nkv, n_head_kv, ne3] -> kt [B, n_head_kv, Sk, Dh]
+    //   v ne[Dv, Nkv, n_head_kv, ne3] -> vt [B, n_head_kv, Sk, Dv]   (ggml V not transposed -> matches)
+    //   mask ne[Nkv, Nq_pad, m2, m3] -> mt [Bm, NHm, Sq_pad, Sk]
+    // realize_ggml_view already hands back BFLOAT16 tensors (f32/f16 -> bf16),
+    // which is exactly what SDPA accepts. GQA (n_head % n_head_kv == 0) is handled
+    // natively by SDPA, so K/V are passed without manual head broadcasting.
     auto qt = *realize_ggml_view(q);
     auto kt = *realize_ggml_view(k);
     auto vt = *realize_ggml_view(v);
 
-    uint32_t b = qt.logical_shape()[1];
-    if(kt.logical_shape()[0] != b) {
-        ttnn::Shape repeat_factor({b, 1, 1, 1});
-        kt = ttnn::repeat(kt, repeat_factor);
-    }
-
-    if(vt.logical_shape()[0] != b) {
-        ttnn::Shape repeat_factor({b, 1, 1, 1});
-        vt = ttnn::repeat(vt, repeat_factor);
-    }
+    const uint32_t Sq = qt.logical_shape()[2];
 
     std::optional<ttnn::Tensor> mask_tensor;
     if(mask) {
-        mask_tensor = *realize_ggml_view(mask);
-        if(mask_tensor->logical_shape()[0] != b) {
-            ttnn::Shape repeat_factor({b, 1, 1, 1});
-            *mask_tensor = ttnn::repeat(*mask_tensor, repeat_factor);
+        auto mt = *realize_ggml_view(mask);
+        // ggml pads the mask query-rows to GGML_KQ_MASK_PAD; the prefill op
+        // requires mask Sq == Q Sq, so trim the padded rows.
+        const auto ms = mt.logical_shape();
+        if((uint32_t)ms[2] != Sq) {
+            mt = ttnn::slice(mt,
+                ttnn::SmallVector<uint32_t>{0u, 0u, 0u, 0u},
+                ttnn::SmallVector<uint32_t>{(uint32_t)ms[0], (uint32_t)ms[1], Sq, (uint32_t)ms[3]},
+                ttnn::SmallVector<uint32_t>{1u, 1u, 1u, 1u});
         }
+        mask_tensor = mt;
     }
 
-    auto res = ttnn::transformer::scaled_dot_product_attention_decode(
+    // ggml always supplies an additive mask with causality baked in -> use the
+    // mask path with is_causal=false.
+    // NOTE: SDPA runs in bf16, landing at NMSE ~6e-4 (q4_0 KV up to ~3.5e-3), over
+    // ggml's strict 5e-4 FA bound. A WormholeComputeKernelConfig{fp32_dest_acc_en=
+    // true, HiFi4} passed as compute_kernel_config would tighten it at a perf cost.
+    auto res = ttnn::transformer::scaled_dot_product_attention(
         qt,
         kt,
         vt,
-        false,
         mask_tensor,
-        std::vector<uint32_t>{},
-        std::nullopt,
-        std::nullopt,
-        scale
-    );
+        /*is_causal=*/false,
+        scale);
 
-    // HACK: I have no idea why
-    if(!ggml_tt_tensors_shape_equal(dst, res)) {
-        res = ttnn::transpose(res, 1, 2);
-    }
+    // SDPA returns [B, n_head, Sq, Dv]. ggml's FLASH_ATTN_EXT output is the
+    // *permuted* layout ne[Dv, n_head, Nq, ne3] -> TTNN order [B, Sq, n_head, Dv],
+    // so swap the n_head and Sq axes (dims 1 and 2) to match.
+    res = ttnn::transpose(res, 1, 2);
+
     *dst_meta = {
         .tensor = std::make_shared<ttnn::Tensor>(res)
     };
@@ -2679,6 +2752,10 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
                 ggml_backend_metalium_norm(ctx, node, true);
                 break;
 
+            case GGML_OP_L2_NORM:
+                ggml_backend_metalium_l2_norm(ctx, node);
+                break;
+
             case GGML_OP_ADD1:
                 ggml_backend_metalium_add1(ctx, node);
                 break;
@@ -2872,6 +2949,8 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
             return ggml_backend_metalium_can_norm(op, false);
         case GGML_OP_RMS_NORM:
             return ggml_backend_metalium_can_norm(op, true);
+        case GGML_OP_L2_NORM:
+            return ggml_backend_metalium_can_norm(op, false);
         case GGML_OP_LEAKY_RELU:
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:

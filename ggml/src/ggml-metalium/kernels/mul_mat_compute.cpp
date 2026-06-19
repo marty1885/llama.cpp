@@ -1,11 +1,10 @@
 #include <cstdint>
-#include "compute_kernel_api/tile_move_copy.h"
-#include "compute_kernel_api/matmul.h"
+#include "api/compute/tile_move_copy.h"
+#include "api/compute/matmul.h"
 
 using std::uint32_t;
 
-namespace NAMESPACE {
-void MAIN {
+void kernel_main() {
     uint32_t Mt =  get_arg_val<uint32_t>(0);
     uint32_t Nt =  get_arg_val<uint32_t>(1);
     uint32_t Kt =  get_arg_val<uint32_t>(2);
@@ -26,7 +25,7 @@ void MAIN {
         for(uint32_t k = 0; k < Kt; ++k) {
             cb_wait_front(cb_in0, 1);
             cb_wait_front(cb_in1, 1);
-            matmul_tiles(cb_in1, cb_in0, 0, 0, 0, true);
+            matmul_tiles(cb_in1, cb_in0, 0, 0, 0);
             cb_pop_front(cb_in0, 1);
             cb_pop_front(cb_in1, 1);
         }
@@ -39,4 +38,3 @@ void MAIN {
     }
 
 }
-}  // namespace NAMESPACE

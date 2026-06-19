@@ -1,79 +1,23 @@
-#include "compute_kernel_api/common.h"
-#include "compute_kernel_api/tile_move_copy.h"
-#include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
-#include "compute_kernel_api/eltwise_unary/exp.h"
-#include "compute_kernel_api/eltwise_unary/recip.h"
-#include "compute_kernel_api/eltwise_unary/identity.h"
-#include "compute_kernel_api/eltwise_unary/trigonometry.h"
+#include "api/compute/common.h"
+#include "api/compute/tile_move_copy.h"
+#include "api/compute/eltwise_unary/eltwise_unary.h"
+#include "api/compute/eltwise_unary/exp.h"
+#include "api/compute/eltwise_unary/recip.h"
+#include "api/compute/eltwise_unary/identity.h"
+#include "api/compute/eltwise_unary/trigonometry.h"
 #include <string.h>
 
 #include <tools/profiler/kernel_profiler.hpp>
-#include <debug/dprint_tensix.h>
+#include "api/debug/dprint_tensix.h"
 
 #ifdef TRISC_MATH
 using namespace sfpi;
 
-// Implemented algorithm exp_f24 from https://ieeexplore.ieee.org/document/9810030
-inline vFloat vector_exp(sfpi::vFloat val) {
-    sfpi::vFloat y = 0.0f;
-    // Intermediary values can overflow if input value is below -88.0f, which leads to output increasing again instead
-    // of staying at 0. This overflow happens when `log2(e) * val < 127.0f`, which correspond to `val < 88.0f`
-    v_if(val > -88.0f) {
-        // The paper relies on the following formula (c.f. Section 2 and 3 of paper):
-        // z = (bias + x * factor * N_m; where:
-        // factor = 0x00b8aa3b (computed through log(e))
-        // bias = 0x3f800000
-        sfpi::vInt z = sfpu::_float_to_int32_(val * sfpi::vFloat(0x00b8aa3b) + sfpi::vFloat(0x3f800000));
-        sfpi::vInt zii = exexp(sfpi::reinterpret<sfpi::vFloat>(z));         // Extract exponent
-        sfpi::vInt zif = sfpi::exman9(sfpi::reinterpret<sfpi::vFloat>(z));  // Extract mantissa
+sfpi_inline vFloat sfpu_sinpi(vFloat x) {
+    vFloat xx = x * x;
 
-        // Polynomial coefficients for approximation of exp on [1; 2]
-        vFloat POLY_D1;
-        vInt POLY_D2;
-        vInt POLY_D3;
-
-        v_if(zif > 0x00600000) {
-            // Fourth segment (highest values of the mantissa)
-            POLY_D1 = 0.52496276e-7f;
-            POLY_D2 = 0x81354a;
-            POLY_D3 = 0x10a440;
-        }
-        v_elseif(zif > 0x00400000) {
-            // Third segment
-            POLY_D1 = 0.4414393e-7f;
-            POLY_D2 = 0xcdf4b4;
-            POLY_D3 = 0x3e4d6;
-        }
-        v_elseif(zif > 0x00200000) {
-            // Second segment
-            POLY_D1 =0.37120473e-7f;
-            POLY_D2 = 0x1113a74;
-            POLY_D3 = 0x9f16;
-        }
-        v_else {
-            // First segment
-            POLY_D1 = 0.31214472e-7f;
-            POLY_D2 = 0x151d842;
-            // Note: The original C code has a float constant here
-            // We treat it as an integer for performance
-            POLY_D3 = 328;
-        }
-        v_endif;
-
-        sfpi::vFloat d1 = sfpi::vFloat(POLY_D1);
-        sfpi::vFloat d2 = sfpi::int32_to_float(sfpi::vInt(POLY_D2) + zif, 0);
-        sfpi::vFloat d3 = sfpi::int32_to_float(sfpi::vInt(POLY_D3) + zif, 0);
-        d2 = d1 * d2;
-        zif = sfpu::_float_to_int32_(d2 * d3);
-
-        // Restore exponent
-        zii = sfpi::reinterpret<sfpi::vInt>(
-            sfpi::setexp(sfpi::reinterpret<sfpi::vFloat>(zif), 127U + zii));  // restore exponent
-
-        y = sfpi::reinterpret<sfpi::vFloat>(zii);
-    }
-    v_endif;
-    return y;
+    return x *
+           ((((0x1.406628p-4f * xx - 0x9.93f86p-4f) * xx + 0x2.8cd64p+0f) * xx - 0x5.2aef6p+0f) * xx + 0x3.243f6cp+0f);
 }
 
 template <int max_iter = 3>
@@ -120,10 +64,10 @@ sfpi_inline sfpi::vFloat _reciprocal_compat_(const sfpi::vFloat in)
 inline vFloat vector_sin_phase(vFloat x)
 {
     vFloat v = x;
-    vInt whole_v = float_to_int16(v, 0);
-    v -= int32_to_float(whole_v, 0);
+    vInt whole_v = float_to_int16(v, RoundMode::NearestEven);
+    v -= int32_to_float(whole_v, RoundMode::NearestEven);
 
-    v = ckernel::sfpu::sfpu_sinpi<false>(v);
+    v = sfpu_sinpi(v);
     v_if(whole_v & 1) { v = -v; }
     v_endif;
     return v;
@@ -194,8 +138,8 @@ inline void rope_tile_init(float inv_d)
 inline void rope_tile(int pos, float inv_d, int vec_offset)
 {
     (void)inv_d; // Unused
-    math::set_dst_write_addr<DstTileLayout::Default, DstTileShape::Tile32x32>(0);
-    math::set_addr_mod_base();
+    math::set_dst_write_addr<DstTileShape::Tile32x32, UnpackDestination::SrcRegs>(0);
+    math::set_addr_mod_base(); // dst_reg[] addressing below uses addr mods 4..7; dropped in the new-SDK port
     TTI_STALLWAIT(p_stall::STALL_SFPU, p_stall::MATH);
 
     #ifdef HAS_FREQ_FACTOR
@@ -209,7 +153,7 @@ inline void rope_tile(int pos, float inv_d, int vec_offset)
         vFloat d2 = ff;
         vFloat d3 = ff;
         sfpi::subvec_transp(d0, d1, d2, d3);
-        vFloat r = _reciprocal_compat_<4>(d0);
+        vFloat r = _reciprocal_compat_<8>(d0);
         v_if(ff < 0) {
             r = -r;
         }
@@ -226,7 +170,7 @@ inline void rope_tile(int pos, float inv_d, int vec_offset)
         vFloat exponent = block_lane_id * vConstFloatPrgm2;
 
         vFloat term_to_exp = -exponent * vConstFloatPrgm0 - vConstFloatPrgm1;
-        vFloat freq = vector_exp(term_to_exp);
+        vFloat freq = sfpu::_sfpu_exp_fp32_accurate_(term_to_exp);
         #ifdef HAS_FREQ_FACTOR
             int ff_idx = 96+(i%2)+(i/2*8);
             freq = freq * vFloat(dst_reg[ff_idx]);
@@ -265,14 +209,14 @@ inline void rope_tile(int pos, float inv_d, int vec_offset)
 
     math::clear_dst_reg_addr();
     TTI_STALLWAIT(p_stall::STALL_CFG, p_stall::WAIT_SFPU);
-    math::clear_addr_mod_base();
+    // math::clear_addr_mod_base();
+    TTI_SETC16(2, 0);  // semantically equivalent to above
 }
 
 
 #endif
 
-namespace NAMESPACE {
-void MAIN {
+void kernel_main() {
 
     uint32_t n_tiles_width_active = get_arg_val<uint32_t>(0);
     uint32_t n_tiles_width = get_arg_val<uint32_t>(1);
@@ -291,14 +235,15 @@ void MAIN {
     float inv_d = 1.f/(n_tiles_width_active * (32 / 2));
     MATH(rope_tile_init(inv_d));
 
-    int* idxs_ptr = nullptr;
+    volatile int* idxs_ptr = nullptr;
     cb_wait_front(cb_in1, 1);
-    cb_get_tile(cb_in1, 0, &idxs_ptr);
-    idxs_ptr += 4; // Need to shift because read ptr is off by 1 << 4 bytes in BBE
+    idxs_ptr = reinterpret_cast<int *>(get_tile_address(cb_in1, 0));
+    // idxs_ptr += 4; // Need to shift because read ptr is off by 1 << 4 bytes in BBE
 
 
     pack_reconfig_data_format(cb_out0);
     for(uint32_t active_id=active_begin; active_id<active_end; active_id++) {
+        DeviceZoneScopedN("RoPE Neox");
         uint32_t b = active_id / (n_tiles_width_active/2) / n_tiles_height;
         uint32_t w = active_id % (n_tiles_width_active/2);
         cb_wait_front(cb_in0, 2);
@@ -331,5 +276,4 @@ void MAIN {
 
     cb_pop_front(cb_in1, 1);
 
-}
 }

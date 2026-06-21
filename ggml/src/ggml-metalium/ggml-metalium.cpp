@@ -3207,23 +3207,20 @@ static const ggml_backend_device_i ggml_backend_metalium_device_interface = {
 static std::vector<std::unique_ptr<ggml_backend_device>> g_backend_device_holder;
 static std::vector<std::unique_ptr<ggml_backend_metalium_device_context>> g_backend_device_context_holder;
 
-struct ggml_metalium_device_closer {
-    std::vector<std::shared_ptr<ttnn::MeshDevice>> devices;
-    ~ggml_metalium_device_closer() {
-        for (auto& dev : devices) {
-            if (dev) {
-                try {
-                    ttnn::close_device(*dev);
-                }
-                catch (...) {
-                    // We are in static teardown at process exit; nothing useful to do with an
-                    // exception here and we must not let it escape a destructor.
-                }
+static std::vector<std::shared_ptr<ttnn::MeshDevice>> g_metalium_open_devices;
+static void ggml_metalium_close_all_devices() {
+    for (auto& dev : g_metalium_open_devices) {
+        if (dev) {
+            try {
+                ttnn::close_device(*dev);
+            }
+            catch (...) {
+                // We are at process teardown; nothing useful to do with an exception here.
             }
         }
     }
-};
-static ggml_metalium_device_closer g_metalium_device_closer;
+    g_metalium_open_devices.clear();
+}
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
 {
@@ -3298,7 +3295,8 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
         else {
             device = ttnn::distributed::open_mesh_device(mesh_shape, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 2, tt::tt_metal::DispatchCoreType::ETH);
         }
-        g_metalium_device_closer.devices.push_back(device);
+        g_metalium_open_devices.push_back(device);
+        std::atexit(ggml_metalium_close_all_devices); // track and kill on eexit
         if(!g_debug_flags.disable_program_cache) {
             ttnn::enable_program_cache(*device);
         }

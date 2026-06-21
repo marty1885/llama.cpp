@@ -513,6 +513,7 @@ static void copy_tt_tensor_to_host_pointer(const tt::tt_metal::Tensor& tensor, v
     GGML_ASSERT(row_major_tensor.storage_type() == tt::tt_metal::StorageType::HOST);
     GGML_ASSERT(row_major_tensor.layout() == ttnn::ROW_MAJOR_LAYOUT);
 
+
     // Grab the data held in the TT tensor
     const tt::tt_metal::HostStorage& storage = row_major_tensor.host_storage();
     const auto buffer = storage.buffer().get_shard({0, 0}).value();
@@ -770,19 +771,21 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         if(dst_size == src_size && dst_stride == src_stride && offset == 0) {
             return parent;
         }
-        //TODO: Handle strided views (seems to be unused in the current codebase)
         std::array<uint32_t, GGML_MAX_DIMS> start;
         std::array<uint32_t, GGML_MAX_DIMS> end;
+        std::array<uint32_t, GGML_MAX_DIMS> step;
 
         // FIXME: Does not work when we are viewing into a permuted tensor. Sucks
         size_t remaining_offset = offset;
         for(size_t i = GGML_MAX_DIMS - 1; i < GGML_MAX_DIMS; i--) {
             start[i] = remaining_offset / src_stride[i];
-            end[i] = dst_size[i] + start[i];
+            step[i] = src_stride[i] != 0 ? dst_stride[i] / src_stride[i] : 1;
+            end[i] = start[i] + dst_size[i] * step[i];
             remaining_offset = remaining_offset % src_stride[i];
         }
         std::reverse(start.begin(), start.end());
         std::reverse(end.begin(), end.end());
+        std::reverse(step.begin(), step.end());
         tt::tt_metal::Tensor res;
 
         if(g_debug_flags.print_view) {
@@ -831,7 +834,6 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         }
         // The fast path, this is what TTNN is designed for (direct slicing)
         else {
-            std::array<uint32_t, GGML_MAX_DIMS> step = {1, 1, 1, 1};
             res = ttnn::slice(*parent, start, end, step);
         }
 
@@ -1885,9 +1887,8 @@ static void ggml_backend_metalium_sum(ggml_backend_metalium_context * ctx, struc
 
 static bool ggml_backend_metalium_can_sum_rows(const struct ggml_tensor * dst)
 {
-    // FIXME: Don't know why but it's broken for these cases
-    ggml_tensor* src0 = dst->src[0];
-    return src0->ne[2] == 1 && src0->ne[3] == 1;
+    GGML_UNUSED(dst);
+    return true;
 }
 
 static void ggml_backend_metalium_sum_rows(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
@@ -1899,8 +1900,14 @@ static void ggml_backend_metalium_sum_rows(ggml_backend_metalium_context * ctx, 
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
 
     auto t = realize_ggml_view(dst->src[0]);
+    ttnn::WormholeComputeKernelConfig cfg{
+        .math_fidelity = MathFidelity::HiFi4,
+        .math_approx_mode = false,
+        .fp32_dest_acc_en = true,
+        .packer_l1_acc = true
+    };
     *dst_meta = {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::sum(*t, 3)),
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::sum(*t, 3, /*keepdim=*/true, std::nullopt, cfg)),
     };
 }
 

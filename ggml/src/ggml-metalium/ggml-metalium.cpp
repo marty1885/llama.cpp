@@ -1564,6 +1564,21 @@ static void ggml_backend_metalium_concat(ggml_backend_metalium_context * ctx, st
     const struct ggml_tensor * src1 = dst->src[1];
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
 
+    // One operand can be empty along the concat axis. This happens e.g. in the RWKV
+    // token-shift concat during generation: ggml_view of [n_embd, n_seq_tokens-1, ...]
+    // collapses to a zero-sized dimension when n_seq_tokens == 1. The concat result is
+    // then just the other operand. ttnn::concat cannot ingest a zero-sized tensor (its
+    // untilize fallback divides by the tile count and hits an FPE), and the empty view
+    // is never materialized on device, so handle this before realizing anything.
+    if(ggml_nelements(src1) == 0) {
+        *dst_meta = { .tensor = realize_ggml_view(src0) };
+        return;
+    }
+    if(ggml_nelements(src0) == 0) {
+        *dst_meta = { .tensor = realize_ggml_view(src1) };
+        return;
+    }
+
     auto src_tensor0 = realize_ggml_view(src0);
     auto src_tensor1 = realize_ggml_view(src1);
 
@@ -2678,12 +2693,7 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
             continue;
         }
 
-        // Zero-element ops produce nothing and their results are never read. This happens
-        // e.g. with inp_out_ids get_rows when a ubatch has no outputs (n_outputs == 0):
-        // the 0-length index tensor lives on a host buffer and is never materialized on
-        // device, so its extra->tensor is a null shared_ptr. Running the op would
-        // dereference that null tensor (logical_shape() -> SIGSEGV). Emptiness propagates
-        // to every consumer, so skipping the whole empty sub-graph is consistent.
+        // no tensor -> no allocated TTNN tensor
         if(ggml_nelements(node) == 0) {
             continue;
         }
@@ -3189,6 +3199,25 @@ static const ggml_backend_device_i ggml_backend_metalium_device_interface = {
 
 static std::vector<std::unique_ptr<ggml_backend_device>> g_backend_device_holder;
 static std::vector<std::unique_ptr<ggml_backend_metalium_device_context>> g_backend_device_context_holder;
+
+struct ggml_metalium_device_closer {
+    std::vector<std::shared_ptr<ttnn::MeshDevice>> devices;
+    ~ggml_metalium_device_closer() {
+        for (auto& dev : devices) {
+            if (dev) {
+                try {
+                    ttnn::close_device(*dev);
+                }
+                catch (...) {
+                    // We are in static teardown at process exit; nothing useful to do with an
+                    // exception here and we must not let it escape a destructor.
+                }
+            }
+        }
+    }
+};
+static ggml_metalium_device_closer g_metalium_device_closer;
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
 {
     static ggml_backend_reg reg;
@@ -3262,6 +3291,7 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
         else {
             device = ttnn::distributed::open_mesh_device(mesh_shape, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 2, tt::tt_metal::DispatchCoreType::ETH);
         }
+        g_metalium_device_closer.devices.push_back(device);
         if(!g_debug_flags.disable_program_cache) {
             ttnn::enable_program_cache(*device);
         }

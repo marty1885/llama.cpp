@@ -2678,6 +2678,16 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
             continue;
         }
 
+        // Zero-element ops produce nothing and their results are never read. This happens
+        // e.g. with inp_out_ids get_rows when a ubatch has no outputs (n_outputs == 0):
+        // the 0-length index tensor lives on a host buffer and is never materialized on
+        // device, so its extra->tensor is a null shared_ptr. Running the op would
+        // dereference that null tensor (logical_shape() -> SIGSEGV). Emptiness propagates
+        // to every consumer, so skipping the whole empty sub-graph is consistent.
+        if(ggml_nelements(node) == 0) {
+            continue;
+        }
+
         // std::cout << ggml_op_name(node->op) << " node " << node->name << " with address " << node->data << std::endl;
         switch (node->op) {
             case GGML_OP_UNARY: {

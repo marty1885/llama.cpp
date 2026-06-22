@@ -6,6 +6,9 @@
 #include "ggml-cpu.h"
 #include "ggml-metalium.h"
 
+#include "ggml-metalium-internal.hpp"
+#include "compiler.hpp"
+
 #include "hostdevcommon/common_values.hpp"
 #include "tt-metalium/bfloat16.hpp"
 #include "tt-metalium/host_buffer.hpp"
@@ -36,6 +39,8 @@
 #include <cstring>
 #include <iostream>
 #include <mutex>
+#include <chrono>
+#include <map>
 #include <optional>
 #include <string_view>
 #include <ttnn/core.hpp>
@@ -79,24 +84,17 @@
 
 extern void metalium_register_all_kernel();
 
-struct ggml_backend_metalium_context {
-    ttnn::IDevice* device = nullptr;
-    int device_id = 0;
-    std::string name;
-};
-
 struct ggml_backend_metalium_device_context {
     std::shared_ptr<ttnn::MeshDevice> device = nullptr;
     int device_id = -1;
     std::string name;
     std::string description;
+    std::unique_ptr<MetaliumGraphCompiler> compiler;
 };
 
 struct ggml_backend_metalium_reg_context {
     std::vector<ggml_backend_dev_t> devices;
 };
-
-struct ggml_tensor_extra_metalium;
 
 struct ggml_backend_metalium_buffer_context {
 
@@ -107,12 +105,6 @@ struct ggml_backend_metalium_buffer_context {
 
     // Tracking our own allocations because Metalium limitations and GGML assuming them
     std::vector<std::unique_ptr<ggml_tensor_extra_metalium>> metadata_to_free;
-};
-
-struct ggml_tensor_extra_metalium
-{
-    std::shared_ptr<tt::tt_metal::Tensor> tensor;
-    bool is_pretransposed = false;
 };
 
 static bool ggml_tt_tensors_shape_equal(const ggml_tensor* ggtensor, const tt::tt_metal::Tensor& ttensor)
@@ -205,6 +197,8 @@ struct ggml_backend_metalium_debug_flags {
     bool cache_mm_transpose = false;        // Cache the transpose kernel for matmul
     bool disable_program_cache = false;     // Disables the program cache
     bool experimental_ops = false;          // Enable experimental ops that is known to cause trouble
+    bool disable_graph_compiler = false;    // Skip the graph compiler entirely; fall back to native per-op dispatch
+    bool print_local_timing = false;        // Per-op host+device timing (Finish after each op). Separate from Tracy.
 };
 
 static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
@@ -225,7 +219,9 @@ static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
         .print_view = parse_env("GGML_METALIUM_PRINT_VIEW"),
         .cache_mm_transpose = parse_env("GGML_METALIUM_CACHE_MM_TRANSPOSE"), // GGML uses pre-transposed weights. Remove this flag when TT implements it
         .disable_program_cache = parse_env("GGML_METALIUM_DISABLE_PROGRAM_CACHE"),
-        .experimental_ops = parse_env("GGML_METALIUM_EXPERIMENTAL_OPS")
+        .experimental_ops = parse_env("GGML_METALIUM_EXPERIMENTAL_OPS"),
+        .disable_graph_compiler = parse_env("GGML_METALIUM_DISABLE_GRAPH_COMPILER"),
+        .print_local_timing = parse_env("GGML_METALIUM_PRINT_LOCAL_TIMING")
     };
 }();
 
@@ -502,11 +498,9 @@ static void copy_tt_tensor_to_host_pointer(const tt::tt_metal::Tensor& tensor, v
 
     tt::tt_metal::Tensor row_major_tensor = tensor;
     if(tensor.layout() == ttnn::TILE_LAYOUT) {
-        // FIXME: untilize is cursed. Causes _MANY_ corruption errors. Replacing it with to_layout
-        // Fixes the majority of accuracy and corruption errors in test-backend-ops
-        // Ofc this is slower so we really want to enable untilize on device
-        // row_major_tensor = ttnn::untilize(tensor).cpu();
-        row_major_tensor = tensor.cpu().to_layout(ttnn::ROW_MAJOR_LAYOUT);
+        // Convert tile -> row-major on device, then copy to host. The host-side
+        // Thanks TT for finally fixing this
+        row_major_tensor = ttnn::untilize(tensor).cpu();
     }
     else {
        row_major_tensor = tensor.cpu();
@@ -705,8 +699,26 @@ static tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tens
     return ttnn::reshape(tensor, ttnn::Shape(target_shape));
 }
 
+// In-place ops (e.g. the recurrent state cache update) write into a view of a
+// pre-allocated tensor. The lazy backend only stores whole-tensor handles, so persist
+// the result into the underlying tensor when the view covers it entirely, otherwise
+// later graphs would read stale data. Partial writes cannot be expressed and are
+// rejected at supports_op time.
+static void metalium_persist_inplace_view(const ggml_tensor* node, const std::shared_ptr<tt::tt_metal::Tensor>& value)
+{
+    ggml_tensor* root = node->view_src;
+    if(root == NULL || root->extra == NULL) {
+        return;
+    }
+    if(!ggml_is_contiguous(node) || node->view_offs != 0 || ggml_nelements(node) != ggml_nelements(root)) {
+        return;
+    }
+    ggml_tensor_extra_metalium* root_meta = (ggml_tensor_extra_metalium*)root->extra;
+    root_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(reshape_tt_tensor_into_ggml(*value, root));
+}
+
 static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_tensor* tensor);
-static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tensor)
+std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tensor)
 {
     auto res = realize_ggml_view_impl(tensor);
     ggml_tensor_extra_metalium* meta = static_cast<ggml_tensor_extra_metalium*>(tensor->extra);
@@ -833,6 +845,21 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
             tt::tt_metal::Tensor tmp = ttnn::slice(*parent, start, end, step);
             res = reshape_tt_tensor_into_ggml(tmp, tensor);
         }
+        // 1-D contiguous sub-view (with offset) of a contiguous parent: it is a flat
+        // sub-range of the parent's data. The generic slicer can derive out-of-range
+        // indices when src0's shape differs from the realized parent (e.g. the RWKV
+        // token-shift / wkv-state split of a flat tensor), so slice the flat range directly.
+        else if(ggml_n_dims(tensor) == 1 && ggml_is_contiguous(tensor) && ggml_is_contiguous(src0)) {
+            uint32_t offset_elements = offset / ggml_type_size(src0->type);
+            uint32_t dst_volume = (uint32_t)ggml_nelements(tensor);
+            uint32_t parent_volume = (uint32_t)ggml_nelements(src0);
+            tt::tt_metal::Tensor flat = ttnn::reshape(*parent, ttnn::Shape({1, 1, 1, parent_volume}));
+            std::array<uint32_t, GGML_MAX_DIMS> fstart{0, 0, 0, offset_elements};
+            std::array<uint32_t, GGML_MAX_DIMS> fend{1, 1, 1, dst_volume + offset_elements};
+            std::array<uint32_t, GGML_MAX_DIMS> fstep{1, 1, 1, 1};
+            tt::tt_metal::Tensor tmp = ttnn::slice(flat, fstart, fend, fstep);
+            res = reshape_tt_tensor_into_ggml(tmp, tensor);
+        }
         // Flat (contiguous) view of a multi-dimensional parent whose generic per-dim step degenerated to 0
         else if(ggml_is_contiguous(tensor) &&
                 std::any_of(step.begin(), step.end(), [](uint32_t s){ return s == 0; })) {
@@ -918,25 +945,6 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
     fmt::println(stderr, "Tensor \"{}\" getting through fallback path. OP = {}, dtype={}", tensor->name, ggml_op_name(tensor->op), ggml_type_name(tensor->type));
     GGML_ASSERT(false && "Fallback path not implemented");
 }
-
-inline static void ggml_metalium_op_src_sanity_check(const struct ggml_tensor * node, int idx) {
-    GGML_ASSERT(node->src[idx] != NULL);
-    GGML_ASSERT(node->src[idx]->extra != NULL);
-    auto* meta = (ggml_tensor_extra_metalium*)(node->src[idx]->extra);
-    if(meta->tensor != NULL) {
-        GGML_ASSERT(meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE);
-        GGML_ASSERT(meta->tensor->layout() == tt::tt_metal::Layout::TILE);
-    }
-}
-
-// Sanity check macros to ensure that the tensors are in the correct format and we won't crash
-#define GGML_METALIUM_OP_SANITY_CHECK(_node) \
-    GGML_ASSERT((_node)->extra != NULL);
-// Check if the tensor is on the device (so we wont'e be using the CPU) as well as letting us crash early
-#define GGML_METALIUM_OP_SRC_SANITY_CHECK(_node, _idx) ggml_metalium_op_src_sanity_check(_node, _idx);
-#define GGML_METALIUM_OP_SRC0_SANITY_CHECK(_node) GGML_METALIUM_OP_SRC_SANITY_CHECK(_node, 0)
-#define GGML_METALIUM_OP_SRC1_SANITY_CHECK(_node) GGML_METALIUM_OP_SRC_SANITY_CHECK(_node, 1)
-
 
 // Experimental flag to enable or disable custom mul_mat
 // #define USE_CUSTOM_MUL_MAT
@@ -1054,12 +1062,27 @@ static bool ggml_backend_metalium_can_cpy(const struct ggml_tensor * dst)
     if(is_integer_type(dst->type) || is_integer_type(dst->src[0]->type)) {
         return false;
     }
-    // Destination must not be a view
     if(dst->op != GGML_OP_CPY) {
         return true;
     }
     ggml_tensor* src1 = dst->src[1];
-    return !(ggml_is_permuted(src1) || is_view(src1));
+    // A zero-element copy is a no-op (e.g. the empty "extra states" copy in build_rs)
+    // and is skipped at compute time.
+    if(ggml_nelements(src1) == 0) {
+        return true;
+    }
+    if(ggml_is_permuted(src1)) {
+        return false;
+    }
+    if(is_view(src1)) {
+        // The only supported view destination is one that covers an entire
+        // pre-allocated tensor (e.g. the recurrent state cache). The lazy backend
+        // stores whole-tensor handles, so a partial write cannot be expressed.
+        ggml_tensor* root = src1->view_src;
+        return root != NULL && ggml_is_contiguous(src1) && src1->view_offs == 0 &&
+               ggml_nelements(src1) == ggml_nelements(root);
+    }
+    return true;
 }
 
 static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
@@ -1084,6 +1107,7 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
         GGML_ASSERT(src1 != NULL);
         GGML_ASSERT(src1->extra != NULL);
         ggml_tensor_extra_metalium* src1_meta = (ggml_tensor_extra_metalium*)src1->extra;
+        metalium_persist_inplace_view(dst, res);
         *src1_meta = {
             .tensor = res,
         };
@@ -1302,16 +1326,19 @@ static void ggml_backend_metalium_scale(ggml_backend_metalium_context * ctx, str
     else {
         res = ttnn::add(ttnn::multiply(*t, scale, std::nullopt, ttnn::L1_MEMORY_CONFIG), bias);
     }
-    // TODO: Support in-place scaling
-    GGML_ASSERT(!is_view(dst->src[0]));
     *dst_meta = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(res)),
     };
+    metalium_persist_inplace_view(dst, dst_meta->tensor);
 }
 
 static bool ggml_backend_metalium_can_get_rows(const struct ggml_tensor * dst, tt::ARCH arch)
 {
     const ggml_tensor *idxs = dst->src[1];
+    // No rows to gather (e.g. the empty "extra states" gather in build_rs): no-op, skipped at compute.
+    if(ggml_nelements(dst) == 0) {
+        return true;
+    }
     // effectivly no-op
     if(idxs->ne[0] == 1 && idxs->ne[1] == 1 && idxs->ne[2] == 1 && idxs->ne[3] == 1 && ggml_n_dims(dst->src[0]) == 1) {
         return true;
@@ -2781,7 +2808,18 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
         }
 
         // std::cout << ggml_op_name(node->op) << " node " << node->name << " with address " << node->data << std::endl;
-        switch (node->op) {
+
+        std::chrono::steady_clock::time_point __lt_t0;
+        if(g_debug_flags.print_local_timing) {
+            // Serialize so the elapsed time below reflects this op's host+device cost,
+            // not pipelined overlap with later ops.
+            tt::tt_metal::distributed::Finish(ctx->device->get_mesh_device()->mesh_command_queue());
+            __lt_t0 = std::chrono::steady_clock::now();
+        }
+
+        if (ctx->compiler != nullptr && ctx->compiler->tryLowerNode(ctx, node)) {
+            // handled by the graph compiler
+        } else switch (node->op) {
             case GGML_OP_UNARY: {
                 ggml_unary_op unary_op = ggml_get_unary_op(node);
                 bool ok = false;
@@ -2947,6 +2985,35 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
                 , node->name, ggml_op_name(node->op), node->ne[0], node->ne[1], node->ne[2], node->ne[3], meta->tensor->logical_shape());
             abort();
         }
+
+        if(g_debug_flags.print_local_timing) {
+            // Finish so the device work this op enqueued is fully drained before we stop the clock.
+            tt::tt_metal::distributed::Finish(ctx->device->get_mesh_device()->mesh_command_queue());
+            double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - __lt_t0).count();
+            static std::map<std::string, std::pair<double, uint64_t>> acc; // op -> {total_us, calls}
+            static uint64_t timed_ops = 0;
+            auto& e = acc[ggml_op_desc(node)];
+            e.first += us;
+            e.second += 1;
+            // Print a cumulative table every so often; the last one before exit is the full picture.
+            timed_ops++;
+            if(timed_ops % 4096 == 0) {
+                double grand = 0;
+                for(auto& kv : acc) grand += kv.second.first;
+                std::vector<std::pair<std::string, std::pair<double, uint64_t>>> rows(acc.begin(), acc.end());
+                std::sort(rows.begin(), rows.end(), [](auto& a, auto& b){ return a.second.first > b.second.first; });
+                fprintf(stderr, "\n=== METALIUM LOCAL TIMING (cumulative, %lu timed ops, %.1f ms total device+host) ===\n",
+                    (unsigned long)timed_ops, grand / 1000.0);
+                fprintf(stderr, "%-28s %8s %12s %7s %12s\n", "op", "calls", "total_ms", "%", "us/call");
+                for(auto& r : rows) {
+                    fprintf(stderr, "%-28s %8lu %12.2f %6.1f%% %12.1f\n",
+                        r.first.c_str(), (unsigned long)r.second.second, r.second.first / 1000.0,
+                        grand > 0 ? 100.0 * r.second.first / grand : 0.0,
+                        r.second.first / r.second.second);
+                }
+                fflush(stderr);
+            }
+        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -2992,6 +3059,11 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
     ggml_backend_metalium_device_context * ctx = (ggml_backend_metalium_device_context *)device->context;
+
+    // Keep nodes with a special lowering on the device instead of the CPU.
+    if (ctx->compiler != nullptr && ctx->compiler->hasLowering(op)) {
+        return true;
+    }
 
     // The metalium backend has seperated internal data types from the GGML data types. We really only care about
     // what we can convert to and from.
@@ -3135,7 +3207,6 @@ static bool ggml_backend_metalium_device_supports_buft(ggml_backend_dev_t dev, g
 
 static void ggml_backend_metalium_synchronize(ggml_backend_t backend)
 {
-    return;
     ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
     tt::tt_metal::distributed::Finish(ctx->device->get_mesh_device()->mesh_command_queue());
 }
@@ -3174,6 +3245,7 @@ static ggml_backend_t ggml_backend_metalium_init(ggml_backend_metalium_device_co
         /* device            = */ device,
         /* device_id         = */ device_id,
         /* name              = */ dev_ctx->name,
+        /* compiler          = */ dev_ctx->compiler.get(),
     };
 
     ggml_backend_t backend = new ggml_backend {
@@ -3391,6 +3463,9 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
         dev_ctx->device = device;
         dev_ctx->device_id = device_id;
         dev_ctx->name = "METALIUM" + std::to_string(device_id);
+        if(!g_debug_flags.disable_graph_compiler) {
+            dev_ctx->compiler = std::make_unique<MetaliumGraphCompiler>();
+        }
         // WHY???
         // chip_id_t MeshDevice::build_id() const { return reference_device()->id(); }
         // Reference device should be the same... Dafaq?

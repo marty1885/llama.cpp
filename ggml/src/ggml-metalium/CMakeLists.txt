@@ -6,11 +6,13 @@ message(STATUS "Metalium found.")
 
 ggml_add_backend_library(ggml-metalium
     ggml-metalium.cpp
+    compiler.cpp
     utils.cpp
     rope.cpp
     mul_mat.cpp
     soft_max.cpp
     wkv7.cpp
+    embedding.cpp
 )
 
 target_include_directories(ggml-metalium PRIVATE
@@ -76,6 +78,11 @@ if(GGML_METALIUM_EMBED_KERNELS)
             wkv7_decodeL_reader
             wkv7_decodeL_compute
             wkv7_writer
+            embedding_fold_reader
+            embedding_fold_compute
+            embedding_fold_writer
+            embedding_gather_reader
+            embedding_gather_writer
     )
     include(cmake/add_kernel.cmake)
     foreach(kernel IN ITEMS ${GGML_METALIUM_EMBED_KERNELS})

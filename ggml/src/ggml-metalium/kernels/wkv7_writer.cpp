@@ -42,7 +42,8 @@ void kernel_main() {
                     // A single noc_async_write_page copies the entire 32x32 tile at once.
                     for (uint32_t st = 0; st < St; st++)
                         noc_async_write_page((sq * nc + cc) * Ct + h * St + st, dst, rp + st * tb);
-                } else {
+                }
+                else {
                     // slow path:  per-row scatter used when:
                     //   (a) decodeL: tpc=1, so each "chunk" is a single token, OR
                     //   (b) chunked but Lr % 32 != 0 (last chunk may be shorter).

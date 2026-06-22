@@ -75,6 +75,7 @@
 #include "rope.hpp"
 #include "mul_mat.hpp"
 #include "soft_max.hpp"
+#include "wkv7.hpp"
 
 extern void metalium_register_all_kernel();
 
@@ -828,6 +829,23 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
             uint32_t dst_volume = (uint32_t)ggml_nelements(tensor);
             std::array<uint32_t, GGML_MAX_DIMS> start{0, 0, 0, offset_elements};
             std::array<uint32_t, GGML_MAX_DIMS> end({1, 1, 1, dst_volume + offset_elements});
+            std::array<uint32_t, GGML_MAX_DIMS> step = {1, 1, 1, 1};
+            tt::tt_metal::Tensor tmp = ttnn::slice(*parent, start, end, step);
+            res = reshape_tt_tensor_into_ggml(tmp, tensor);
+        }
+        // Flat (contiguous) view of a multi-dimensional parent whose generic per-dim step degenerated to 0
+        else if(ggml_is_contiguous(tensor) &&
+                std::any_of(step.begin(), step.end(), [](uint32_t s){ return s == 0; })) {
+            const auto pshape = parent->logical_shape();
+            const uint32_t Cc = pshape[-1];
+            const uint32_t off_e = (uint32_t)(offset / ggml_type_size(src0->type));
+            const uint32_t len_e = (uint32_t)ggml_nelements(tensor);
+            GGML_ASSERT(Cc != 0 && off_e % Cc == 0 && len_e % Cc == 0 &&
+                "metalium: contiguous view not aligned to parent row width (unsupported)");
+            const uint32_t r0 = off_e / Cc;
+            const uint32_t r1 = r0 + len_e / Cc;
+            std::array<uint32_t, GGML_MAX_DIMS> start{0, 0, r0, 0};
+            std::array<uint32_t, GGML_MAX_DIMS> end{pshape[0], pshape[1], r1, Cc};
             std::array<uint32_t, GGML_MAX_DIMS> step = {1, 1, 1, 1};
             tt::tt_metal::Tensor tmp = ttnn::slice(*parent, start, end, step);
             res = reshape_tt_tensor_into_ggml(tmp, tensor);
@@ -2096,6 +2114,63 @@ static void ggml_backend_metalium_rope(ggml_backend_metalium_context * ctx, stru
     };
 }
 
+static void ggml_backend_metalium_rwkv_wkv7(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
+{
+    GGML_METALIUM_OP_SANITY_CHECK(dst);
+    for(int i = 0; i < 7; i++) {
+        GGML_METALIUM_OP_SRC_SANITY_CHECK(dst, i);
+    }
+    GGML_UNUSED(ctx);
+
+    ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
+
+    // ggml src order: r,w,k,v,a,b,state -> realize each to its ggml-native device tensor.
+    auto res = ttggml::rwkv_wkv7(
+        *realize_ggml_view(dst->src[0]),   // r
+        *realize_ggml_view(dst->src[1]),   // w
+        *realize_ggml_view(dst->src[2]),   // k
+        *realize_ggml_view(dst->src[3]),   // v
+        *realize_ggml_view(dst->src[4]),   // a
+        *realize_ggml_view(dst->src[5]),   // b
+        *realize_ggml_view(dst->src[6]));  // state
+
+    *dst_meta = {
+        .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(res)),
+    };
+}
+
+static bool ggml_backend_metalium_can_rwkv_wkv7(const struct ggml_tensor * dst)
+{
+    for(int i = 0; i < 7; i++) {
+        if(dst->src[i] == NULL) {
+            return false;
+        }
+    }
+    const struct ggml_tensor * k     = dst->src[2];
+    const struct ggml_tensor * state = dst->src[6];
+    const int64_t S = k->ne[0];           // head_size
+    const int64_t H = k->ne[1];           // head_count
+    const int64_t L = k->ne[2];           // n_seq_tokens
+    const int64_t G = state->ne[1];       // n_seqs
+
+    // The kernel is validated for head_size 64; needs head_count | head_size (region-2
+    // scatter). Arbitrary n_seq_tokens is supported (the reader neutral-pads the partial
+    // last chunk on-device) AND arbitrary n_seqs is supported: the state-seed gather pages
+    // across 32-row flat-strip blocks via (sq/32)*tpr, so G is not bounded to one row-tile
+    // (verified PASS at G=64/128 for chunked + decodeL + decode). chunked (L>=2) still needs
+    // (G*H) even for its NB=2 group (always true for even H; only bites odd head_count).
+    if(S != 64 || H <= 0 || (S % H) != 0) {
+        return false;
+    }
+    if(G < 1) {
+        return false;
+    }
+    if(L >= 2 && ((G * H) % 2) != 0) {
+        return false;
+    }
+    return true;
+}
+
 static bool ggml_backend_metalium_can_flash_attn(const struct ggml_tensor * dst)
 {
     if(!g_debug_flags.experimental_ops) {
@@ -2851,6 +2926,10 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
                 ggml_backend_metalium_set_rows(ctx, node);
                 break;
 
+            case GGML_OP_RWKV_WKV7:
+                ggml_backend_metalium_rwkv_wkv7(ctx, node);
+                break;
+
             case GGML_OP_NONE:
                 break;
 
@@ -3033,6 +3112,13 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
             return tensor_supported(src1) && tensor_supported(op->src[2]) && ggml_backend_metalium_can_flash_attn(op);
         case GGML_OP_SET_ROWS:
             return tensor_supported(src1) && ggml_backend_metalium_can_set_rows(op);
+        case GGML_OP_RWKV_WKV7:
+            for(int i = 1; i < 7; i++) {
+                if(!tensor_supported(op->src[i])) {
+                    return false;
+                }
+            }
+            return ggml_backend_metalium_can_rwkv_wkv7(op);
         default:
             return false;
     }

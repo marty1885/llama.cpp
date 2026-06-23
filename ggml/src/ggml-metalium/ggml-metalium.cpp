@@ -62,6 +62,7 @@
 #include <ttnn/operations/data_movement/permute/permute.hpp>
 #include <ttnn/operations/data_movement/repeat/repeat.hpp>
 #include <ttnn/operations/data_movement/concat/concat.hpp>
+#include <ttnn/operations/data_movement/copy/copy.hpp>
 #include <ttnn/operations/copy/typecast/typecast.hpp>
 #include <ttnn/operations/normalization/softmax/softmax.hpp>
 #include <tt-metalium/experimental/kernel_cache.hpp>
@@ -2836,6 +2837,20 @@ static std::map<uint64_t, metalium_trace_exec_state>& metalium_trace_exec_states
     return m;
 }
 
+
+// Tracking for tracing support
+static std::unordered_map<uint64_t, std::shared_ptr<tt::tt_metal::Tensor>> g_metalium_pinned_tensors;
+
+// Hash the GGML tensor to give us some key
+static uint64_t ggml_metalium_ggtensor_key(const ggml_tensor* t) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](uint64_t v){ h ^= v; h *= 1099511628211ull; };
+    mix((uint64_t)(uintptr_t)t->data);
+    mix((uint64_t)t->type);
+    for(int d = 0; d < GGML_MAX_DIMS; d++) mix((uint64_t)t->ne[d]);
+    return h;
+}
+
 static void metalium_trace_release_all(ttnn::MeshDevice* mesh) {
     auto& states = metalium_trace_exec_states();
     for(auto& kv : states) {
@@ -2845,6 +2860,7 @@ static void metalium_trace_release_all(ttnn::MeshDevice* mesh) {
         }
     }
     states.clear();
+    g_metalium_pinned_tensors.clear();
 }
 
 static uint64_t metalium_trace_graph_signature(const ggml_cgraph* g) {
@@ -2895,6 +2911,34 @@ struct metalium_trace_dispatch {
         }
     }
 
+    // Pin every op==NONE leaf to its fixed anchor to avoid future allocation because Metal Trace
+    // neeeds a stable address
+    void pin_leaves(bool may_populate) const {
+        auto& pins = g_metalium_pinned_tensors;
+        for(int i = 0; i < graph->n_leafs; i++) {
+            ggml_tensor* l = graph->leafs[i];
+            if(l->op != GGML_OP_NONE || l->extra == nullptr) continue;
+            auto* m = (ggml_tensor_extra_metalium*)l->extra;
+            if(m->tensor == nullptr || m->tensor->storage_type() != tt::tt_metal::StorageType::DEVICE) continue;
+            uint64_t key = ggml_metalium_ggtensor_key(l);
+            auto it = pins.find(key);
+            if(it == pins.end()) {
+                if(may_populate) pins.emplace(key, m->tensor);
+                continue;
+            }
+            const auto& anchor = it->second;
+            if(m->tensor.get() == anchor.get()) continue; // already at the fixed address
+            if(anchor->storage_type() != tt::tt_metal::StorageType::DEVICE
+                || m->tensor->dtype()  != anchor->dtype()
+                || m->tensor->layout() != anchor->layout()
+                || !ggml_tt_tensors_shape_equal(l, *anchor)) {
+                continue; // incompatible -> leave untouched
+            }
+            ttnn::copy(*m->tensor, *anchor); // actual copy of device mmoey
+            m->tensor = anchor;
+        }
+    }
+
     // Run before the node loop. Returns true if the graph was fully served by REPLAY, in which case
     // the caller returns immediately and skips the node loop; returns false to run the node loop
     // eagerly (and, on the capture pass, with capture recording active).
@@ -2909,10 +2953,14 @@ struct metalium_trace_dispatch {
         state->passes++;
 
         if(state->captured) {
+            pin_leaves(/*may_populate*/true);   // inject freshly-fed inputs at their baked addresses
             ttnn::operations::trace::execute_trace(mesh, state->tid, std::nullopt, /*blocking*/false);
             rebind_nodes();
             return true;
         }
+        // Load leaves into their anchors BEFORE opening the capture window, so the input-injection
+        // copies are NOT baked into the trace (we re-do them ourselves on every replay above).
+        pin_leaves(/*may_populate*/true);
         if(state->passes >= 2) {
             state->tid = ttnn::operations::trace::begin_trace_capture(mesh, std::nullopt);
             capturing = true;
@@ -2924,6 +2972,9 @@ struct metalium_trace_dispatch {
     // @note Capture only RECORDS the command stream -- it does not run on device -- so we
     //   execute_trace once here to populate this pass's outputs, matching a normal eager compute.
     void finish() {
+        // Tracing off (begin() returned before binding graph): nothing to settle.
+        if(!g_metalium_trace_enabled) return;
+        pin_leaves(/*may_populate*/false);
         if(!capturing) return;
         ttnn::operations::trace::end_trace_capture(mesh, state->tid, std::nullopt);
         state->captured = true;

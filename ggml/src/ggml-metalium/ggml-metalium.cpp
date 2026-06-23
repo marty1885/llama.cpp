@@ -18,6 +18,7 @@
 #include "ttnn/operations/eltwise/binary/binary_composite.hpp"
 #include "ttnn/operations/eltwise/unary/unary.hpp"
 #include "ttnn/operations/moreh/moreh_group_norm/moreh_group_norm.hpp"
+#include "ttnn/operations/trace.hpp"
 #include "ttnn/tensor/layout/layout.hpp"
 #include "ttnn/tensor/shape/shape.hpp"
 #include "ttnn/tensor/storage.hpp"
@@ -232,6 +233,30 @@ static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
 // Maintain all base addresses are unique
 // TODO: Do we still need this since we already removed the virtual address mapping hack?
 static size_t g_metalium_base_offset = 0;
+
+// Unlike g_debug_flags it is MUTABLE so a test can set or unset it.
+// on via ggml_backend_metalium_set_tracing() BEFORE the device opens (the device must reserve a
+// trace-capable region at open time). Default OFF because this feature is unstable and in development
+static bool g_metalium_trace_enabled = []() {
+    const char* v = std::getenv("GGML_METALIUM_TRACE");
+    if(v == nullptr) return false;
+    std::string s(v);
+    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    return s != "0" && s != "false" && s != "no" && s != "off";
+}();
+
+extern "C" {
+void ggml_backend_metalium_set_tracing(bool enable) {
+    g_metalium_trace_enabled = enable;
+}
+bool ggml_backend_metalium_tracing_enabled(void) {
+    return g_metalium_trace_enabled;
+}
+}
+
+// [elease all captured traces. Defined further down where the state struct is complete;
+// forward-declared here because ggml_backend_metalium_free (above) calls it.
+static void metalium_trace_release_all(ttnn::MeshDevice* mesh);
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 // Actual backend code
@@ -2388,6 +2413,13 @@ static const char * ggml_backend_metalium_name(ggml_backend_t backend) {
 
 static void ggml_backend_metalium_free(ggml_backend_t backend) {
     ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
+    // Release captured traces HERE (backend free runs while the program is alive), NOT at
+    // atexit. Trace buffer deallocation calls GraphTracker::track_deallocate, which reads a
+    // thread_local that is already destroyed during static teardown -> UAF segfault.
+    // It's dumb
+    if(g_metalium_trace_enabled && ctx->device != nullptr) {
+        metalium_trace_release_all(ctx->device->get_mesh_device().get());
+    }
     delete ctx;
     delete backend;
 }
@@ -2786,8 +2818,127 @@ static ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(ggml_backend
     return &buffer_type_map[device_id];
 }
 
+// Persistent capture/replay state for one graph signature, held for the process lifetime.
+// @note Lifecycle across passes of the same signature: pass 1 runs eagerly (warmup: JIT compile,
+//   weight pre-transpose, allocs); pass 2 captures then executes once (capture only RECORDS the
+//   command stream, so an execute is needed to populate outputs); pass 3+ replay.
+struct metalium_trace_exec_state {
+    uint64_t passes = 0;                        ///< Number of times this signature has been seen.
+    bool captured = false;                      ///< Whether the trace has been captured (=> replay).
+    ttnn::MeshTraceId tid = ttnn::MeshTraceId{0}; ///< Handle to the captured trace on the device.
+    // Captured per-node device tensors, by node index.
+    // @note The backend allocates a fresh node->extra every pass, so replay must re-bind these;
+    //   see metalium_trace_dispatch::rebind_nodes / snapshot_nodes.
+    std::vector<std::shared_ptr<tt::tt_metal::Tensor>> node_tensors;
+};
+static std::map<uint64_t, metalium_trace_exec_state>& metalium_trace_exec_states() {
+    static std::map<uint64_t, metalium_trace_exec_state> m;
+    return m;
+}
+
+static void metalium_trace_release_all(ttnn::MeshDevice* mesh) {
+    auto& states = metalium_trace_exec_states();
+    for(auto& kv : states) {
+        if(kv.second.captured) {
+            try { ttnn::operations::trace::release_trace(mesh, kv.second.tid); }
+            catch(...) {}
+        }
+    }
+    states.clear();
+}
+
+static uint64_t metalium_trace_graph_signature(const ggml_cgraph* g) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](uint64_t v){ h ^= v; h *= 1099511628211ull; };
+    mix((uint64_t)g->n_nodes);
+    for(int i = 0; i < g->n_nodes; i++) {
+        const ggml_tensor* n = g->nodes[i];
+        mix((uint64_t)n->op);
+        if(n->op == GGML_OP_UNARY) mix((uint64_t)ggml_get_unary_op(n));
+        for(int d = 0; d < GGML_MAX_DIMS; d++) mix((uint64_t)n->ne[d]);
+    }
+    return h;
+}
+
+/// TTNN capture/replay for a single graph_compute call
+struct metalium_trace_dispatch {
+    ggml_cgraph* graph = nullptr;
+    ttnn::MeshDevice* mesh = nullptr;
+    metalium_trace_exec_state* state = nullptr;
+    bool capturing = false;
+
+    // Re-attach the captured per-node device tensors onto this pass's nodes, by node index.
+    // @note ggml hands every node a fresh null-bound extra each pass and only the node loop binds
+    //   it; replay skips that loop, so without this re-bind a reader hits a null binding. Indexing by
+    //   position is valid because an identical signature implies identical topology.
+    void rebind_nodes() const {
+        const auto& nt = state->node_tensors;
+        if((int)nt.size() != graph->n_nodes) return;
+        for(int i = 0; i < graph->n_nodes; i++) {
+            ggml_tensor* n = graph->nodes[i];
+            if(n->extra != nullptr && nt[i] != nullptr) {
+                ((ggml_tensor_extra_metalium*)n->extra)->tensor = nt[i];
+            }
+        }
+    }
+
+    // Snapshot every node's device tensor at capture so replay can re-bind them.
+    // @note Holding the shared_ptrs also pins the buffers whose addresses the trace baked, for the
+    //   process lifetime.
+    void snapshot_nodes() const {
+        state->node_tensors.assign(graph->n_nodes, nullptr);
+        for(int i = 0; i < graph->n_nodes; i++) {
+            ggml_tensor* n = graph->nodes[i];
+            if(n->extra != nullptr) {
+                state->node_tensors[i] = ((ggml_tensor_extra_metalium*)n->extra)->tensor;
+            }
+        }
+    }
+
+    // Run before the node loop. Returns true if the graph was fully served by REPLAY, in which case
+    // the caller returns immediately and skips the node loop; returns false to run the node loop
+    // eagerly (and, on the capture pass, with capture recording active).
+    // @note Pass 1 is the eager warmup (JIT compile, weight pre-transpose, allocs); pass 2 captures;
+    //   pass 3+ replay. Every graph is eligible while tracing is on -- the test drives which graphs
+    //   reach here; real-model n_tokens gating is a later rung.
+    bool begin(ggml_backend_metalium_context* ctx, ggml_cgraph* cgraph) {
+        if(!g_metalium_trace_enabled) return false;
+        graph = cgraph;
+        mesh  = ctx->device->get_mesh_device().get();
+        state = &metalium_trace_exec_states()[metalium_trace_graph_signature(cgraph)];
+        state->passes++;
+
+        if(state->captured) {
+            ttnn::operations::trace::execute_trace(mesh, state->tid, std::nullopt, /*blocking*/false);
+            rebind_nodes();
+            return true;
+        }
+        if(state->passes >= 2) {
+            state->tid = ttnn::operations::trace::begin_trace_capture(mesh, std::nullopt);
+            capturing = true;
+        }
+        return false;
+    }
+
+    // Run after the node loop to close an in-progress capture. No-op unless this pass is capturing.
+    // @note Capture only RECORDS the command stream -- it does not run on device -- so we
+    //   execute_trace once here to populate this pass's outputs, matching a normal eager compute.
+    void finish() {
+        if(!capturing) return;
+        ttnn::operations::trace::end_trace_capture(mesh, state->tid, std::nullopt);
+        state->captured = true;
+        snapshot_nodes();
+        ttnn::operations::trace::execute_trace(mesh, state->tid, std::nullopt, /*blocking*/false);
+    }
+};
+
 static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
+
+    metalium_trace_dispatch trace;
+    if(trace.begin(ctx, cgraph)) {
+        return GGML_STATUS_SUCCESS;
+    }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
@@ -2809,12 +2960,12 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
 
         // std::cout << ggml_op_name(node->op) << " node " << node->name << " with address " << node->data << std::endl;
 
-        std::chrono::steady_clock::time_point __lt_t0;
+        std::chrono::steady_clock::time_point lt_t0;
         if(g_debug_flags.print_local_timing) {
             // Serialize so the elapsed time below reflects this op's host+device cost,
             // not pipelined overlap with later ops.
             tt::tt_metal::distributed::Finish(ctx->device->get_mesh_device()->mesh_command_queue());
-            __lt_t0 = std::chrono::steady_clock::now();
+            lt_t0 = std::chrono::steady_clock::now();
         }
 
         if (ctx->compiler != nullptr && ctx->compiler->tryLowerNode(ctx, node)) {
@@ -2989,7 +3140,7 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
         if(g_debug_flags.print_local_timing) {
             // Finish so the device work this op enqueued is fully drained before we stop the clock.
             tt::tt_metal::distributed::Finish(ctx->device->get_mesh_device()->mesh_command_queue());
-            double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - __lt_t0).count();
+            double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lt_t0).count();
             static std::map<std::string, std::pair<double, uint64_t>> acc; // op -> {total_us, calls}
             static uint64_t timed_ops = 0;
             auto& e = acc[ggml_op_desc(node)];
@@ -3015,6 +3166,8 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
             }
         }
     }
+
+    trace.finish();
 
     return GGML_STATUS_SUCCESS;
     GGML_UNUSED(backend);
@@ -3447,11 +3600,18 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
         ctx->devices.reserve(num_devices);
         ggml_backend_metalium_device_context * dev_ctx = new ggml_backend_metalium_device_context;
         std::shared_ptr<ttnn::MeshDevice> device;
+        // Trace region size. 0 = tt-metal DYNAMIC ALLOCATION MODE: during capture it tracks DRAM
+        // alloc/free high-water-marks so per-op alloc/free/reuse work normally and the trace buffer
+        // is sized to the reuse-optimized peak after capture. A NONZERO value reserves a fixed
+        // region up front (static mode) where capture-time buffers cannot be freed -- a graph that
+        // allocates per-op (like ours) accumulates and OOMs. So when tracing is on, use 0; else keep
+        // tt-metal's default. Read the runtime flag (a test may have flipped it on before open).
+        const size_t trace_region_size = g_metalium_trace_enabled ? 0 : DEFAULT_TRACE_REGION_SIZE;
         if(mesh_env == NULL) {
-            device = ttnn::open_mesh_device(device_id);
+            device = ttnn::open_mesh_device(device_id, DEFAULT_L1_SMALL_SIZE, trace_region_size);
         }
         else {
-            device = ttnn::distributed::open_mesh_device(mesh_shape, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 2, tt::tt_metal::DispatchCoreType::ETH);
+            device = ttnn::distributed::open_mesh_device(mesh_shape, DEFAULT_L1_SMALL_SIZE, trace_region_size, 2, tt::tt_metal::DispatchCoreType::ETH);
         }
         g_metalium_open_devices.push_back(device);
         std::atexit(ggml_metalium_close_all_devices); // track and kill on eexit

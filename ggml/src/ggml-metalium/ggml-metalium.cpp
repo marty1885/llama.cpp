@@ -2912,11 +2912,11 @@ static uint64_t metalium_trace_graph_signature(const ggml_cgraph* g) {
     uint64_t h = 1469598103934665603ull;
     auto mix = [&](uint64_t v){ h ^= v; h *= 1099511628211ull; };
     mix((uint64_t)g->n_nodes);
+    // XXX: Slow but at least guarentees a unique signature per graph
     for(int i = 0; i < g->n_nodes; i++) {
         const ggml_tensor* n = g->nodes[i];
         mix((uint64_t)n->op);
-        if(n->op == GGML_OP_UNARY) mix((uint64_t)ggml_get_unary_op(n));
-        for(int d = 0; d < GGML_MAX_DIMS; d++) mix((uint64_t)n->ne[d]);
+        mix(GGMLTensorHasher()(GGMLTensorMeta(n)));
     }
     return h;
 }
@@ -3001,7 +3001,10 @@ struct metalium_trace_dispatch {
         if(!g_metalium_trace_enabled) return false;
         graph = cgraph;
         mesh  = ctx->device->get_mesh_device().get();
-        state = &metalium_trace_exec_states()[metalium_trace_graph_signature(cgraph)];
+        // uid is OPTIONAL and some times not set. We use it if present, else fall back to a signature
+        // of the graph's topology and node ops (slow).
+        uint64_t key = cgraph->uid != 0 ? cgraph->uid : metalium_trace_graph_signature(cgraph);
+        state = &metalium_trace_exec_states()[key];
         state->passes++;
 
         if(state->captured) {

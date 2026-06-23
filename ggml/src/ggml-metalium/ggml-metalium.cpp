@@ -63,6 +63,7 @@
 #include <ttnn/operations/data_movement/repeat/repeat.hpp>
 #include <ttnn/operations/data_movement/concat/concat.hpp>
 #include <ttnn/operations/data_movement/copy/copy.hpp>
+#include <ttnn/operations/data_movement/clone/clone.hpp>
 #include <ttnn/operations/copy/typecast/typecast.hpp>
 #include <ttnn/operations/normalization/softmax/softmax.hpp>
 #include <tt-metalium/experimental/kernel_cache.hpp>
@@ -725,6 +726,8 @@ static tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tens
     return ttnn::reshape(tensor, ttnn::Shape(target_shape));
 }
 
+// Attempt to write value into the existing tensor buffer so tracing can work (needing a stable address
+// ) this API likely needs rethinking because creating a new tensor here MIGHT break tracing.
 static void ggml_metalium_store_tensor(ggml_tensor_extra_metalium* meta, tt::tt_metal::Tensor value)
 {
     const auto& cur = meta->tensor;
@@ -1428,7 +1431,7 @@ static void ggml_backend_metalium_get_rows(ggml_backend_metalium_context * ctx, 
     const ggml_tensor *idxs = dst->src[1];
     if(idxs->ne[0] == 1 && idxs->ne[1] == 1 && idxs->ne[2] == 1 && idxs->ne[3] == 1 && ggml_n_dims(dst->src[0]) == 1) {
         *dst_meta = {
-            .tensor = t,
+            .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::clone(*t, std::nullopt, std::nullopt, std::nullopt)),
         };
     }
     else {

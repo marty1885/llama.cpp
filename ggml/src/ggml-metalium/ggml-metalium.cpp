@@ -2856,43 +2856,45 @@ static std::map<uint64_t, metalium_trace_exec_state>& metalium_trace_exec_states
 
 // Tracking for tracing support
 
+struct GGMLTensorMeta
+{
+    void* data;
+    ggml_type type;
+    int64_t ne[GGML_MAX_DIMS];
+    char name[GGML_MAX_NAME];
+
+    GGMLTensorMeta(const ggml_tensor* t)
+        : data(t->data), type(t->type) {
+        memcpy(ne, t->ne, sizeof(ne));
+        strncpy(name, t->name, GGML_MAX_NAME);
+    }
+};
+
 struct GGMLTensorHasher
 {
-    size_t operator() (const ggml_tensor* t) const
+    size_t operator() (const GGMLTensorMeta& t) const
     {
         size_t h = 1469598103934665603ull;
         auto mix = [&](uint64_t v){ h ^= v; h *= 1099511628211ull; };
-        mix((uint64_t)(uintptr_t)t->data);
-        mix((uint64_t)t->type);
-        for(int d = 0; d < GGML_MAX_DIMS; d++) mix((uint64_t)t->ne[d]);
-        h ^= std::hash<std::string_view>()(std::string_view(t->name));
+        mix((uint64_t)(uintptr_t)t.data);
+        mix((uint64_t)t.type);
+        for(int d = 0; d < GGML_MAX_DIMS; d++) mix((uint64_t)t.ne[d]);
+        h ^= std::hash<std::string_view>()(std::string_view(t.name));
         return h;
     }
 };
 
 struct GGMLTensorEqual
 {
-    bool operator() (const ggml_tensor* lhs, const ggml_tensor* rhs) const
+    bool operator() (const GGMLTensorMeta& lhs, const GGMLTensorMeta& rhs) const
     {
-        bool cheap_ok = lhs->data == rhs->data && lhs->type == rhs->type
-            && memcmp(lhs->ne, rhs->ne, sizeof(lhs->ne)) == 0;
-        if(cheap_ok)
-            return true;
-        return std::string_view(lhs->name) == std::string_view(rhs->name);
+        return lhs.data == rhs.data && lhs.type == rhs.type
+            && memcmp(lhs.ne, rhs.ne, sizeof(lhs.ne)) == 0
+            && std::string_view(lhs.name) == std::string_view(rhs.name);
     }
 };
 
-static std::unordered_map<const ggml_tensor*, std::shared_ptr<tt::tt_metal::Tensor>, GGMLTensorHasher, GGMLTensorEqual> g_metalium_pinned_tensors;
-
-// Hash the GGML tensor to give us some key
-static uint64_t ggml_metalium_ggtensor_key(const ggml_tensor* t) {
-    uint64_t h = 1469598103934665603ull;
-    auto mix = [&](uint64_t v){ h ^= v; h *= 1099511628211ull; };
-    mix((uint64_t)(uintptr_t)t->data);
-    mix((uint64_t)t->type);
-    for(int d = 0; d < GGML_MAX_DIMS; d++) mix((uint64_t)t->ne[d]);
-    return h;
-}
+static std::unordered_map<GGMLTensorMeta, std::shared_ptr<tt::tt_metal::Tensor>, GGMLTensorHasher, GGMLTensorEqual> g_metalium_pinned_tensors;
 
 static void metalium_trace_release_all(ttnn::MeshDevice* mesh) {
     auto& states = metalium_trace_exec_states();
@@ -2954,36 +2956,44 @@ struct metalium_trace_dispatch {
         }
     }
 
-    // Pin every op==NONE leaf to its fixed anchor to avoid future allocation because Metal Trace
-    // neeeds a stable address
-    void pin_leaves(bool may_populate) const {
+    // Pin one op == NONE external input to its anchor. Metal Trace bakes the device handle at
+    // capture, so every input the trace reads must live at a stable handle across replays.
+    void pin_input(ggml_tensor* t, bool may_populate) const {
+        if(t->op != GGML_OP_NONE || t->extra == nullptr) return;
+        auto* m = (ggml_tensor_extra_metalium*)t->extra;
+        if(m->tensor == nullptr || m->tensor->storage_type() != tt::tt_metal::StorageType::DEVICE) return;
         auto& pins = g_metalium_pinned_tensors;
-        for(int i = 0; i < graph->n_leafs; i++) {
-            ggml_tensor* l = graph->leafs[i];
-            if(l->op != GGML_OP_NONE || l->extra == nullptr) continue;
-            auto* m = (ggml_tensor_extra_metalium*)l->extra;
-            if(m->tensor == nullptr || m->tensor->storage_type() != tt::tt_metal::StorageType::DEVICE) continue;
-            auto it = pins.find(l);
-            if(it == pins.end()) {
-                if(may_populate) pins.emplace(l, m->tensor);
-                continue;
+        auto key = GGMLTensorMeta(t);
+        auto it = pins.find(key);
+        if(it == pins.end()) {
+            if(may_populate) pins.emplace(key, m->tensor);
+            return;
+        }
+        const auto& anchor = it->second;
+        if(m->tensor.get() == anchor.get()) return; // already at the fixed address (also dedups repeats)
+        if(anchor->storage_type() != tt::tt_metal::StorageType::DEVICE
+            || m->tensor->dtype()  != anchor->dtype()
+            || m->tensor->layout() != anchor->layout()
+            || !ggml_tt_tensors_shape_equal(t, *anchor)) {
+            return; // incompatible -> leave untouched
+        }
+        ttnn::copy(*m->tensor, *anchor); // actual copy of device memory
+        m->tensor = anchor;
+    }
+
+    // Pin every external input to its fixed anchor
+    void pin_inputs(bool may_populate) const {
+        for(int i = 0; i < graph->n_nodes; i++) {
+            ggml_tensor* n = graph->nodes[i];
+            for(int j = 0; j < GGML_MAX_SRC; j++) {
+                if(n->src[j] == nullptr) continue;
+                pin_input(n->src[j], may_populate);
             }
-            const auto& anchor = it->second;
-            if(m->tensor.get() == anchor.get()) continue; // already at the fixed address
-            if(anchor->storage_type() != tt::tt_metal::StorageType::DEVICE
-                || m->tensor->dtype()  != anchor->dtype()
-                || m->tensor->layout() != anchor->layout()
-                || !ggml_tt_tensors_shape_equal(l, *anchor)) {
-                continue; // incompatible -> leave untouched
-            }
-            ttnn::copy(*m->tensor, *anchor); // actual copy of device mmoey
-            m->tensor = anchor;
         }
     }
 
-    // Run before the node loop. Returns true if the graph was fully served by REPLAY, in which case
-    // the caller returns immediately and skips the node loop; returns false to run the node loop
-    // eagerly (and, on the capture pass, with capture recording active).
+    //  Returns true if the graph was fully served by REPLAY
+    // returns false to run the node loop eagerly (and, on the capture pass, with capture recording active).
     // @note Pass 1 is the eager warmup (JIT compile, weight pre-transpose, allocs); pass 2 captures;
     //   pass 3+ replay. Every graph is eligible while tracing is on -- the test drives which graphs
     //   reach here; real-model n_tokens gating is a later rung.
@@ -2995,14 +3005,14 @@ struct metalium_trace_dispatch {
         state->passes++;
 
         if(state->captured) {
-            pin_leaves(/*may_populate*/true);   // inject freshly-fed inputs at their baked addresses
+            pin_inputs(/*may_populate*/true);   // inject freshly-fed inputs at their baked addresses
             ttnn::operations::trace::execute_trace(mesh, state->tid, std::nullopt, /*blocking*/false);
             rebind_nodes();
             return true;
         }
-        // Load leaves into their anchors BEFORE opening the capture window, so the input-injection
+        // Load inputs into their anchors BEFORE opening the capture window, so the input-injection
         // copies are NOT baked into the trace (we re-do them ourselves on every replay above).
-        pin_leaves(/*may_populate*/true);
+        pin_inputs(/*may_populate*/true);
         if(state->passes >= 2) {
             state->tid = ttnn::operations::trace::begin_trace_capture(mesh, std::nullopt);
             capturing = true;
@@ -3016,7 +3026,7 @@ struct metalium_trace_dispatch {
     void finish() {
         // Tracing off (begin() returned before binding graph): nothing to settle.
         if(!g_metalium_trace_enabled) return;
-        pin_leaves(/*may_populate*/false);
+        pin_inputs(/*may_populate*/false);
         if(!capturing) return;
         ttnn::operations::trace::end_trace_capture(mesh, state->tid, std::nullopt);
         state->captured = true;

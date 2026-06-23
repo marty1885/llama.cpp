@@ -725,6 +725,21 @@ static tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tens
     return ttnn::reshape(tensor, ttnn::Shape(target_shape));
 }
 
+static void ggml_metalium_store_tensor(ggml_tensor_extra_metalium* meta, tt::tt_metal::Tensor value)
+{
+    const auto& cur = meta->tensor;
+    if(cur != nullptr
+        && cur->storage_type()  == tt::tt_metal::StorageType::DEVICE
+        && value.storage_type() == tt::tt_metal::StorageType::DEVICE
+        && cur->dtype()         == value.dtype()
+        && cur->layout()        == value.layout()
+        && cur->logical_shape() == value.logical_shape()) {
+        ttnn::copy(value, *cur);   // write into the existing buffer -> address preserved
+    } else {
+        meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(value));
+    }
+}
+
 // In-place ops (e.g. the recurrent state cache update) write into a view of a
 // pre-allocated tensor. The lazy backend only stores whole-tensor handles, so persist
 // the result into the underlying tensor when the view covers it entirely, otherwise
@@ -740,7 +755,7 @@ static void metalium_persist_inplace_view(const ggml_tensor* node, const std::sh
         return;
     }
     ggml_tensor_extra_metalium* root_meta = (ggml_tensor_extra_metalium*)root->extra;
-    root_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(reshape_tt_tensor_into_ggml(*value, root));
+    ggml_metalium_store_tensor(root_meta, reshape_tt_tensor_into_ggml(*value, root));
 }
 
 static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_tensor* tensor);
@@ -2583,9 +2598,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     GGML_ASSERT(t.dtype() == final_type);
     GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, t));
     GGML_ASSERT(t.layout() == (tilize ? tt::tt_metal::Layout::TILE : tt::tt_metal::Layout::ROW_MAJOR));
-    *meta = ggml_tensor_extra_metalium {
-        .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(t)),
-    };
+    ggml_metalium_store_tensor(meta, std::move(t));
 }
 
 static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer,
@@ -2839,7 +2852,34 @@ static std::map<uint64_t, metalium_trace_exec_state>& metalium_trace_exec_states
 
 
 // Tracking for tracing support
-static std::unordered_map<uint64_t, std::shared_ptr<tt::tt_metal::Tensor>> g_metalium_pinned_tensors;
+
+struct GGMLTensorHasher
+{
+    size_t operator() (const ggml_tensor* t) const
+    {
+        size_t h = 1469598103934665603ull;
+        auto mix = [&](uint64_t v){ h ^= v; h *= 1099511628211ull; };
+        mix((uint64_t)(uintptr_t)t->data);
+        mix((uint64_t)t->type);
+        for(int d = 0; d < GGML_MAX_DIMS; d++) mix((uint64_t)t->ne[d]);
+        h ^= std::hash<std::string_view>()(std::string_view(t->name));
+        return h;
+    }
+};
+
+struct GGMLTensorEqual
+{
+    bool operator() (const ggml_tensor* lhs, const ggml_tensor* rhs) const
+    {
+        bool cheap_ok = lhs->data == rhs->data && lhs->type == rhs->type
+            && memcmp(lhs->ne, rhs->ne, sizeof(lhs->ne)) == 0;
+        if(cheap_ok)
+            return true;
+        return std::string_view(lhs->name) == std::string_view(rhs->name);
+    }
+};
+
+static std::unordered_map<const ggml_tensor*, std::shared_ptr<tt::tt_metal::Tensor>, GGMLTensorHasher, GGMLTensorEqual> g_metalium_pinned_tensors;
 
 // Hash the GGML tensor to give us some key
 static uint64_t ggml_metalium_ggtensor_key(const ggml_tensor* t) {
@@ -2920,10 +2960,9 @@ struct metalium_trace_dispatch {
             if(l->op != GGML_OP_NONE || l->extra == nullptr) continue;
             auto* m = (ggml_tensor_extra_metalium*)l->extra;
             if(m->tensor == nullptr || m->tensor->storage_type() != tt::tt_metal::StorageType::DEVICE) continue;
-            uint64_t key = ggml_metalium_ggtensor_key(l);
-            auto it = pins.find(key);
+            auto it = pins.find(l);
             if(it == pins.end()) {
-                if(may_populate) pins.emplace(key, m->tensor);
+                if(may_populate) pins.emplace(l, m->tensor);
                 continue;
             }
             const auto& anchor = it->second;

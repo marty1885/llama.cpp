@@ -763,12 +763,17 @@ static void metalium_persist_inplace_view(const ggml_tensor* node, const std::sh
 }
 
 static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_tensor* tensor);
+static tt::tt_metal::Tensor ggml_metalium_row_unfold(const tt::tt_metal::Tensor& folded);
 std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tensor)
 {
     ggml_tensor_extra_metalium* meta = static_cast<ggml_tensor_extra_metalium*>(tensor->extra);
-    // Row-folded tensors are owned entirely by the compiler's matchers and MUST NOT go through
-    // the regular GGML path,they need special handling.
-    GGML_ASSERT((meta == nullptr || !meta->is_row_folded()) && "Cannot view a row-folded tensor, GGML Metalium backend internal bug!");
+    // A consumer that needs the canonical layout of a row-folded tensor (e.g. ggml_concat consuming
+    // the token-shift cache) gets it unfolded on demand.
+    // XXX: The compiler SHOULD guarantee that the row-folded tensor doesn't have downstream
+    // consumers that would be affected by the unfolding, but aparantly there are
+    if(meta != nullptr && meta->is_row_folded()) {
+        return std::make_shared<tt::tt_metal::Tensor>(ggml_metalium_row_unfold(*meta->row_folded));
+    }
     auto res = realize_ggml_view_impl(tensor);
     if(!ggml_tt_tensors_shape_equal(tensor, *res)) {
         std::cout << "FATAL ERROR: Shape mismatch between TTNN and GGML after view op " << ggml_op_name(tensor->op) << "\n"
@@ -1487,9 +1492,15 @@ static void ggml_backend_metalium_get_rows(ggml_backend_metalium_context * ctx, 
         const ggml_tensor* root = dst->src[0];
         while(root->view_src != nullptr) { root = root->view_src; }
         GGML_ASSERT(root->ne[1] == 1 && "folded cache gather only supports n_rows==1 for now");
-        *dst_meta = {
-            .tensor = std::make_shared<tt::tt_metal::Tensor>(ggml_metalium_row_unfold(*folded->row_folded)),
-        };
+        // Emit a folded SNAPSHOT of the cache. aliasing the live cache buffer would let a
+        // lazy consumer read a generation that a later in-place cache write has already clobbered.
+        // When folded state is disabled, unfold eagerly to the canonical flat-strip WKV layout.
+        if(ttggml::wkv7_folded_state()) {
+            dst_meta->row_folded = std::make_shared<tt::tt_metal::Tensor>(
+                ttnn::clone(*folded->row_folded, std::nullopt, std::nullopt, std::nullopt));
+        } else {
+            dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ggml_metalium_row_unfold(*folded->row_folded));
+        }
         return;
     }
 
@@ -2267,8 +2278,10 @@ static void ggml_backend_metalium_rwkv_wkv7(ggml_backend_metalium_context * ctx,
     std::shared_ptr<tt::tt_metal::Tensor> state;
     if (ttggml::wkv7_folded_state()) {
         if (ggml_tensor_extra_metalium* folded = ggml_metalium_resolve_folded(dst->src[6])) {
+            // Fast path: the state gather propagated the folded handle, consume it with zero relayout.
             state = folded->row_folded;
         } else {
+            // Fallback: state is canonical here, fold on entry (one relayout per WKV7 call).
             state = std::make_shared<tt::tt_metal::Tensor>(ggml_metalium_row_fold(*realize_ggml_view(dst->src[6])));
         }
     } else {
@@ -3534,12 +3547,16 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
         ggml_tensor_extra_metalium* meta = (ggml_tensor_extra_metalium*)node->extra;
         // std::cout << "Executed " << ggml_op_desc(node) << " with address " << node->data << " and shape " << meta->tensor->logical_shape() << ", GGML wants " << node->ne[0] << " " << node->ne[1] << " " << node->ne[2] << " " << node->ne[3] << std::endl;
         GGML_ASSERT(meta != NULL);
-        GGML_ASSERT(meta->tensor != NULL);
-        GGML_ASSERT(meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE);
-        if(!ggml_tt_tensors_shape_equal(node, *meta->tensor)) {
-            fmt::println(stderr, "Mismatched tensor shapes for node '{}' ({}): GGML wants [{}, {}, {}, {}], TTNN generates {}\n"
-                , node->name, ggml_op_name(node->op), node->ne[0], node->ne[1], node->ne[2], node->ne[3], meta->tensor->logical_shape());
-            abort();
+        // A row-folded result carries its device data in `row_folded` (its `tensor` is intentionally
+        // null); its logical shape differs from the ggml node, so skip the canonical post-checks.
+        if(!meta->is_row_folded()) {
+            GGML_ASSERT(meta->tensor != NULL);
+            GGML_ASSERT(meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE);
+            if(!ggml_tt_tensors_shape_equal(node, *meta->tensor)) {
+                fmt::println(stderr, "Mismatched tensor shapes for node '{}' ({}): GGML wants [{}, {}, {}, {}], TTNN generates {}\n"
+                    , node->name, ggml_op_name(node->op), node->ne[0], node->ne[1], node->ne[2], node->ne[3], meta->tensor->logical_shape());
+                abort();
+            }
         }
 
         if(g_debug_flags.print_local_timing) {

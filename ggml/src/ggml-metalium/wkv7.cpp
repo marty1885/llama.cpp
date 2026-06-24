@@ -1,6 +1,7 @@
 #include "wkv7.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
@@ -24,6 +25,14 @@ using namespace ttnn;
 // Dispatch (there are 2 kernels)
 //   decodeL  -> sequential per-token. Faster for decode
 //   chunked  -> Higher throughput large decode
+
+// Switch the WKV7 state input/reader between the canonical flat-strip layout (default) and the
+// row-folded layout [1,G,Es/32,32]. Must agree across invoke() (G derivation), create() (reader
+// define) and the ggml-metalium handler (which folds/passes the state accordingly).
+bool wkv7_folded_state() {
+    static const bool v = std::getenv("GGML_METALIUM_WKV7_FOLDED_STATE") != nullptr;
+    return v;
+}
 
 namespace {
 constexpr uint32_t TW = 32, TH = 32;
@@ -106,7 +115,8 @@ wkv7_device::RWKVWKV7DeviceOperation::invoke(
     const uint32_t S = rs[-1];
     const uint32_t H = rs[-2];
     const uint32_t T = rs[-3];
-    const uint32_t G = state.logical_shape()[-2];
+    // Canonical state TTNN [1,1,G,Es] -> G at [-2]; folded state TTNN [1,G,Es/32,32] -> G at [-3].
+    const uint32_t G = wkv7_folded_state() ? state.logical_shape()[-3] : state.logical_shape()[-2];
     const uint32_t L = T / G;
     return {
         operation_attributes_t{
@@ -195,8 +205,10 @@ wkv7_device::program::WKV7ProgramFactory::create(
     TensorAccessorArgs(*st_buf).append_to(rct);
     TensorAccessorArgs(*out_buf).append_to(wct);
 
+    std::map<std::string, std::string> reader_defines;
+    if (wkv7_folded_state()) reader_defines["WKV7_STATE_FOLDED"] = "1";
     KernelHandle reader = CreateMetaliumKernel(prog, decode ? "wkv7_decodeL_reader" : "wkv7_reader", core, DataMovementConfig{
-        .processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default, .compile_args = rct});
+        .processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default, .compile_args = rct, .defines = reader_defines});
     KernelHandle writer = CreateMetaliumKernel(prog, "wkv7_writer", core, DataMovementConfig{
         .processor = DataMovementProcessor::RISCV_1, .noc = NOC::RISCV_1_default, .compile_args = wct});
 

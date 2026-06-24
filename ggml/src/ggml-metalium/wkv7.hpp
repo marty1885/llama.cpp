@@ -100,6 +100,11 @@ struct RWKVWKV7DeviceOperation {
 
 } // namespace wkv7_device
 
+// True when WKV7 consumes the row-folded state layout [1,G,Es/32,32] instead of the canonical
+// flat-strip. Gated by GGML_METALIUM_WKV7_FOLDED_STATE; the ggml-metalium handler must fold/pass
+// the state to match.
+bool wkv7_folded_state();
+
 ttnn::Tensor rwkv_wkv7(
     const Tensor& r,
     const Tensor& w,

@@ -4,7 +4,6 @@ namespace { constexpr uint32_t c_natstage = 21, c_selstage = 22;
             constexpr uint32_t c_tri = 7, c_maskSL = 19, c_maskLI = 20, c_ident = 28; }
 
 void kernel_main() {
-    // -----------------------------------------------------------------------
     // Runtime args (get_arg_val indices 0..17)
     //
     //  [0]  H          - number of heads per sequence
@@ -22,7 +21,6 @@ void kernel_main() {
     //  [15] nc         - number of chunks per sequence (= ceil(Lreal / cl))
     //  [16] inst_start - first instance index assigned to this core
     //  [17] inst_end   - one-past-last instance index assigned to this core
-    // -----------------------------------------------------------------------
     uint32_t H  = get_arg_val<uint32_t>(0);
     uint32_t L  = get_arg_val<uint32_t>(1);     // = cl (on-device chunk size, always 32)
     uint32_t St = get_arg_val<uint32_t>(2);
@@ -117,6 +115,30 @@ void kernel_main() {
                 if (c == 0) {
                     cb_reserve_back(c_natstage, NS);
                     uint32_t wp = get_write_ptr(c_natstage);
+#ifdef WKV7_STATE_FOLDED
+                    // Row-folded state [1,G,Es/32,32]: head h's [S,S] is dense (no 32x flat-strip pad).
+                    // The fold is a logical reshape; physical bytes stay face-tiled. For dest tile (it,jt)
+                    // row r, the source folded logical row is h*(NS*32) + it*(St*32) + 2r + jt (the fold's
+                    // 2-row interleave: state row i -> folded rows 2i, 2i+1). Read its full 32 cols (both
+                    // col-faces). TPS = NS*H = tiles per sequence in the folded buffer.
+                    const uint32_t TPS = NS * H;
+                    for (uint32_t it = 0; it < St; it++) for (uint32_t jt = 0; jt < St; jt++) {
+                        uint32_t tilebase = wp + (it * St + jt) * tb;
+                        for (uint32_t r = 0; r < 32; r++) {
+                            uint32_t flr      = h * (NS * 32) + it * (St * 32) + 2 * r + jt;
+                            uint32_t src_page = sq * TPS + flr / 32;
+                            uint32_t sr       = flr % 32;
+                            uint32_t ssoff0   = (sr / 16) * 1024 + (sr % 16) * 32;
+                            uint32_t ssoff1   = ssoff0 + 512;
+                            uint32_t doff0    = (r / 16) * 1024 + (r % 16) * 32;
+                            uint32_t doff1    = doff0 + 512;
+                            noc_async_read(st_acc.get_noc_addr(src_page, ssoff0), tilebase + doff0, 32);
+                            noc_async_read(st_acc.get_noc_addr(src_page, ssoff1), tilebase + doff1, 32);
+                        }
+                    }
+#else
+                    // Canonical flat-strip state [Gpad, S*S*H]: head h's [S,S] scattered across
+                    // h*(NS*32)+i*St+jt tiles, only row srow=sq%32 valid per tile (32x pad waste).
                     const uint32_t tpr  = NS * 32 * H;          // tiles per flat-strip row (= S*S*H/32)
                     const uint32_t srow = sq % 32;              // source intra-tile row
                     const uint32_t soff0 = (srow / 16) * 1024 + (srow % 16) * 32;  // src face (srow/16,0)
@@ -132,6 +154,7 @@ void kernel_main() {
                             noc_async_read(st_acc.get_noc_addr(src_page, soff1), tilebase + doff1, 32);
                         }
                     }
+#endif
                     noc_async_read_barrier();
                     cb_push_back(c_natstage, NS);
                 }

@@ -174,7 +174,7 @@ static void dump_ggml_tensor_meta(const ggml_tensor* ggtensor)
     }
 }
 
-static ttnn::DeviceComputeKernelConfig make_compute_kernel_config(ttnn::IDevice* device)
+ttnn::DeviceComputeKernelConfig make_compute_kernel_config(ttnn::IDevice* device)
 {
     ttnn::DeviceComputeKernelConfig cfg;
     if (device->arch() == tt::ARCH::WORMHOLE_B0 || device->arch() == tt::ARCH::BLACKHOLE) {
@@ -2261,6 +2261,20 @@ static void ggml_backend_metalium_rwkv_wkv7(ggml_backend_metalium_context * ctx,
 
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
 
+    // State (src[6]) layout depends on the gate. Default: canonical flat-strip (realize as-is). Folded:
+    // pass the cache's folded tensor straight through (no relayout), else fold a canonical state on entry
+    // (e.g. the op test) so the reader always sees [1,G,Es/32,32].
+    std::shared_ptr<tt::tt_metal::Tensor> state;
+    if (ttggml::wkv7_folded_state()) {
+        if (ggml_tensor_extra_metalium* folded = ggml_metalium_resolve_folded(dst->src[6])) {
+            state = folded->row_folded;
+        } else {
+            state = std::make_shared<tt::tt_metal::Tensor>(ggml_metalium_row_fold(*realize_ggml_view(dst->src[6])));
+        }
+    } else {
+        state = realize_ggml_view(dst->src[6]);
+    }
+
     // ggml src order: r,w,k,v,a,b,state -> realize each to its ggml-native device tensor.
     auto res = ttggml::rwkv_wkv7(
         *realize_ggml_view(dst->src[0]),   // r
@@ -2269,7 +2283,7 @@ static void ggml_backend_metalium_rwkv_wkv7(ggml_backend_metalium_context * ctx,
         *realize_ggml_view(dst->src[3]),   // v
         *realize_ggml_view(dst->src[4]),   // a
         *realize_ggml_view(dst->src[5]),   // b
-        *realize_ggml_view(dst->src[6]));  // state
+        *state);                           // state
 
     *dst_meta = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(res)),
@@ -3138,6 +3152,11 @@ static uint64_t metalium_trace_graph_signature(const ggml_cgraph* g) {
     return h;
 }
 
+// Stable identity for a cgraph: uid if present, else the (slow) topology signature.
+uint64_t metalium_graph_key(const ggml_cgraph* g) {
+    return g->uid != 0 ? g->uid : metalium_trace_graph_signature(g);
+}
+
 /// TTNN capture/replay for a single graph_compute call
 struct metalium_trace_dispatch {
     ggml_cgraph* graph = nullptr;
@@ -3314,6 +3333,12 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
         return GGML_STATUS_SUCCESS;
     }
 
+    // Recognise multi-node fusions once for this graph (only the eager / trace-capture passes reach
+    // here; replay returned above). Populates the inert set + fusion roots consulted in the loop.
+    if(ctx->compiler != nullptr) {
+        ctx->compiler->analyzeGraph(cgraph);
+    }
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
 
@@ -3329,6 +3354,12 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
 
         // no tensor -> no allocated TTNN tensor
         if(ggml_nelements(node) == 0) {
+            continue;
+        }
+
+        // Folded into a fusion root (e.g. the SUB/REPEAT/MUL of a lerp): its work is subsumed by the
+        // root, so skip it -- don't execute and don't let it be baked into a trace capture.
+        if(ctx->compiler != nullptr && ctx->compiler->isInert(node)) {
             continue;
         }
 

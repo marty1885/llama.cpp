@@ -8,6 +8,7 @@
 
 #include <ttnn/tensor/tensor.hpp>
 #include <ttnn/device.hpp>
+#include <ttnn/operations/core/compute_kernel/compute_kernel_config.hpp>
 
 #include "ggml.h"
 
@@ -34,6 +35,14 @@ struct ggml_backend_metalium_context {
 
 // Materialises the TTNN tensor backing a (possibly lazily-viewed) ggml tensor.
 std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tensor);
+
+// Stable identity for a cgraph: its uid when set, else a topology+shape signature. The graph
+// compiler caches its per-graph fusion plan on this key (the same key the trace layer uses).
+uint64_t metalium_graph_key(const ggml_cgraph* cgraph);
+
+// The matmul math-fidelity config the backend uses for all GEMMs (HiFi4 on Wormhole). Fusions that
+// emit their own matmul/linear must reuse this so accuracy matches the unfused path.
+ttnn::DeviceComputeKernelConfig make_compute_kernel_config(ttnn::IDevice* device);
 
 inline void ggml_metalium_op_src_sanity_check(const ggml_tensor * node, int idx) {
     GGML_ASSERT(node->src[idx] != NULL);

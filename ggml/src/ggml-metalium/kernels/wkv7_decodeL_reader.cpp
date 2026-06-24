@@ -1,39 +1,10 @@
 #include <cstdint>
 
-// WKV7 decode-L reader kernel
-// ============================================================================
-// PURPOSE: Feed the DECODE-L WKV7 compute kernel with all input data it needs
-// for a sequential per-token recurrence pass (1 <= L <= 32 tokens, P=1).
-//
-// WHAT IS WKV7: RWKV-7 linear-attention operator. Per head the recurrent state
-// is an [S,S] matrix (S=64 head size). Tiles are 32x32 bf16.  Key quantities:
-//   St  (tiles per head dim)       = S/32 = 2
-//   NS  (state tiles per head)     = St*St = 4   (one full [S,S] matrix)
-//   IC  (total instances)          = G*H   (G groups, H heads per group)
-//   inst = sq*H + h  selects (sequence index sq, head h).
-//
-// WHAT THIS READER STREAMS (per instance, in order):
-//   1. S0 state seed   -- NS=4 tiles read once via a SUB-PAGE GATHER from the
-//                         FLAT-STRIP buffer.  Lands in CB c_natstage.
-//   2. Per token t=0..L-1, six input tensors [a, w, k, v, r, b] in that order
-//                      -- St tiles each, placed at dest row 0 so the compute
-//                         kernel can run its single-token extract verbatim each
-//                         iteration.  Also lands in CB c_natstage.
-//
-// TILE FACE LAYOUT (bf16 32x32 tile, 4 faces of 16x16, face-major storage):
-//   byte_offset(row r, col c) = ((r/16)*2 + c/16)*512 + (r%16)*32 + (c%16)*2
-// A single head-dim column-block of 32 dims sits in two column-faces 512 bytes
-// apart.  Within a source tile the reader extracts exactly one intra-tile row
-// (32 elements = 64 bytes) as two 32-byte NOC reads: face (r/16, 0) and face
-// (r/16, 1), offsets doff0 and doff1 = doff0 + 512.
-
+// WKV7 decodeL reader kernel
 namespace { constexpr uint32_t c_natstage = 21, c_selstage = 22;
             constexpr uint32_t c_tri = 7, c_maskSL = 19, c_maskLI = 20, c_ident = 28; }
 
 void kernel_main() {
-    // -----------------------------------------------------------------------
-    // Runtime arguments (get_arg_val indices)
-    // -----------------------------------------------------------------------
     // 0  H          : number of heads per group
     // 1  L          : token count for this decode call (1..32)
     // 2  St         : tiles per head dimension = S/32 = 2
@@ -73,16 +44,12 @@ void kernel_main() {
     const uint32_t ntok = L * Ht * St;
     // NS: number of [S,S] state tiles per head = St * St = 4
     const uint32_t NS  = St * St;
-
-    // -----------------------------------------------------------------------
-    // TensorAccessors -- TWO only: input accessor (index 0) and state accessor
-    // -----------------------------------------------------------------------
     // CONVENTION: ggml wkv7.cpp appends exactly two accessor arg-blocks into the
     // compile-time args: input[0] first, then state.  All 6 input tensors share
     // the single input accessor (they differ only in their runtime DRAM base
     // address in_addr[inp]).
     //
-    // NOTE -- DO NOT construct a 3rd accessor here:
+    // NOTE: DO NOT construct a 3rd accessor here:
     //   This build does NOT append a "sel" or "cst" TensorAccessorArgs block.
     //   If a TensorAccessorArgs<IN_NA+ST_NA> were constructed it would read
     //   compile-time args past the end of what was provided, causing the same
@@ -111,9 +78,7 @@ void kernel_main() {
         const uint32_t soff0 = (lh / 16) * 1024 + (lh % 16) * 32;
         const uint32_t soff1 = soff0 + 512;
 
-        // -------------------------------------------------------------------
         // PHASE 1 -- S0 STATE SEED: sub-page gather from the flat-strip buffer
-        // -------------------------------------------------------------------
         // The state buffer has layout [Gpad, S*S*H] stored as a FLAT STRIP: one
         // long sequence of tiles, NOT arranged as per-head tile-blocks (STDIRECT).
         //
@@ -142,6 +107,30 @@ void kernel_main() {
         //   Source page index for dest row r: i = it*32 + r.
         cb_reserve_back(c_natstage, NS);
         { uint32_t wp = get_write_ptr(c_natstage);
+#ifdef WKV7_STATE_FOLDED
+          // Row-folded state [1,G,Es/32,32]: head h's [S,S] is dense (no 32x flat-strip pad). The fold
+          // is a logical reshape; physical bytes stay face-tiled. For dest tile (it,jt) row r, the source
+          // folded logical row is h*(NS*32) + it*(St*32) + 2r + jt (the fold's 2-row interleave: state
+          // row i -> folded rows 2i, 2i+1); read its full 32 cols (both col-faces). TPS = NS*H = tiles
+          // per sequence in the folded buffer.
+          const uint32_t TPS = NS * H;
+          for (uint32_t it = 0; it < St; it++) for (uint32_t jt = 0; jt < St; jt++) {
+              uint32_t tilebase = wp + (it * St + jt) * tb;
+              for (uint32_t r = 0; r < 32; r++) {
+                  uint32_t flr      = h * (NS * 32) + it * (St * 32) + 2 * r + jt;  // folded logical row
+                  uint32_t src_page = sq * TPS + flr / 32;
+                  uint32_t sr       = flr % 32;
+                  uint32_t ssoff0   = (sr / 16) * 1024 + (sr % 16) * 32;
+                  uint32_t ssoff1   = ssoff0 + 512;
+                  uint32_t doff0    = (r / 16) * 1024 + (r % 16) * 32;
+                  uint32_t doff1    = doff0 + 512;
+                  noc_async_read(st_acc.get_noc_addr(src_page, ssoff0), tilebase + doff0, 32);
+                  noc_async_read(st_acc.get_noc_addr(src_page, ssoff1), tilebase + doff1, 32);
+              }
+          }
+#else
+          // Canonical flat-strip state [Gpad, S*S*H]: head h's [S,S] scattered across source tiles,
+          // only intra-tile row srow=sq%32 valid (32x pad waste).
           const uint32_t tpr   = NS * 32 * H;            // tiles per flat-strip row (= S*S*H/32)
           const uint32_t srow  = sq % 32;                // source intra-tile row
           const uint32_t ssoff0 = (srow / 16) * 1024 + (srow % 16) * 32;  // src face (srow/16,0)
@@ -149,24 +138,19 @@ void kernel_main() {
           for (uint32_t it = 0; it < St; it++) for (uint32_t jt = 0; jt < St; jt++) {
               uint32_t tilebase = wp + (it * St + jt) * tb;
               for (uint32_t r = 0; r < 32; r++) {
-                  // i: absolute source row index within head h's strip block for dest row r
                   uint32_t i = it * 32 + r;
-                  // src_page: flat-strip tile index for element row i, col-tile jt of head h
                   uint32_t src_page = (sq / 32) * tpr + h * (NS * 32) + i * St + jt;
-                  // doff0/doff1: dest byte offsets for the two column-faces of dest row r
                   uint32_t doff0 = (r / 16) * 1024 + (r % 16) * 32;
                   uint32_t doff1 = doff0 + 512;
-                  // Two 32-byte reads: left column-face then right column-face of source row srow
                   noc_async_read(st_acc.get_noc_addr(src_page, ssoff0), tilebase + doff0, 32);
                   noc_async_read(st_acc.get_noc_addr(src_page, ssoff1), tilebase + doff1, 32);
               }
           }
+#endif
           noc_async_read_barrier(); }
         cb_push_back(c_natstage, NS);
 
-        // -------------------------------------------------------------------
-        // PHASE 2 -- PER-TOKEN INPUTS: stream [a, w, k, v, r, b] for t=0..L-1
-        // -------------------------------------------------------------------
+        // PHASE 2: PER-TOKEN INPUTS: stream [a, w, k, v, r, b] for t=0..L-1
         // For each token t, read all 6 inputs in order (inp=0..5).  Each input
         // contributes St=2 tiles placed at dest row 0 in c_natstage, so the
         // compute kernel sees every token's data in the same tile-row position and

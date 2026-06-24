@@ -43,6 +43,7 @@
 #include <chrono>
 #include <map>
 #include <optional>
+#include <unordered_set>
 #include <string_view>
 #include <ttnn/core.hpp>
 #include <ttnn/device.hpp>
@@ -201,6 +202,7 @@ struct ggml_backend_metalium_debug_flags {
     bool experimental_ops = false;          // Enable experimental ops that is known to cause trouble
     bool disable_graph_compiler = false;    // Skip the graph compiler entirely; fall back to native per-op dispatch
     bool print_local_timing = false;        // Per-op host+device timing (Finish after each op). Separate from Tracy.
+    bool print_trace_mem = false;           // DRAM attribution under tracing: pinned intermediates vs IO vs trace cmd buffers
 };
 
 static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
@@ -222,7 +224,8 @@ static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
         .disable_program_cache = parse_env("GGML_METALIUM_DISABLE_PROGRAM_CACHE"),
         .experimental_ops = parse_env("GGML_METALIUM_EXPERIMENTAL_OPS"),
         .disable_graph_compiler = parse_env("GGML_METALIUM_DISABLE_GRAPH_COMPILER"),
-        .print_local_timing = parse_env("GGML_METALIUM_PRINT_LOCAL_TIMING")
+        .print_local_timing = parse_env("GGML_METALIUM_PRINT_LOCAL_TIMING"),
+        .print_trace_mem = parse_env("GGML_METALIUM_TRACE_MEM")
     };
 }();
 
@@ -3015,6 +3018,11 @@ struct metalium_trace_exec_state {
     // @note The backend allocates a fresh node->extra every pass, so replay must re-bind these;
     //   see metalium_trace_dispatch::rebind_nodes / snapshot_nodes.
     std::vector<std::shared_ptr<tt::tt_metal::Tensor>> node_tensors;
+
+    // Lazily-memoized replay plan
+    bool replay_plan_built = false;
+    std::vector<std::pair<ggml_tensor*, std::shared_ptr<tt::tt_metal::Tensor>>> pin_plan;  // input node + baked anchor
+    std::vector<std::pair<int, std::shared_ptr<tt::tt_metal::Tensor>>> rebind_plan;        // boundary node idx + tensor
 };
 static std::map<uint64_t, metalium_trace_exec_state>& metalium_trace_exec_states() {
     static std::map<uint64_t, metalium_trace_exec_state> m;
@@ -3076,6 +3084,47 @@ static void metalium_trace_release_all(ttnn::MeshDevice* mesh) {
     g_metalium_pinned_tensors.clear();
 }
 
+static void ggml_metalium_trace_mem_report(ttnn::MeshDevice* mesh, const char* tag) {
+    if(!g_debug_flags.print_trace_mem) return;
+
+    std::unordered_set<uint64_t> seen;
+    auto buf_bytes = [&](const std::shared_ptr<tt::tt_metal::Tensor>& t) -> uint64_t {
+        if(!t || t->storage_type() != tt::tt_metal::StorageType::DEVICE) return 0;
+        try {
+            uint64_t addr = (uint64_t)t->buffer()->address();
+            if(!seen.insert(addr).second) return 0; // already counted this buffer
+            return (uint64_t)t->buffer()->size();
+        } catch(...) { return 0; }
+    };
+
+    auto& states = metalium_trace_exec_states();
+    size_t n_traces = 0, n_nodes_pinned = 0;
+    uint64_t node_bytes = 0;
+    for(auto& kv : states) {
+        if(!kv.second.captured) continue;
+        n_traces++;
+        for(auto& nt : kv.second.node_tensors) {
+            if(nt) { n_nodes_pinned++; node_bytes += buf_bytes(nt); }
+        }
+    }
+    uint64_t io_bytes = 0;
+    for(auto& kv : g_metalium_pinned_tensors) io_bytes += buf_bytes(kv.second);
+
+    uint64_t dram_alloc = 0, dram_free = 0;
+    try {
+        auto s = mesh->allocator()->get_statistics(tt::tt_metal::BufferType::DRAM);
+        dram_alloc = s.total_allocated_bytes;
+        dram_free  = s.total_free_bytes;
+    } catch(...) {}
+
+    const double MB = 1024.0 * 1024.0;
+    fprintf(stderr,
+        "[trace-mem %-10s] DRAM alloc=%.1fMB free=%.1fMB | traces=%zu | "
+        "pinned-intermediates: nodes=%zu bytes=%.1fMB | pinned-IO: bytes=%.1fMB\n",
+        tag, dram_alloc / MB, dram_free / MB, n_traces,
+        n_nodes_pinned, node_bytes / MB, io_bytes / MB);
+}
+
 static uint64_t metalium_trace_graph_signature(const ggml_cgraph* g) {
     uint64_t h = 1469598103934665603ull;
     auto mix = [&](uint64_t v){ h ^= v; h *= 1099511628211ull; };
@@ -3118,26 +3167,21 @@ struct metalium_trace_dispatch {
         state->node_tensors.assign(graph->n_nodes, nullptr);
         for(int i = 0; i < graph->n_nodes; i++) {
             ggml_tensor* n = graph->nodes[i];
-            if(n->extra != nullptr) {
-                state->node_tensors[i] = ((ggml_tensor_extra_metalium*)n->extra)->tensor;
-            }
+            if(n->extra == nullptr) continue;
+
+            // only pin IO boundry nodes
+            if((n->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) == 0) continue;
+            state->node_tensors[i] = ((ggml_tensor_extra_metalium*)n->extra)->tensor;
         }
     }
 
-    // Pin one op == NONE external input to its anchor. Metal Trace bakes the device handle at
-    // capture, so every input the trace reads must live at a stable handle across replays.
-    void pin_input(ggml_tensor* t, bool may_populate) const {
-        if(t->op != GGML_OP_NONE || t->extra == nullptr) return;
+    // Copy t's freshly-fed device tensor into its baked anchor so the trace reads it at the stable
+    // address. Pointer-equal (already there) or incompatible -> no-op. No map lookup: the anchor is
+    // supplied by the caller (the cached plan), so this is the per-replay hot path.
+    static void apply_pin(ggml_tensor* t, const std::shared_ptr<tt::tt_metal::Tensor>& anchor) {
+        if(t->extra == nullptr) return;
         auto* m = (ggml_tensor_extra_metalium*)t->extra;
         if(m->tensor == nullptr || m->tensor->storage_type() != tt::tt_metal::StorageType::DEVICE) return;
-        auto& pins = g_metalium_pinned_tensors;
-        auto key = GGMLTensorMeta(t);
-        auto it = pins.find(key);
-        if(it == pins.end()) {
-            if(may_populate) pins.emplace(key, m->tensor);
-            return;
-        }
-        const auto& anchor = it->second;
         if(m->tensor.get() == anchor.get()) return; // already at the fixed address (also dedups repeats)
         if(anchor->storage_type() != tt::tt_metal::StorageType::DEVICE
             || m->tensor->dtype()  != anchor->dtype()
@@ -3149,12 +3193,65 @@ struct metalium_trace_dispatch {
         m->tensor = anchor;
     }
 
+    // Pin one op == NONE external input to its anchor. Metal Trace bakes the device handle at
+    // capture, so every input the trace reads must live at a stable handle across replays. Resolves
+    // (and on first sight populates) the anchor via the global map -- the SLOW pre-capture path.
+    void pin_input(ggml_tensor* t, bool may_populate) const {
+        if(t->op != GGML_OP_NONE || t->extra == nullptr) return;
+        auto* m = (ggml_tensor_extra_metalium*)t->extra;
+        if(m->tensor == nullptr || m->tensor->storage_type() != tt::tt_metal::StorageType::DEVICE) return;
+        auto& pins = g_metalium_pinned_tensors;
+        auto key = GGMLTensorMeta(t);
+        auto it = pins.find(key);
+        if(it == pins.end()) {
+            if(may_populate) pins.emplace(key, m->tensor);
+            return;
+        }
+        apply_pin(t, it->second);
+    }
+
+    // Build the cached replay plan once from the captured graph: the op==NONE device inputs that have
+    // a resolved anchor (deduped by tensor) + the boundary node rebinds snapshotted at capture. This
+    // is exactly the work pin_inputs(true)+rebind_nodes do, recorded so replay skips the n_nodes walk.
+    void build_replay_plan() const {
+        state->pin_plan.clear();
+        state->rebind_plan.clear();
+        std::unordered_set<const ggml_tensor*> seen;
+        for(int i = 0; i < graph->n_nodes; i++) {
+            ggml_tensor* n = graph->nodes[i];
+            for(int j = 0; j < GGML_MAX_SRC; j++) {
+                ggml_tensor* s = n->src[j];
+                if(s == nullptr || s->op != GGML_OP_NONE || s->extra == nullptr) continue;
+                if(!seen.insert(s).second) continue;
+                auto* m = (ggml_tensor_extra_metalium*)s->extra;
+                if(m->tensor == nullptr || m->tensor->storage_type() != tt::tt_metal::StorageType::DEVICE) continue;
+                auto it = g_metalium_pinned_tensors.find(GGMLTensorMeta(s));
+                if(it == g_metalium_pinned_tensors.end()) continue;
+                state->pin_plan.emplace_back(s, it->second);
+            }
+        }
+        for(int i = 0; i < (int)state->node_tensors.size(); i++) {
+            if(state->node_tensors[i]) state->rebind_plan.emplace_back(i, state->node_tensors[i]);
+        }
+        state->replay_plan_built = true;
+    }
+
+    // Per-replay hot path: inject inputs and rebind boundary nodes from the cached plan, no walk.
+    void replay_inject() const { for(auto& pr : state->pin_plan) apply_pin(pr.first, pr.second); }
+    // FIXME: Im theory we can avoid rebind. But welp. fix later
+    void replay_rebind() const {
+        for(auto& pr : state->rebind_plan) {
+            ggml_tensor* n = graph->nodes[pr.first];
+            if(n->extra != nullptr) ((ggml_tensor_extra_metalium*)n->extra)->tensor = pr.second;
+        }
+    }
+
     // Pin every external input to its fixed anchor
     void pin_inputs(bool may_populate) const {
         for(int i = 0; i < graph->n_nodes; i++) {
             ggml_tensor* n = graph->nodes[i];
             for(int j = 0; j < GGML_MAX_SRC; j++) {
-                if(n->src[j] == nullptr) continue;
+                if(n->src[j] == nullptr) break;
                 pin_input(n->src[j], may_populate);
             }
         }
@@ -3176,9 +3273,11 @@ struct metalium_trace_dispatch {
         state->passes++;
 
         if(state->captured) {
-            pin_inputs(/*may_populate*/true);   // inject freshly-fed inputs at their baked addresses
+            // Lazy init to reduce overhead setting up reply
+            if(!state->replay_plan_built) build_replay_plan();
+            replay_inject();                    // inject freshly-fed inputs at their baked addresses
             ttnn::operations::trace::execute_trace(mesh, state->tid, std::nullopt, /*blocking*/false);
-            rebind_nodes();
+            replay_rebind();
             return true;
         }
         // Load inputs into their anchors BEFORE opening the capture window, so the input-injection
@@ -3203,6 +3302,7 @@ struct metalium_trace_dispatch {
         state->captured = true;
         snapshot_nodes();
         ttnn::operations::trace::execute_trace(mesh, state->tid, std::nullopt, /*blocking*/false);
+        ggml_metalium_trace_mem_report(mesh, "captured");
     }
 };
 

@@ -82,7 +82,6 @@
 #include <vector>
 
 #include "rope.hpp"
-#include "mul_mat.hpp"
 #include "soft_max.hpp"
 #include "wkv7.hpp"
 
@@ -198,7 +197,6 @@ static ttnn::DeviceComputeKernelConfig make_compute_kernel_config(ttnn::IDevice*
 struct ggml_backend_metalium_debug_flags {
     bool print_rejected_ops = false;        // Print ops that the backend rejects
     bool print_view = false;                // Print details when a VIEW op is being realized
-    bool cache_mm_transpose = false;        // Cache the transpose kernel for matmul
     bool disable_program_cache = false;     // Disables the program cache
     bool experimental_ops = false;          // Enable experimental ops that is known to cause trouble
     bool disable_graph_compiler = false;    // Skip the graph compiler entirely; fall back to native per-op dispatch
@@ -221,7 +219,6 @@ static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
     return ggml_backend_metalium_debug_flags {
         .print_rejected_ops = parse_env("GGML_METALIUM_PRINT_REJECTED_OPS"),
         .print_view = parse_env("GGML_METALIUM_PRINT_VIEW"),
-        .cache_mm_transpose = parse_env("GGML_METALIUM_CACHE_MM_TRANSPOSE"), // GGML uses pre-transposed weights. Remove this flag when TT implements it
         .disable_program_cache = parse_env("GGML_METALIUM_DISABLE_PROGRAM_CACHE"),
         .experimental_ops = parse_env("GGML_METALIUM_EXPERIMENTAL_OPS"),
         .disable_graph_compiler = parse_env("GGML_METALIUM_DISABLE_GRAPH_COMPILER"),
@@ -770,8 +767,7 @@ std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tenso
     // the regular GGML path,they need special handling.
     GGML_ASSERT((meta == nullptr || !meta->is_row_folded()) && "Cannot view a row-folded tensor, GGML Metalium backend internal bug!");
     auto res = realize_ggml_view_impl(tensor);
-    // We hack around weight transposed issue that maeks this test fail. But the performance gain is worth the inconsistency
-    if(!ggml_tt_tensors_shape_equal(tensor, *res) && !meta->is_pretransposed) {
+    if(!ggml_tt_tensors_shape_equal(tensor, *res)) {
         std::cout << "FATAL ERROR: Shape mismatch between TTNN and GGML after view op " << ggml_op_name(tensor->op) << "\n"
             << "  Result: " << res->logical_shape() << "\n"
             << "  GGML expecting: " << tensor->ne[3] << " " << tensor->ne[2] << " " << tensor->ne[1] << " " << tensor->ne[0] << "\n";
@@ -994,9 +990,6 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
     GGML_ASSERT(false && "Fallback path not implemented");
 }
 
-// Experimental flag to enable or disable custom mul_mat
-// #define USE_CUSTOM_MUL_MAT
-
 static bool ggml_backend_metalium_can_mul_mat(const struct ggml_tensor * dst)
 {
     const struct ggml_tensor * src0 = dst->src[0];
@@ -1006,20 +999,8 @@ static bool ggml_backend_metalium_can_mul_mat(const struct ggml_tensor * dst)
     // or [B, 1, M, K] x [B, 1, K, N] (bcast_batch=False)
     // For now we simply only allow those shapes. We transpose the shapes ourselves
     // TODO: Detect when shape[1] can be removed and do that automagically
-    bool can_be_processed_by_ttnn = src0->ne[0] == src1->ne[0] && src0->ne[2] == 1 && src1->ne[2] == 1 &&
+    return src0->ne[0] == src1->ne[0] && src0->ne[2] == 1 && src1->ne[2] == 1 &&
         (src0->ne[3] == src1->ne[3] || src0->ne[3] == 1);
-    if(can_be_processed_by_ttnn) {
-        return true;
-    }
-
-    // Our own slow implementation
-    if(!(src0->ne[0] == src1->ne[0] && src1->ne[2] % src0->ne[2] == 0 && src1->ne[3] % src0->ne[3] == 0
-                && src1->ne[2] != 0 && src1->ne[3] != 0)) {
-        return false;
-    }
-
-    // we will perform a transpose which is not supported on quantized types for now
-    return (!is_view(src0) || !ggml_is_quantized(src0->type)) && (!is_view(src1) || !ggml_is_quantized(src1->type));
 }
 
 static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
@@ -1034,9 +1015,8 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     const struct ggml_tensor * src1 = dst->src[1];
     bool can_be_processed_by_ttnn = src0->ne[0] == src1->ne[0] && src0->ne[2] == 1 && src1->ne[2] == 1 &&
         (src0->ne[3] == src1->ne[3] || src0->ne[3] == 1);
-    bool awkward_gemv = src1->ne[0] == 1; // HACK: the custom MUL_MAT kernel needs to have masking support
 
-    if(can_be_processed_by_ttnn && (g_debug_flags.cache_mm_transpose || awkward_gemv)) {
+    if(can_be_processed_by_ttnn) {
         GGML_TENSOR_BINARY_OP_LOCALS
 
         const enum ggml_type type = src0->type;
@@ -1061,29 +1041,11 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
         auto &a = *ap;
         auto &b = *bp;
 
-        tt::tt_metal::Tensor aT;
-        if(src0->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-            ggml_tensor_extra_metalium* meta0 = (ggml_tensor_extra_metalium*)src0->extra;
-            if(meta0->is_pretransposed) {
-                aT = *meta0->tensor;
-            }
-            else {
-                aT = ttnn::transpose(a, -2, -1);
-                meta0->tensor = std::make_shared<tt::tt_metal::Tensor>(aT);
-                meta0->is_pretransposed = true;
-            }
-        }
-        else {
-            aT = ttnn::transpose(a, -2, -1);
-        }
-        GGML_ASSERT(aT.is_allocated() && "Matrix aT is not allocated");
-        // TODO: Ask TT to support multiplication of pre-transposed tensors. Calling transpose here is inefficient
-        // https://github.com/tenstorrent/tt-metal/issues/9709
         *dst_meta = {
             .tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::operations::matmul::matmul(
-                b, aT,
+                b, a,
                 /* transpose_a            = */ false,
-                /* transpose_b            = */ false,
+                /* transpose_b            = */ true,
                 /* memory_config          = */ std::nullopt,
                 /* dtype                  = */ std::nullopt,
                 /* program_config         = */ std::nullopt,
@@ -1092,15 +1054,7 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
         };
     }
     else {
-        // Our slow implementation of MUL_MAT using direct kernels
-        uint32_t prec = dst->op_params[0];
-        bool high_percision = prec == GGML_PREC_F32;
-
-        auto res = ttggml::mul_mat(*realize_ggml_view(dst->src[0]), *realize_ggml_view(dst->src[1]), high_percision);
-
-        *dst_meta = ggml_tensor_extra_metalium{
-            .tensor = std::make_shared<tt::tt_metal::Tensor>(res),
-        };
+        GGML_ABORT("unsupported Metalium MUL_MAT shape");
     }
     GGML_ASSERT(dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE);
 }

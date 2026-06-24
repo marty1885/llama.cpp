@@ -16,7 +16,6 @@ class MetaliumGraphCompiler;
 // Per ggml-tensor device state, hung off ggml_tensor::extra.
 struct ggml_tensor_extra_metalium {
     std::shared_ptr<tt::tt_metal::Tensor> tensor;
-    bool is_pretransposed = false;
 
     // Row-folded physical storage for a tensor whose GGML-declared shape would tile-pad badly
     // (1-D / short-penultimate caches and the token embedding). When non-null, this is the

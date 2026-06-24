@@ -9,7 +9,6 @@ ggml_add_backend_library(ggml-metalium
     compiler.cpp
     utils.cpp
     rope.cpp
-    mul_mat.cpp
     soft_max.cpp
     wkv7.cpp
     embedding.cpp
@@ -67,9 +66,6 @@ if(GGML_METALIUM_EMBED_KERNELS)
             rope_normal_reader
             rope_normal_compute
             rope_normal_writer
-            mul_mat_reader
-            mul_mat_compute
-            mul_mat_writer
             soft_max_reader
             soft_max_writer
             soft_max_compute

@@ -176,7 +176,6 @@ There are several debug flags available to assist with debugging/performance of 
 |-----------------------------------|-----------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | GGML_METALIUM_PRINT_REJECTED_OPS  | 0(default) or 1 | Print operators GGML asked if the Metalium backend can run, and Metalium reported false                                                                                  |
 | GGML_METALIUM_PRINT_VIEW          | 0(default) or 1 | Print all view operations (VIEW, TRANSPOSE, RESHAPE, PERMUTE) that the backend's lazy view system sees                                                                   |
-| GGML_METALIUM_CACHE_MM_TRANSPOSE  | 0(default) or 1 | TTNN has limited support for pre-transposed matmul that GGML needs and does most on the fly. This options cache the transpose. But is incompatiable with LoRA fully      |
 |GGML_METALIUM_DISABLE_PROGRAM_CACHE| 0(default) or 1 | Disables TTNN program cacheing                                                                                                                                           |
 | GGML_METALIUM_EXPERIMENTAL_OPS    | 0(default) or 1 | Enables experimental ops that is known to cause trouble                                                                                                                  |
 
@@ -197,15 +196,8 @@ Though llama.cpp encourages a c-with-classes coding style. TTNN by it's nature i
 
 Due to hardware design, most operations are pratically limited to an accuracy BFP16. Which seems to be enough for most models. And so for now FP32 support is emulated with using BFP16 underneath.
 
-### Note on `GGML_METALIUM_CACHE_MM_TRANSPOSE`
+### Note on `GGML_MUL_MAT`
 
 `GGML_MUL_MAT` is a weird operation, `mul_mat(a, b)` is in fact evaulating `tranpose(matmul(a, b)) = matmul(tranpose(b), tranpose(a))` since `b` is pre-tranposed on GGML. It effectivly evaulates `matmul(bT, tranpose(a))`
 
-There's is 2 code paths that executed the `GGML_MUL_MAT` operation on device.
-
-* By using TTNN `ttnn.matmul(b, ttnn.transpose(a))`
-* By using a custom MUL_MAT written in Metalium kernels
-
-The current custom MUL_MAT kernel is very barebones. But still faster then actually performing a transpose then matmul using TNN. However, if you are willing to compatibility with workload that modifies the weight - since `a` is the weight matrix and does not change across the inference run, the backend can transpose the weight matrix once and cache the result. This can be done by using the `GGML_METALIUM_CACHE_MM_TRANSPOSE` flag. It transposes the weight matrix once and caches the result for future use.
-
-The eventual goal is to get rid of this flag since there's no reason custom kernels can't reach near the same performance (it's just pre-transpose, but we add a transpose stem to the matrix engine). But until then, it is recommended to use it for better performance.
+The backend evaluates this through native TTNN matmul as `ttnn.matmul(b, a, transpose_b=true)`.

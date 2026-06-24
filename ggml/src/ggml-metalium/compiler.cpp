@@ -54,22 +54,19 @@ public:
 
         auto * a_meta = (ggml_tensor_extra_metalium *)dst->src[0]->extra;
 
-        // Build the gather-friendly variant once and cache it on the weight's extra. The fold
+        // Fold the weight into the gather-friendly [1, vocab, embed/32, 32] layout once, then drop
+        // the canonical copy: the fold is now the authoritative residency for this weight. The fold
         // op produces bf16; we keep it block-float for residency (the gather dequants in compute).
-        static const std::string kVariantKey = "embedding_fold";
-        auto it = a_meta->variants.find(kVariantKey);
-        if (it == a_meta->variants.end()) {
+        if (a_meta->row_folded == nullptr) {
             auto canonical = realize_ggml_view(dst->src[0]);
-            auto variant_bf16 = ttggml::EmbeddingFoldVariant::invoke(*canonical);
-            auto variant = ttnn::typecast(variant_bf16, tt::tt_metal::DataType::BFLOAT8_B);
-            it = a_meta->variants.emplace(kVariantKey,
-                std::make_shared<tt::tt_metal::Tensor>(std::move(variant))).first;
+            auto variant = ttnn::typecast(ttggml::EmbeddingFoldVariant::invoke(*canonical), tt::tt_metal::DataType::BFLOAT8_B);
+            a_meta->row_folded = std::make_shared<tt::tt_metal::Tensor>(std::move(variant));
+            a_meta->tensor.reset();
         }
 
-        // Gather the indexed rows of the variant and scatter into the ggml-canonical output.
-        auto variant = it->second;
+        // Gather the indexed rows of the fold and scatter into the ggml-canonical output.
         auto index = realize_ggml_view(dst->src[1]);
-        auto gathered = ttggml::EmbeddingGather::invoke(*variant, *index, (uint32_t)dst->ne[0]);
+        auto gathered = ttggml::EmbeddingGather::invoke(*a_meta->row_folded, *index, (uint32_t)dst->ne[0]);
 
         auto * dst_meta = (ggml_tensor_extra_metalium *)dst->extra;
         dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(gathered));

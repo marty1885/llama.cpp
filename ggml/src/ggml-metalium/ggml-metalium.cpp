@@ -74,6 +74,7 @@
 #include <ttnn/cpp/ttnn/operations/transformer/sdpa_decode/sdpa_decode.hpp>
 #include <ttnn/cpp/ttnn/operations/transformer/sdpa/sdpa.hpp>
 #include <ttnn/cpp/ttnn/operations/data_movement/slice/slice.hpp>
+#include <ttnn/operations/experimental/slice_write/slice_write.hpp>
 
 
 #include <memory>
@@ -764,8 +765,11 @@ static void metalium_persist_inplace_view(const ggml_tensor* node, const std::sh
 static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_tensor* tensor);
 std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tensor)
 {
-    auto res = realize_ggml_view_impl(tensor);
     ggml_tensor_extra_metalium* meta = static_cast<ggml_tensor_extra_metalium*>(tensor->extra);
+    // Row-folded tensors are owned entirely by the compiler's matchers and MUST NOT go through
+    // the regular GGML path,they need special handling.
+    GGML_ASSERT((meta == nullptr || !meta->is_row_folded()) && "Cannot view a row-folded tensor, GGML Metalium backend internal bug!");
+    auto res = realize_ggml_view_impl(tensor);
     // We hack around weight transposed issue that maeks this test fail. But the performance gain is worth the inconsistency
     if(!ggml_tt_tensors_shape_equal(tensor, *res) && !meta->is_pretransposed) {
         std::cout << "FATAL ERROR: Shape mismatch between TTNN and GGML after view op " << ggml_op_name(tensor->op) << "\n"
@@ -1101,6 +1105,40 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     GGML_ASSERT(dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE);
 }
 
+// Walk view_src to the storage leaf; return its extra iff that leaf is row-folded, else nullptr.
+// The recurrent cache is always reached through a reshape/view, so callers pass the op's src.
+static ggml_tensor_extra_metalium* ggml_metalium_resolve_folded(const ggml_tensor* t) {
+    const ggml_tensor* root = t;
+    while(root->view_src != nullptr) {
+        root = root->view_src;
+    }
+    if(root->extra == nullptr) {
+        return nullptr;
+    }
+    auto* meta = (ggml_tensor_extra_metalium*)root->extra;
+    return meta->is_row_folded() ? meta : nullptr;
+}
+
+// Unfold [1, R, dim/32, 32] (TILE) -> canonical [1, 1, R, dim] (TILE). ttnn::reshape handles the tile
+// relayout internally (a manual untilize would inject hardware padding and corrupt the order). This
+// is the temporary bridge to the WKV kernel, which still wants canonical state -- see memory
+// rwkv-cache-rowfold-unfold-decision.
+static tt::tt_metal::Tensor ggml_metalium_row_unfold(const tt::tt_metal::Tensor& folded) {
+    const auto s = folded.logical_shape().to_array_4D();   // [1, R, dim/32, 32]
+    const uint32_t R = s[1];
+    const uint32_t dim = s[2] * s[3];
+    return ttnn::reshape(folded, ttnn::Shape({1, 1, R, dim}));
+}
+
+// Fold canonical [1, 1, R, dim] (TILE) -> [1, R, dim/32, 32] (TILE).
+static tt::tt_metal::Tensor ggml_metalium_row_fold(const tt::tt_metal::Tensor& canonical) {
+    const auto s = canonical.logical_shape().to_array_4D();  // [1, 1, R, dim]
+    const uint32_t R = s[2];
+    const uint32_t dim = s[3];
+    GGML_ASSERT(dim % 32 == 0 && "row-fold requires a tile-aligned inner dim");
+    return ttnn::reshape(canonical, ttnn::Shape({1, R, dim / 32, 32}));
+}
+
 static bool ggml_backend_metalium_can_cpy(const struct ggml_tensor * dst)
 {
     if(is_integer_type(dst->type) || is_integer_type(dst->src[0]->type)) {
@@ -1136,6 +1174,37 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
     // GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
     ggml_tensor* src0 = dst->src[0];
+
+    // Row-folded recurrent cache write-back
+    if(dst->op == GGML_OP_CPY && dst->src[1] != nullptr && dst->src[1]->extra != nullptr) {
+        if(ggml_tensor_extra_metalium* folded = ggml_metalium_resolve_folded(dst->src[1])) {
+            ggml_tensor* dst_view = dst->src[1];
+            const ggml_tensor* root = dst_view;
+            while(root->view_src != nullptr) { root = root->view_src; }
+            const uint32_t dim    = (uint32_t)root->ne[0];           // n_embd_s
+            const uint32_t n_rows = (uint32_t)root->ne[1];
+            const size_t   row_bytes = (size_t)dim * ggml_type_size(root->type);
+            const uint32_t head  = (uint32_t)(dst_view->view_offs / row_bytes);
+            const uint32_t cells = (uint32_t)(ggml_nelements(dst_view) / dim);
+            GGML_ASSERT(n_rows == 1 && head == 0 && cells == 1
+                && "folded cache write only supports n_rows==1 for now");
+
+            auto new_state = realize_ggml_view(src0);                // [1,1,1,dim]
+            tt::tt_metal::Tensor folded_new = ggml_metalium_row_fold(*new_state);  // [1,1,dim/32,32]
+            const tt::tt_metal::DataType ftype = folded->row_folded->dtype();
+            if(folded_new.dtype() != ftype) {
+                folded_new = ttnn::typecast(folded_new, ftype);
+            }
+            ttnn::SmallVector<uint32_t> begins{0, head, 0, 0};
+            ttnn::SmallVector<uint32_t> ends{1, head + cells, dim / 32, 32};
+            ttnn::SmallVector<uint32_t> step{1, 1, 1, 1};
+            ttnn::experimental::slice_write(folded_new, *folded->row_folded, begins, ends, step);
+
+            // CPY result aliases the (canonical) new state as an ordering handle for any consumer.
+            *dst_meta = { .tensor = new_state };
+            return;
+        }
+    }
 
     // TODO: Check we are not writing into a view
     auto res = realize_ggml_view(src0);
@@ -1362,6 +1431,33 @@ static void ggml_backend_metalium_scale(ggml_backend_metalium_context * ctx, str
     memcpy(params.data(), dst->op_params, sizeof(params));
     auto [scale, bias] = params;
 
+    // Row-folded recurrent cache in-place scale (the build_rs state-clear: scale a row by 0). Scaling
+    // is element-wise so it commutes with the fold -- scale the folded store's row range directly, no
+    // unfold, and write it back in place. n_rows==1 (whole cache) for now.
+    if(ggml_tensor_extra_metalium* folded = ggml_metalium_resolve_folded(dst->src[0])) {
+        const ggml_tensor* root = dst->src[0];
+        while(root->view_src != nullptr) { root = root->view_src; }
+        const uint32_t dim   = (uint32_t)root->ne[0];
+        const size_t   row_bytes = (size_t)dim * ggml_type_size(root->type);
+        const uint32_t head  = (uint32_t)(dst->src[0]->view_offs / row_bytes);
+        const uint32_t cells = (uint32_t)(ggml_nelements(dst->src[0]) / dim);
+        GGML_ASSERT(root->ne[1] == 1 && head == 0 && cells == 1
+            && "folded cache scale only supports n_rows==1 for now");
+        ttnn::Tensor scaled = (bias == 0.f)
+            ? ttnn::multiply(*folded->row_folded, scale)
+            : ttnn::add(ttnn::multiply(*folded->row_folded, scale, std::nullopt, ttnn::L1_MEMORY_CONFIG), bias);
+        const tt::tt_metal::DataType ftype = folded->row_folded->dtype();
+        if(scaled.dtype() != ftype) { scaled = ttnn::typecast(scaled, ftype); }
+        ttnn::SmallVector<uint32_t> begins{0, head, 0, 0};
+        ttnn::SmallVector<uint32_t> ends{1, head + cells, dim / 32, 32};
+        ttnn::SmallVector<uint32_t> step{1, 1, 1, 1};
+        ttnn::experimental::slice_write(scaled, *folded->row_folded, begins, ends, step);
+        // The in-place SCALE node is itself a (canonical) ggml view; if any consumer realizes it the
+        // shape check needs canonical [1,1,cells,dim]. Cold path (only when rs_zero>=0), so unfold.
+        *dst_meta = { .tensor = std::make_shared<tt::tt_metal::Tensor>(ggml_metalium_row_unfold(scaled)) };
+        return;
+    }
+
     auto t = realize_ggml_view(dst->src[0]);
     ttnn::Tensor res;
     if(bias == 0.f) {
@@ -1426,6 +1522,19 @@ static void ggml_backend_metalium_get_rows(ggml_backend_metalium_context * ctx, 
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
 
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
+
+    // Row-folded recurrent cache read. For now only n_rows==1 (the whole-cache identity gather):
+    // unfold the folded store back to the canonical [1,1,1,n_embd_s] the WKV kernel needs. General
+    // n_rows>1 needs an on-device folded gather (TODO: scatter/gather kernel).
+    if(ggml_tensor_extra_metalium* folded = ggml_metalium_resolve_folded(dst->src[0])) {
+        const ggml_tensor* root = dst->src[0];
+        while(root->view_src != nullptr) { root = root->view_src; }
+        GGML_ASSERT(root->ne[1] == 1 && "folded cache gather only supports n_rows==1 for now");
+        *dst_meta = {
+            .tensor = std::make_shared<tt::tt_metal::Tensor>(ggml_metalium_row_unfold(*folded->row_folded)),
+        };
+        return;
+    }
 
     auto t = realize_ggml_view(dst->src[0]);
     const ggml_tensor *idxs = dst->src[1];
@@ -2479,6 +2588,82 @@ ggml_backend_metalium_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     delete ctx;
 }
 
+// Row-folded host contract. A folded cache is stored as [1, n_rows, dim/32, 32] (TILE), decoupled
+// from GGML's declared [dim, n_rows]. GGML still addresses it in canonical row-major bytes, but the
+// recurrent save/restore path only ever touches WHOLE rows (offset/size are multiples of one row),
+// so the host<->device bridge is just a row-range slice plus the free row-major reshape
+// [cells, dim] <-> [cells, dim/32, 32]. No fold kernel needed: the byte order is identical.
+
+static void ggml_backend_metalium_set_tensor_folded(ggml_backend_metalium_buffer_context * bufctx,
+                                                ggml_tensor *tensor, ggml_tensor_extra_metalium * meta,
+                                                const void *data, size_t offset, size_t size)
+{
+    const ggml_type ggtype = tensor->type;
+    const uint32_t  dim    = (uint32_t)tensor->ne[0];
+    const size_t    row_bytes = (size_t)dim * ggml_type_size(ggtype);
+    // Proven contract: recurrent save/restore writes whole rows only (see ROW_FOLD_PLAN.md).
+    GGML_ASSERT(row_bytes > 0 && offset % row_bytes == 0 && size % row_bytes == 0
+        && "folded cache set_tensor must be whole-row aligned");
+    GGML_ASSERT(dim % 32 == 0 && "folded cache inner dim must be tile aligned");
+    const uint32_t head  = (uint32_t)(offset / row_bytes);
+    const uint32_t cells = (uint32_t)(size   / row_bytes);
+    if(cells == 0) {
+        return;
+    }
+
+    // Host [cells, dim] bytes are bit-identical to [1, cells, dim/32, 32] row-major (free reshape).
+    std::optional<tt::tt_metal::HostBuffer> storage;
+    const size_t n_elems = (size_t)cells * dim;
+    if(ggtype == GGML_TYPE_F32) {
+        storage = host_data_to_tt_host_buffer<float, bfloat16>((const float*)data, n_elems);
+    }
+    else if(ggtype == GGML_TYPE_F16) {
+        storage = host_data_to_tt_host_buffer<ggml_fp16_t, bfloat16>((const ggml_fp16_t*)data, n_elems);
+    }
+    else if(ggtype == GGML_TYPE_BF16) {
+        storage = host_data_to_tt_host_buffer<ggml_bf16_t, bfloat16>((const ggml_bf16_t*)data, n_elems);
+    }
+    else {
+        GGML_ASSERT(false && "Unsupported folded cache data type");
+    }
+
+    tt::tt_metal::Tensor chunk(std::move(*storage), ttnn::Shape({1, cells, dim / 32, 32}),
+        tt::tt_metal::DataType::BFLOAT16, tt::tt_metal::Layout::ROW_MAJOR);
+    const tt::tt_metal::DataType final_type = ggml2tt_type(ggtype, bufctx->device->arch());
+    chunk = ttnn::tilize_with_zero_padding(chunk.to_device(bufctx->device.get()), std::nullopt, final_type);
+
+    // Scatter the row range [head, head+cells) into the folded store along the un-tiled outer dim.
+    const uint32_t dim_t = dim / 32;
+    ttnn::SmallVector<uint32_t> begins{0, head, 0, 0};
+    ttnn::SmallVector<uint32_t> ends{1, head + cells, dim_t, 32};
+    ttnn::SmallVector<uint32_t> step{1, 1, 1, 1};
+    ttnn::experimental::slice_write(chunk, *meta->row_folded, begins, ends, step);
+}
+
+static void ggml_backend_metalium_get_tensor_folded(const ggml_tensor *tensor, ggml_tensor_extra_metalium * meta,
+                                                void *data, size_t offset, size_t size)
+{
+    const ggml_type ggtype = tensor->type;
+    const uint32_t  dim    = (uint32_t)tensor->ne[0];
+    const size_t    row_bytes = (size_t)dim * ggml_type_size(ggtype);
+    GGML_ASSERT(row_bytes > 0 && offset % row_bytes == 0 && size % row_bytes == 0
+        && "folded cache get_tensor must be whole-row aligned");
+    GGML_ASSERT(dim % 32 == 0 && "folded cache inner dim must be tile aligned");
+    const uint32_t head  = (uint32_t)(offset / row_bytes);
+    const uint32_t cells = (uint32_t)(size   / row_bytes);
+    if(cells == 0) {
+        return;
+    }
+
+    const uint32_t dim_t = dim / 32;
+    ttnn::SmallVector<uint32_t> begins{0, head, 0, 0};
+    ttnn::SmallVector<uint32_t> ends{1, head + cells, dim_t, 32};
+    ttnn::SmallVector<uint32_t> step{1, 1, 1, 1};
+    auto sliced = ttnn::slice(*meta->row_folded, begins, ends, step);
+    // Logical [1, cells, dim/32, 32] row-major order is exactly canonical [cells, dim].
+    copy_tt_tensor_to_host_pointer<bfloat16>(sliced, data, ggtype);
+}
+
 static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                 ggml_tensor *tensor,
                                                 const void *data, size_t offset,
@@ -2492,13 +2677,19 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     // 3. If the data is quantized, cast down to BFLOAT8_B or BFLOAT4_B
     // There's a lot of things to do here.
     // TODO: Make a scalable way to decide which GGML type casts to TT quantized types
-    GGML_ASSERT(offset == 0);
     GGML_ASSERT(tensor->extra != NULL);
 
     ggml_backend_metalium_buffer_context * bufctx = (ggml_backend_metalium_buffer_context *)buffer->context;
     GGML_ASSERT(bufctx != NULL);
     ggml_type ggtype = tensor->type;
     ggml_tensor_extra_metalium * meta = (ggml_tensor_extra_metalium *)tensor->extra;
+
+    // Row-folded store owns its own whole-row scatter path (supports nonzero offsets).
+    if(meta->is_row_folded()) {
+        ggml_backend_metalium_set_tensor_folded(bufctx, tensor, meta, data, offset, size);
+        return;
+    }
+    GGML_ASSERT(offset == 0);
 
     // Make sure we are not writing to a view tensor
     if(size != ggml_nbytes(tensor) || (meta->tensor && ggml_tt_tensors_shape_equal(tensor, *meta->tensor) == false)
@@ -2615,8 +2806,17 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
     // 2. If the TT tensor is quantized, cast it to BFLOAT16
     // 3. Call copy_tt_tensor_to_host_pointer to convert the TT tensor to GGML tensor
     //    - copy_tt_tensor_to_host_pointer internally handles the data type conversion
-    GGML_ASSERT(size == ggml_nbytes(tensor));
     GGML_ASSERT(tensor->extra != NULL);
+
+    // Row-folded store owns its own whole-row gather path (supports nonzero offsets / sub-ranges).
+    {
+        ggml_tensor_extra_metalium * meta = (ggml_tensor_extra_metalium *)tensor->extra;
+        if(meta->is_row_folded()) {
+            ggml_backend_metalium_get_tensor_folded(tensor, meta, data, offset, size);
+            return;
+        }
+    }
+    GGML_ASSERT(size == ggml_nbytes(tensor));
     GGML_UNUSED(offset);
 
     // ggml_backend_metalium_buffer_context * ctx = (ggml_backend_metalium_buffer_context *)buffer->context;
@@ -2711,7 +2911,21 @@ ggml_backend_metalium_buffer_init_tensor(ggml_backend_buffer_t buffer,
     // TODO: Most likely we'd want to refer this allocation to first time use of the tensor to support proper KV cache setup
     //       as the "real" shape information (GGML allocates KV cache as a very long 1D tensor) is missing here
     std::string_view name(tensor->name);
-    if(std::string_view(name).find("cache") != std::string::npos && tensor->op == GGML_OP_NONE) {
+    // RWKV recurrent state hacks to improve DRAM compatness in Metalim. Folding converts tensor [1, 1, nrows, nembed]
+    // into [1, nrows, nembed/32, 32] (TILE) for storage. Because Metalium runs on tiles, not doing so leads to large
+    // bandwidth waste always reading the full 32x32 tile even just needing one row.
+    const bool is_rwkv_cache = name.rfind("cache_r_l", 0) == 0 || name.rfind("cache_s_l", 0) == 0;
+    if(is_rwkv_cache && tensor->op == GGML_OP_NONE) {
+        GGML_ASSERT(ggml_n_dims(tensor) <= 2 && "row-fold only supports <=2D caches");
+        const uint32_t dim    = (uint32_t)tensor->ne[0];
+        const uint32_t n_rows = (uint32_t)tensor->ne[1];
+        GGML_ASSERT(dim % 32 == 0 && "row-fold requires a tile-aligned inner dim");
+        auto z = ttnn::zeros(ttnn::Shape({1, n_rows, dim / 32, 32}),
+            ggml2tt_type(tensor->type, bufctx->device->arch()), tt::tt_metal::Layout::ROW_MAJOR);
+        z = ttnn::tilize_with_zero_padding(z.to_device(bufctx->device.get()));
+        meta->row_folded = std::make_shared<tt::tt_metal::Tensor>(std::move(z));
+    }
+    else if(std::string_view(name).find("cache") != std::string::npos && tensor->op == GGML_OP_NONE) {
         std::vector<uint32_t> shape(tensor->ne, tensor->ne + GGML_MAX_DIMS);
         std::reverse(shape.begin(), shape.end());
         auto t = ttnn::zeros(ttnn::Shape(shape), ggml2tt_type(tensor->type, bufctx->device->arch()), tt::tt_metal::Layout::ROW_MAJOR);

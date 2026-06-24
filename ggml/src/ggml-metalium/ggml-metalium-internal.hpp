@@ -5,8 +5,6 @@
 // tensors and TTNN tensors; everything else stays private to ggml-metalium.cpp.
 
 #include <memory>
-#include <string>
-#include <unordered_map>
 
 #include <ttnn/tensor/tensor.hpp>
 #include <ttnn/device.hpp>
@@ -20,8 +18,12 @@ struct ggml_tensor_extra_metalium {
     std::shared_ptr<tt::tt_metal::Tensor> tensor;
     bool is_pretransposed = false;
 
-    // hack for embeddings
-    std::unordered_map<std::string, std::shared_ptr<tt::tt_metal::Tensor>> variants;
+    // Row-folded physical storage for a tensor whose GGML-declared shape would tile-pad badly
+    // (1-D / short-penultimate caches and the token embedding). When non-null, this is the
+    // authoritative device copy stored as [n_rows, dim/32, 32] and `tensor` is dropped
+    std::shared_ptr<tt::tt_metal::Tensor> row_folded;
+
+    bool is_row_folded() const { return row_folded != nullptr; }
 };
 
 struct ggml_backend_metalium_context {

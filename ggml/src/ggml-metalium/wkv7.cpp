@@ -26,14 +26,6 @@ using namespace ttnn;
 //   decodeL  -> sequential per-token. Faster for decode
 //   chunked  -> Higher throughput large decode
 
-// Switch the WKV7 state input/reader between the canonical flat-strip layout (default) and the
-// row-folded layout [1,G,Es/32,32]. Must agree across invoke() (G derivation), create() (reader
-// define) and the ggml-metalium handler (which folds/passes the state accordingly).
-bool wkv7_folded_state() {
-    static const bool v = std::getenv("GGML_METALIUM_WKV7_FOLDED_STATE") != nullptr;
-    return v;
-}
-
 namespace {
 constexpr uint32_t TW = 32, TH = 32;
 
@@ -110,14 +102,25 @@ wkv7_device::RWKVWKV7DeviceOperation::invoke(
     const Tensor& b,
     const Tensor& state)
 {
-    // Inputs are TTNN [T, H, S] (ggml ne=[S,H,T]); state TTNN [G, S*S*H] (ggml ne=[S*S*H,G]).
-    const auto& rs = r.logical_shape();
-    const uint32_t S = rs[-1];
-    const uint32_t H = rs[-2];
-    const uint32_t T = rs[-3];
-    // Canonical state TTNN [1,1,G,Es] -> G at [-2]; folded state TTNN [1,G,Es/32,32] -> G at [-3].
-    const uint32_t G = wkv7_folded_state() ? state.logical_shape()[-3] : state.logical_shape()[-2];
+    // Inputs use TTNN shape [T, H, S] (ggml ne=[S, H, T]).
+    // The state tensor uses TTNN shape [G, S*S*H] (ggml ne=[S*S*H, G]).
+    // Read S/H/T from `a` (neg(kk)), because `a` is always reshaped per head.
+    // Do not derive geometry from r/w/k/v: those tensors may arrive either reshaped
+    // as [T, H, S] or flat as [T, S*H] when the host skips the head reshape.
+    const auto& as = a.logical_shape();
+    const uint32_t S = as[-1];
+    const uint32_t H = as[-2];
+    const uint32_t T = as[-3];
+    // State always reaches this device op in row-folded TTNN shape [1, G, Es/32, 32], so G is at
+    // dimension [-3]. The KV cache is stored folded, and the ggml-metalium handler folds canonical
+    // state inputs (for example, in the op test) before invoking this op.
+    const uint32_t G = state.logical_shape()[-3];
     const uint32_t L = T / G;
+    // Detect flat r/w/k/v inputs from shape: flat inputs have inner dim S*H (full embedding)
+    // instead of S (per-head). In the real model path, the handler passes the un-reshaped parent
+    // tensors for r/w/k/v, while op tests and leaf-input paths pass reshaped tensors with inner S.
+    // Flat inputs use the flat reader path; reshaped inputs use the per-head reader path.
+    const bool input_flat = (r.logical_shape()[-1] == S * H);
     return {
         operation_attributes_t{
             r.memory_config(),
@@ -127,6 +130,7 @@ wkv7_device::RWKVWKV7DeviceOperation::invoke(
                 || (G == 1 && L <= 16)
                 || (G <= 8 && L <= 7)
                 || (L <= 4),
+            input_flat,
         },
         tensor_args_t{r, w, k, v, a, b, state}
     };
@@ -206,7 +210,12 @@ wkv7_device::program::WKV7ProgramFactory::create(
     TensorAccessorArgs(*out_buf).append_to(wct);
 
     std::map<std::string, std::string> reader_defines;
-    if (wkv7_folded_state()) reader_defines["WKV7_STATE_FOLDED"] = "1";
+    // State always arrives row-folded (cache is folded; canonical op-test state is folded on entry).
+    reader_defines["WKV7_STATE_FOLDED"] = "1";
+    // For flat r/w/k/v inputs, the reader consumes the original un-reshaped [n_embd, T]
+    // tensors for kernel inputs 1..4. This is selected by shape via `input_flat`, so
+    // reshaped leaf inputs used by op tests stay on the reshaped reader path.
+    if (attrs.input_flat) reader_defines["WKV7_INPUT_FLAT"] = "1";
     KernelHandle reader = CreateMetaliumKernel(prog, decode ? "wkv7_decodeL_reader" : "wkv7_reader", core, DataMovementConfig{
         .processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default, .compile_args = rct, .defines = reader_defines});
     KernelHandle writer = CreateMetaliumKernel(prog, "wkv7_writer", core, DataMovementConfig{

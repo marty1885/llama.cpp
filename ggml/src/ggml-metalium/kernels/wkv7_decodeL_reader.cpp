@@ -166,6 +166,26 @@ void kernel_main() {
         for (uint32_t t = 0; t < L; t++) {
             // base: starting tile page for token t, head h's tile-row within the input tensor
             uint32_t base = (sq * L + t) * Ht * St + ht * St;
+#ifdef WKV7_INPUT_FLAT
+            // Flat inputs r/w/k/v (inp 1..4) are read from the original embedding-style
+            // layout instead of the standard per-token/per-head layout used by a and b.
+            //
+            // For global token index tg = sq * L + t:
+            //   - ftr = tg % 32 selects the source row within the tile
+            //   - tg / 32 selects the source row-tile block
+            //
+            // For head h, this head's S-wide slice occupies column tiles
+            // [h * St, h * St + St), and each row-tile block contains H * St tiles
+            // total (= n_embd / 32).
+            //
+            // Inputs a and b (0 and 5) are not flat and continue to use the normal
+            // [S, H, T] path below.
+            const uint32_t tg    = sq * L + t;
+            const uint32_t ftr   = tg % 32;
+            const uint32_t ffso0 = (ftr / 16) * 1024 + (ftr % 16) * 32;
+            const uint32_t ffso1 = ffso0 + 512;
+            const uint32_t fbase = (tg / 32) * (H * St) + h * St;
+#endif
             for (uint32_t inp = 0; inp < 6; inp++) {
                 // Construct input accessor freshly per input: each of the 6 inputs has a
                 // different DRAM base address (in_addr[inp]) but shares the same CT args.
@@ -174,6 +194,15 @@ void kernel_main() {
                 uint32_t wp = get_write_ptr(c_natstage);
                 for (uint32_t st = 0; st < St; st++) {
                     uint32_t tilebase = wp + st * tb;
+#ifdef WKV7_INPUT_FLAT
+                    if (inp >= 1 && inp <= 4) {
+                        // Flat input: token-row source, head's col-tile page; dest row 0.
+                        uint32_t src_page = fbase + st;
+                        noc_async_read(in_acc.get_noc_addr(src_page, ffso0), tilebase + 0, 32);
+                        noc_async_read(in_acc.get_noc_addr(src_page, ffso1), tilebase + 512, 32);
+                        continue;
+                    }
+#endif
                     // src_page: tile page for col-tile st of this input/token/head
                     uint32_t src_page = base + st;
                     // Read 32 bytes from left column-face (face (lh/16,0)) into dest row 0

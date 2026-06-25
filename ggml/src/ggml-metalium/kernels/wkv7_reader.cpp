@@ -91,6 +91,43 @@ void kernel_main() {
                     cb_reserve_back(c_natstage, St);
                     uint32_t wp = get_write_ptr(c_natstage);
                     const uint16_t neutral = (inp == 1) ? 0x3F80 : 0x0000;   // w -> 1.0, else 0.0
+#ifdef WKV7_INPUT_FLAT
+                    // Under WKV7_INPUT_FLAT, inputs 1..4 use the flat embedding layout [T, n_embd]
+                    // (equivalently [n_embd, T] in logical terms) instead of the reshaped [S, H, T]
+                    // path used below. Inputs 0 and 5 (a, b) stay on the reshaped l2-norm-derived path.
+                    //
+                    // For head h, its S-dimensional slice occupies column tiles [h*St, h*St + St).
+                    // Token tg selects the source row: tr = tg % 32 within the tile, and tg / 32 selects
+                    // the row-tile page. Each row-tile page has H*St column tiles total (= n_embd / 32).
+                    // Destination packing is unchanged: token t is written into row t of the output tile.
+                    if (inp >= 1 && inp <= 4) {
+                        const uint32_t tg0 = sq * Lreal + c * L;   // global token base for this chunk
+                        const uint32_t cpr = H * St;               // col-tiles per row-tile (= n_embd/32)
+                        for (uint32_t st = 0; st < St; st++) {
+                            uint32_t tilebase = wp + st * tb;
+                            for (uint32_t t = 0; t < L; t++) {
+                                uint32_t doff0 = (t / 16) * 1024 + (t % 16) * 32;
+                                uint32_t doff1 = doff0 + 512;
+                                if (t < cl_real) {
+                                    uint32_t tg   = tg0 + t;
+                                    uint32_t tr   = tg % 32;
+                                    uint32_t fso0 = (tr / 16) * 1024 + (tr % 16) * 32;
+                                    uint32_t fso1 = fso0 + 512;
+                                    uint32_t src_page = (tg / 32) * cpr + h * St + st;
+                                    noc_async_read(in_acc.get_noc_addr(src_page, fso0), tilebase + doff0, 32);
+                                    noc_async_read(in_acc.get_noc_addr(src_page, fso1), tilebase + doff1, 32);
+                                } else {
+                                    volatile tt_l1_ptr uint16_t* p0 = (volatile tt_l1_ptr uint16_t*)(tilebase + doff0);
+                                    volatile tt_l1_ptr uint16_t* p1 = (volatile tt_l1_ptr uint16_t*)(tilebase + doff1);
+                                    for (uint32_t e = 0; e < 16; e++) { p0[e] = neutral; p1[e] = neutral; }
+                                }
+                            }
+                        }
+                        noc_async_read_barrier();
+                        cb_push_back(c_natstage, St);
+                        continue;
+                    }
+#endif
                     uint32_t base = (sq * Lreal + c * L) * (Ht * St) + ht * St;
                     for (uint32_t st = 0; st < St; st++) {
                         uint32_t tilebase = wp + st * tb;

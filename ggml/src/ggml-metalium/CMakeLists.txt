@@ -11,6 +11,7 @@ ggml_add_backend_library(ggml-metalium
     rope.cpp
     soft_max.cpp
     wkv7.cpp
+    slice_write_folded.cpp
     embedding.cpp
 )
 
@@ -74,6 +75,7 @@ if(GGML_METALIUM_EMBED_KERNELS)
             wkv7_decodeL_reader
             wkv7_decodeL_compute
             wkv7_writer
+            slice_write_folded_dm
             embedding_fold_reader
             embedding_fold_compute
             embedding_fold_writer

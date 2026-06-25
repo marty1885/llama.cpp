@@ -85,6 +85,7 @@
 #include "rope.hpp"
 #include "soft_max.hpp"
 #include "wkv7.hpp"
+#include "slice_write_folded.hpp"
 
 extern void metalium_register_all_kernel();
 
@@ -1151,6 +1152,37 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
             GGML_ASSERT(n_rows == 1 && head == 0 && cells == 1
                 && "folded cache write only supports n_rows==1 for now");
 
+            // FAST PATH: src0 is the WKV7 region-2 (= view_1d(wkv_output)). Scatter it straight
+            // into the folded cache via a single sub-tile kernel -- no flatten, no fold. This
+            // elides the whole region-2 view -> realize(flatten) -> row_fold chain. Restricted to
+            // the proven S==H==64, G==1 verbatim-face-copy case; anything else falls through to the
+            // generic fold+slice_write below. (The op test never reaches here -- canonical state.)
+            if(ggml_tensor* parent = src0->view_src) {
+                if(parent->extra != nullptr) {
+                    const uint32_t C  = (uint32_t)parent->ne[0];           // n_embd = S*H
+                    const uint32_t S  = (C != 0) ? dim / C : 0;            // n_embd_s / n_embd = head_size
+                    const uint32_t Hd = (S != 0) ? C / S : 0;             // head_count
+                    const uint32_t SG = (C != 0) ? (uint32_t)(ggml_nelements(src0) / C) : 0;
+                    const uint32_t G  = (S != 0) ? SG / S : 0;
+                    const uint32_t T  = (uint32_t)parent->ne[1] - SG;     // region-2 row offset
+                    const uint32_t ng = (C != 0) ? C / 32 : 0;
+                    auto src_tt = realize_ggml_view(parent);              // wkv_output (already materialized)
+                    const bool eligible =
+                        S == 64 && Hd == 64 && G == 1 && C % 1024 == 0 &&
+                        src_tt->dtype() == tt::tt_metal::DataType::BFLOAT16 &&
+                        folded->row_folded->dtype() == tt::tt_metal::DataType::BFLOAT16;
+                    if(eligible) {
+                        ttggml::slice_write_region2_folded(*src_tt, *folded->row_folded, T, Hd, ng);
+                        // The CPY result IS the (now updated) folded cache. Carry the folded handle
+                        // (tensor null) so the canonical post-op shape check is skipped and any
+                        // consumer unfolds on demand via realize_ggml_view. Matches get_rows' folded
+                        // result convention; nothing actually consumes this node in the RWKV graph.
+                        *dst_meta = { .row_folded = folded->row_folded };
+                        return;
+                    }
+                }
+            }
+
             auto new_state = realize_ggml_view(src0);                // [1,1,1,dim]
             tt::tt_metal::Tensor folded_new = ggml_metalium_row_fold(*new_state);  // [1,1,dim/32,32]
             const tt::tt_metal::DataType ftype = folded->row_folded->dtype();
@@ -1492,15 +1524,12 @@ static void ggml_backend_metalium_get_rows(ggml_backend_metalium_context * ctx, 
         const ggml_tensor* root = dst->src[0];
         while(root->view_src != nullptr) { root = root->view_src; }
         GGML_ASSERT(root->ne[1] == 1 && "folded cache gather only supports n_rows==1 for now");
-        // Emit a folded SNAPSHOT of the cache. aliasing the live cache buffer would let a
-        // lazy consumer read a generation that a later in-place cache write has already clobbered.
-        // When folded state is disabled, unfold eagerly to the canonical flat-strip WKV layout.
-        if(ttggml::wkv7_folded_state()) {
-            dst_meta->row_folded = std::make_shared<tt::tt_metal::Tensor>(
-                ttnn::clone(*folded->row_folded, std::nullopt, std::nullopt, std::nullopt));
-        } else {
-            dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ggml_metalium_row_unfold(*folded->row_folded));
-        }
+        // Emit a folded SNAPSHOT of the cache. Aliasing the live cache buffer would let a lazy
+        // consumer read a generation that a later in-place cache write has already clobbered. WKV7
+        // consumes the snapshot folded; any other consumer (concat of the token-shift cache) unfolds
+        // it on demand in realize_ggml_view.
+        dst_meta->row_folded = std::make_shared<tt::tt_metal::Tensor>(
+            ttnn::clone(*folded->row_folded, std::nullopt, std::nullopt, std::nullopt));
         return;
     }
 
@@ -2272,28 +2301,42 @@ static void ggml_backend_metalium_rwkv_wkv7(ggml_backend_metalium_context * ctx,
 
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
 
-    // State (src[6]) layout depends on the gate. Default: canonical flat-strip (realize as-is). Folded:
-    // pass the cache's folded tensor straight through (no relayout), else fold a canonical state on entry
-    // (e.g. the op test) so the reader always sees [1,G,Es/32,32].
+    // State (src[6]) always reaches the reader row-folded [1,G,Es/32,32]. Fast path: the state gather
+    // propagated the folded handle, consume it with zero relayout. Fallback (op test, canonical state):
+    // fold on entry, one relayout per WKV7 call.
     std::shared_ptr<tt::tt_metal::Tensor> state;
-    if (ttggml::wkv7_folded_state()) {
-        if (ggml_tensor_extra_metalium* folded = ggml_metalium_resolve_folded(dst->src[6])) {
-            // Fast path: the state gather propagated the folded handle, consume it with zero relayout.
-            state = folded->row_folded;
-        } else {
-            // Fallback: state is canonical here, fold on entry (one relayout per WKV7 call).
-            state = std::make_shared<tt::tt_metal::Tensor>(ggml_metalium_row_fold(*realize_ggml_view(dst->src[6])));
-        }
+    if (ggml_tensor_extra_metalium* folded = ggml_metalium_resolve_folded(dst->src[6])) {
+        state = folded->row_folded;
     } else {
-        state = realize_ggml_view(dst->src[6]);
+        state = std::make_shared<tt::tt_metal::Tensor>(ggml_metalium_row_fold(*realize_ggml_view(dst->src[6])));
     }
+
+    // r/w/k/v (src 0..3) are [n_embd,T]->[S,H,T] head reshapes in the real model. Feed the un-reshaped
+    // [n_embd,T] parent instead and let the reader address each head's column-tiles itself (one
+    // ttnn::reshape/input/layer eliminated). a/b (src 4,5) are l2_norm-derived and stay [S,H,T]. The
+    // guard (RESHAPE of a contiguous [S*H,T] parent) means a non-reshape src -- e.g. test-backend-ops
+    // leaf inputs -- stays on the reshaped path; invoke() then detects the reshaped shape and never
+    // defines WKV7_INPUT_FLAT, so host and reader agree.
+    auto realize_wkv7_input = [&](int i) -> std::shared_ptr<tt::tt_metal::Tensor> {
+        const ggml_tensor* s = dst->src[i];
+        if (i >= 0 && i <= 3
+            && s->op == GGML_OP_RESHAPE && s->src[0] != nullptr) {
+            const ggml_tensor* p = s->src[0];
+            // parent must be a contiguous [n_embd=S*H, T] tensor (n_embd = s->ne[0]*s->ne[1]).
+            if (ggml_is_contiguous(p) && p->ne[2] == 1 && p->ne[3] == 1
+                && p->ne[0] == s->ne[0] * s->ne[1] && p->ne[1] == s->ne[2]) {
+                return realize_ggml_view(p);
+            }
+        }
+        return realize_ggml_view(s);
+    };
 
     // ggml src order: r,w,k,v,a,b,state -> realize each to its ggml-native device tensor.
     auto res = ttggml::rwkv_wkv7(
-        *realize_ggml_view(dst->src[0]),   // r
-        *realize_ggml_view(dst->src[1]),   // w
-        *realize_ggml_view(dst->src[2]),   // k
-        *realize_ggml_view(dst->src[3]),   // v
+        *realize_wkv7_input(0),            // r
+        *realize_wkv7_input(1),            // w
+        *realize_wkv7_input(2),            // k
+        *realize_wkv7_input(3),            // v
         *realize_ggml_view(dst->src[4]),   // a
         *realize_ggml_view(dst->src[5]),   // b
         *state);                           // state

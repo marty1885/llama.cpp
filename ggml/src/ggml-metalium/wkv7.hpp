@@ -21,6 +21,7 @@ struct operation_attributes_t {
     uint32_t L;              // n_seq_tokens
     uint32_t G;              // n_seqs
     bool     use_decode;     // decode-L kernel (small L) vs chunked-parallel kernel
+    bool     input_flat;     // r/w/k/v arrive un-reshaped [n_embd,T] (reader addresses heads itself)
 };
 
 struct tensor_args_t {
@@ -99,11 +100,6 @@ struct RWKVWKV7DeviceOperation {
 };
 
 } // namespace wkv7_device
-
-// True when WKV7 consumes the row-folded state layout [1,G,Es/32,32] instead of the canonical
-// flat-strip. Gated by GGML_METALIUM_WKV7_FOLDED_STATE; the ggml-metalium handler must fold/pass
-// the state to match.
-bool wkv7_folded_state();
 
 ttnn::Tensor rwkv_wkv7(
     const Tensor& r,

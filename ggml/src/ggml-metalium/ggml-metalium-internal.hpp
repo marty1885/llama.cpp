@@ -36,6 +36,11 @@ struct ggml_backend_metalium_context {
 // Materialises the TTNN tensor backing a (possibly lazily-viewed) ggml tensor.
 std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tensor);
 
+// Adapt a TTNN tensor's logical shape to a ggml node's shape (no-op if already equal, else ttnn::reshape).
+// Fusions that emit a result in a different-but-equivalent tiling use this so the backend's post-op shape
+// sanity check passes and consumers see the node's canonical shape.
+tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tensor& tensor, const struct ggml_tensor * node);
+
 // Stable identity for a cgraph: its uid when set, else a topology+shape signature. The graph
 // compiler caches its per-graph fusion plan on this key (the same key the trace layer uses).
 uint64_t metalium_graph_key(const ggml_cgraph* cgraph);

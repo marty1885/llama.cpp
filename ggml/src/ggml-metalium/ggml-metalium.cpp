@@ -42,6 +42,7 @@
 #include <mutex>
 #include <chrono>
 #include <map>
+#include <sstream>
 #include <optional>
 #include <unordered_set>
 #include <string_view>
@@ -76,6 +77,10 @@
 #include <ttnn/cpp/ttnn/operations/transformer/sdpa/sdpa.hpp>
 #include <ttnn/cpp/ttnn/operations/data_movement/slice/slice.hpp>
 #include <ttnn/operations/experimental/slice_write/slice_write.hpp>
+
+#ifdef GGML_METALIUM_HAVE_TTPRM
+#include "view_realize_op.hpp"
+#endif
 
 
 #include <memory>
@@ -713,7 +718,7 @@ static bool is_integer_type(ggml_type type)
     return std::find(integer_types.begin(), integer_types.end(), type) != integer_types.end();
 }
 
-static tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tensor& tensor, const struct ggml_tensor * node)
+tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tensor& tensor, const struct ggml_tensor * node)
 {
     if(ggml_tt_tensors_shape_equal(node, tensor)) {
         return tensor;
@@ -725,6 +730,25 @@ static tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tens
     }
 
     // std::cerr << "Reshaping tensor " << tensor.logical_shape() << " to " << target_shape << std::endl;
+    if (getenv("GGML_METALIUM_RESHAPE_HISTO")) {
+        static std::mutex m;
+        static std::map<std::string, long> histo;
+        std::ostringstream key;
+        key << tensor.logical_shape() << "->[";
+        for (int i = 0; i < GGML_MAX_DIMS; i++) key << (i?",":"") << target_shape[i];
+        key << "] node=" << ggml_op_desc(node) << " '" << node->name << "'"
+            << " src0=" << (node->src[0] ? ggml_op_desc(node->src[0]) : "null");
+        std::lock_guard<std::mutex> lk(m);
+        histo[key.str()]++;
+        // dump full sorted table at teardown
+        static bool reg = [](){ std::atexit([](){
+            std::lock_guard<std::mutex> lk2(m);
+            std::vector<std::pair<std::string,long>> v(histo.begin(), histo.end());
+            std::sort(v.begin(), v.end(), [](auto&a,auto&b){return a.second>b.second;});
+            fprintf(stderr, "\n==== RESHAPE HISTO (final) ====\n");
+            for (auto&p : v) fprintf(stderr, "  x%-6ld %s\n", p.second, p.first.c_str());
+        }); return true; }(); (void)reg;
+    }
     return ttnn::reshape(tensor, ttnn::Shape(target_shape));
 }
 
@@ -1183,8 +1207,29 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
                 }
             }
 
-            auto new_state = realize_ggml_view(src0);                // [1,1,1,dim]
-            tt::tt_metal::Tensor folded_new = ggml_metalium_row_fold(*new_state);  // [1,1,dim/32,32]
+            // Relayout ① kill: if src0 is a pure flatten of a [inner, R] source (the
+            // token-shift concat [n_embd, 2] -> [n_embd*2]), fold the SOURCE directly
+            // into the dense cache layout with a single reshape, skipping the wasteful
+            // intermediate [dim] flatten. row_fold is itself just ttnn::reshape, which
+            // is row-major-preserving, so reshaping the unflattened source straight to
+            // [1,1,dim/32,32] produces byte-identical data to flatten-then-fold -- the
+            // exact same fold (②), minus one relayout. Any non-flatten source falls back
+            // to the original flatten+fold below.
+            ggml_tensor* flat_src = src0->view_src;
+            const bool direct_fold =
+                flat_src != nullptr && src0->view_offs == 0 && ggml_is_contiguous(src0) &&
+                ggml_nelements(src0) == ggml_nelements(flat_src) &&
+                (uint64_t)ggml_nelements(flat_src) == (uint64_t)dim * cells && (dim % 32) == 0;
+
+            std::shared_ptr<tt::tt_metal::Tensor> ordering_handle;  // flat canonical (fallback only)
+            tt::tt_metal::Tensor folded_new;
+            if(direct_fold) {
+                auto base_tt = realize_ggml_view(flat_src);          // [1,1,R,inner], NO flatten
+                folded_new = ttnn::reshape(*base_tt, ttnn::Shape({1, cells, dim / 32, 32}));  // -> dense fold
+            } else {
+                ordering_handle = realize_ggml_view(src0);           // [1,1,1,dim]
+                folded_new = ggml_metalium_row_fold(*ordering_handle);  // [1,1,dim/32,32]
+            }
             const tt::tt_metal::DataType ftype = folded->row_folded->dtype();
             if(folded_new.dtype() != ftype) {
                 folded_new = ttnn::typecast(folded_new, ftype);
@@ -1194,8 +1239,16 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
             ttnn::SmallVector<uint32_t> step{1, 1, 1, 1};
             ttnn::experimental::slice_write(folded_new, *folded->row_folded, begins, ends, step);
 
-            // CPY result aliases the (canonical) new state as an ordering handle for any consumer.
-            *dst_meta = { .tensor = new_state };
+            if(direct_fold) {
+                // No flat canonical handle exists (we never flattened); carry the (now
+                // updated) folded cache as the result so the post-op shape check is
+                // skipped and any consumer unfolds on demand. Matches the region-2
+                // fast-path convention above; nothing consumes this node as data anyway.
+                *dst_meta = { .row_folded = folded->row_folded };
+            } else {
+                // CPY result aliases the (canonical) new state as an ordering handle.
+                *dst_meta = { .tensor = ordering_handle };
+            }
             return;
         }
     }
@@ -1658,7 +1711,11 @@ static void ggml_backend_metalium_norm(ggml_backend_metalium_context * ctx, stru
         res = ttnn::rms_norm(*t, esp);
     }
     else {
+        #ifdef GGML_METALIUM_HAVE_TTPRM
+        res = ttprm::layer_norm(*t, nullptr, nullptr, esp).value();
+        #else
         res = ttnn::layer_norm(*t, esp);
+        #endif
     }
     *dst_meta = {
         .tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(res)),

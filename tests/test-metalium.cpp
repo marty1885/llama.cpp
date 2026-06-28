@@ -768,6 +768,243 @@ static void add_unittests(std::vector<std::unique_ptr<test_case>>& tests)
     }, "MLP mixer", 1e-3));
 }
 
+// Round-trip the row-folded host contract: a tensor named cache_s_l* is stored on device as
+// [1, n_rows, dim/32, 32] (folded), and GGML still addresses it in canonical [dim, n_rows] bytes.
+// Verify whole-tensor set/get AND a sub-range (the [head, head+cells) state-restore pattern).
+// Values are small integers (exact in bf16), so the round trip must be byte-for-byte.
+static bool test_row_fold_roundtrip(ggml_backend_t backend) {
+    const int64_t dim    = 256;   // tile-aligned inner dim
+    const int64_t n_rows = 4;
+    const size_t  row_el = (size_t)dim;
+
+    ggml_init_params params = { ggml_tensor_overhead(), nullptr, /*no_alloc*/ true };
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, n_rows);
+    ggml_set_name(cache, "cache_s_l0");           // triggers the fold at init_tensor
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    std::vector<float> X(row_el * n_rows);
+    for (size_t i = 0; i < X.size(); i++) X[i] = (float)((int)(i % 13) - 6);  // exact in bf16
+    ggml_backend_tensor_set(cache, X.data(), 0, X.size() * sizeof(float));
+
+    std::vector<float> Y(X.size(), -999.0f);
+    ggml_backend_tensor_get(cache, Y.data(), 0, Y.size() * sizeof(float));
+    bool whole_ok = (X == Y);
+
+    // Sub-range: overwrite rows [1,3) only, leave rows 0 and 3 untouched.
+    const int64_t head = 1, cells = 2;
+    std::vector<float> Z(row_el * cells);
+    for (size_t i = 0; i < Z.size(); i++) Z[i] = (float)(100 + (int)(i % 7));
+    ggml_backend_tensor_set(cache, Z.data(), head * row_el * sizeof(float), Z.size() * sizeof(float));
+
+    std::vector<float> W(X.size(), -999.0f);
+    ggml_backend_tensor_get(cache, W.data(), 0, W.size() * sizeof(float));
+    bool range_ok = true;
+    for (int64_t r = 0; r < n_rows; r++) {
+        for (size_t c = 0; c < row_el; c++) {
+            float expect = (r >= head && r < head + cells) ? Z[(r - head) * row_el + c] : X[r * row_el + c];
+            if (W[r * row_el + c] != expect) { range_ok = false; }
+        }
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    printf("[row-fold round-trip] whole: %s   sub-range: %s\n",
+        whole_ok ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m",
+        range_ok ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m");
+    return whole_ok && range_ok;
+}
+
+// Correctness gate for the WKV7 metalium path (flat r/w/k/v reader + folded state, both now the
+// unconditional default). r/w/k/v are fed to the kernel WITHOUT their [n_embd,T]->[S,H,T] head
+// reshape (the handler passes the un-reshaped parent and the reader addresses each head's
+// column-tiles itself); the recurrent state is folded on entry. Each config runs the
+// reshape->rwkv_wkv7 graph on metalium and compares against CPU. w is filled in (0,1) (a valid
+// decay) so the kernel's synthetic-w clamp is a no-op and CPU is a faithful oracle; a,b are
+// l2-normed (matches the real model and avoids long-seqlen NaN).
+static bool test_wkv7_flat_input(ggml_backend_t metalium, ggml_backend_t cpu) {
+    struct cfg { int64_t S, H, Tseq, G; const char * name; };
+    const cfg cfgs[] = {
+        { 64, 64,  1, 1, "L1G1 (decode)" },
+        { 64, 64,  8, 1, "L8G1 (decode)" },
+        { 64, 64, 20, 1, "L20G1 (partial chunk)" },
+        { 64, 64, 32, 1, "L32G1 (chunked)" },
+        { 64, 64, 32, 4, "L32G4 (chunked, multi-seq)" },
+        { 64, 64, 48, 2, "L48G2 (cross-32, seq-offset)" },
+    };
+
+    auto fill_det = [](ggml_tensor * t, uint32_t seed, float lo, float hi) {
+        size_t n = ggml_nelements(t);
+        std::vector<float> d(n);
+        std::mt19937 g(seed);
+        std::uniform_real_distribution<float> u(lo, hi);
+        for (auto & x : d) x = u(g);
+        ggml_backend_tensor_set(t, d.data(), 0, n * sizeof(float));
+    };
+
+    // Build + compute the reshape->rwkv_wkv7 graph on `backend`; return the output.
+    auto run = [&](ggml_backend_t backend, int64_t S, int64_t H, int64_t T, int64_t G,
+                   std::vector<float> & out) -> bool {
+        ggml_init_params p = { ggml_tensor_overhead() * 64 + ggml_graph_overhead(), nullptr, /*no_alloc*/ true };
+        ggml_context * ctx = ggml_init(p);
+        // r/w/k/v as flat [n_embd,T] parents + the head reshape the flat path elides on device.
+        ggml_tensor * rp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S * H, T);
+        ggml_tensor * wp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S * H, T);
+        ggml_tensor * kp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S * H, T);
+        ggml_tensor * vp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S * H, T);
+        ggml_tensor * ap = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S, H, T);   // a,b stay [S,H,T]
+        ggml_tensor * bp = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S, H, T);
+        ggml_tensor * sp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S * S * H, G);
+        ggml_tensor * r = ggml_reshape_3d(ctx, rp, S, H, T);
+        ggml_tensor * w = ggml_reshape_3d(ctx, wp, S, H, T);
+        ggml_tensor * k = ggml_reshape_3d(ctx, kp, S, H, T);
+        ggml_tensor * v = ggml_reshape_3d(ctx, vp, S, H, T);
+        ggml_tensor * a = ggml_l2_norm(ctx, ap, 1e-7F);
+        ggml_tensor * b = ggml_l2_norm(ctx, bp, 1e-7F);
+        ggml_tensor * o = ggml_rwkv_wkv7(ctx, r, w, k, v, a, b, sp);
+
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, o);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (buf == NULL) { ggml_free(ctx); return false; }
+
+        // Identical deterministic inputs for both backends (per-role fixed seeds). w in (0,1).
+        fill_det(rp, 1001, -1.0f, 1.0f);
+        fill_det(wp, 1002,  0.0f, 0.99f);
+        fill_det(kp, 1003, -1.0f, 1.0f);
+        fill_det(vp, 1004, -1.0f, 1.0f);
+        fill_det(ap, 1005, -1.0f, 1.0f);
+        fill_det(bp, 1006, -1.0f, 1.0f);
+        fill_det(sp, 1007, -1.0f, 1.0f);
+
+        ggml_backend_graph_compute(backend, gf);
+        out.resize(ggml_nelements(o));
+        ggml_backend_tensor_get(o, out.data(), 0, ggml_nbytes(o));
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return true;
+    };
+
+    bool all_ok = true;
+    printf("[wkv7 metalium vs cpu]\n");
+    for (const auto & c : cfgs) {
+        const int64_t S = c.S, H = c.H, G = c.G, T = c.Tseq * c.G;
+        std::vector<float> o_cpu, o_tt;
+        bool ran = run(cpu, S, H, T, G, o_cpu) && run(metalium, S, H, T, G, o_tt);
+
+        // Reject a degenerate (constant/near-zero) reference -- nmse would be meaningless.
+        double ref_energy = 0.0;
+        for (float x : o_cpu) ref_energy += (double)x * x;
+
+        double e = ran ? nmse(o_cpu.data(), o_tt.data(), o_cpu.size()) : 1e9;
+        const double tol = 2e-2;   // bf16 device vs f32 CPU
+        bool pass = ran && ref_energy > 1e-6 && e < tol;
+        all_ok &= pass;
+        printf("  %-30s metalium/cpu nmse=%.2e  %s\n",
+            c.name, e, pass ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m");
+    }
+    return all_ok;
+}
+
+// Correctness gate for slice_write_region2_folded: the WKV7 region-2 (final state) scattered
+// straight into the row-folded cache must round-trip (unfold on read) back to the CPU WKV7's
+// region-2. The folded cache canonical flat index f = h*S*S + i*S + j maps to the WKV7 output
+// flat index T*C + f (region-2 rows start at row T, col = i*S+j), so cache_canon[f] == o_cpu[T*C+f].
+// This exercises the whole chain: WKV7 -> view_1d(region-2) -> cpy(folded cache) -> my scatter.
+static bool test_slice_write_folded(ggml_backend_t metalium, ggml_backend_t cpu) {
+    const int64_t S = 64, H = 64, G = 1, C = S * H, dim = S * S * H;
+    struct cfg { int64_t L; const char * name; };
+    const cfg cfgs[] = { { 1, "L1 (decode)" }, { 8, "L8 (decode)" }, { 32, "L32 (chunked)" } };
+
+    auto fill_det = [](ggml_tensor * t, uint32_t seed, float lo, float hi) {
+        size_t n = ggml_nelements(t);
+        std::vector<float> d(n);
+        std::mt19937 g(seed);
+        std::uniform_real_distribution<float> u(lo, hi);
+        for (auto & x : d) x = u(g);
+        ggml_backend_tensor_set(t, d.data(), 0, n * sizeof(float));
+    };
+
+    // CPU: full WKV7 output (region-1 + region-2). Metalium: same WKV7, but region-2 is cpy'd into
+    // a folded cache and we read the cache back (canonical). out_cache holds [dim], out_full [C*(T+S*G)].
+    auto run = [&](ggml_backend_t backend, int64_t T, bool via_cache,
+                   std::vector<float> & out) -> bool {
+        ggml_init_params p = { ggml_tensor_overhead() * 64 + ggml_graph_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(p);
+        ggml_tensor * rp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S * H, T);
+        ggml_tensor * wp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S * H, T);
+        ggml_tensor * kp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S * H, T);
+        ggml_tensor * vp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S * H, T);
+        ggml_tensor * ap = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S, H, T);
+        ggml_tensor * bp = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S, H, T);
+        ggml_tensor * sp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S * S * H, G);
+        ggml_tensor * r = ggml_reshape_3d(ctx, rp, S, H, T);
+        ggml_tensor * w = ggml_reshape_3d(ctx, wp, S, H, T);
+        ggml_tensor * k = ggml_reshape_3d(ctx, kp, S, H, T);
+        ggml_tensor * v = ggml_reshape_3d(ctx, vp, S, H, T);
+        ggml_tensor * a = ggml_l2_norm(ctx, ap, 1e-7F);
+        ggml_tensor * b = ggml_l2_norm(ctx, bp, 1e-7F);
+        ggml_tensor * o = ggml_rwkv_wkv7(ctx, r, w, k, v, a, b, sp);
+
+        ggml_tensor * cache = nullptr;
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        if (via_cache) {
+            // region-2 = view_1d(o, dim*G) at row offset T (byte offset T*C*4).
+            ggml_tensor * region2 = ggml_view_1d(ctx, o, dim * G, (size_t)C * T * sizeof(float));
+            cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S * S * H, G);
+            ggml_set_name(cache, "cache_s_l0");   // folded at init
+            ggml_tensor * cv = ggml_view_1d(ctx, cache, dim * G, 0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, region2, cv));
+        } else {
+            ggml_build_forward_expand(gf, o);
+        }
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (buf == NULL) { ggml_free(ctx); return false; }
+
+        fill_det(rp, 1001, -1.0f, 1.0f);
+        fill_det(wp, 1002,  0.0f, 0.99f);
+        fill_det(kp, 1003, -1.0f, 1.0f);
+        fill_det(vp, 1004, -1.0f, 1.0f);
+        fill_det(ap, 1005, -1.0f, 1.0f);
+        fill_det(bp, 1006, -1.0f, 1.0f);
+        fill_det(sp, 1007, -1.0f, 1.0f);
+
+        ggml_backend_graph_compute(backend, gf);
+        if (via_cache) {
+            out.resize(dim * G);
+            ggml_backend_tensor_get(cache, out.data(), 0, out.size() * sizeof(float));
+        } else {
+            out.resize(ggml_nelements(o));
+            ggml_backend_tensor_get(o, out.data(), 0, ggml_nbytes(o));
+        }
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return true;
+    };
+
+    bool all_ok = true;
+    printf("[slice_write_folded: WKV7 region-2 -> folded cache round-trip]\n");
+    for (const auto & c : cfgs) {
+        const int64_t T = c.L * G;
+        std::vector<float> o_cpu, cache_tt;
+        bool ran = run(cpu, T, /*via_cache*/ false, o_cpu) &&
+                   run(metalium, T, /*via_cache*/ true, cache_tt);
+        // Reference region-2 = o_cpu[T*C .. T*C+dim).
+        std::vector<float> ref(dim * G);
+        if (ran) for (int64_t f = 0; f < dim * G; f++) ref[f] = o_cpu[(size_t)C * T + f];
+
+        double ref_energy = 0.0;
+        for (float x : ref) ref_energy += (double)x * x;
+        double e = ran ? nmse(ref.data(), cache_tt.data(), ref.size()) : 1e9;
+        const double tol = 3e-2;
+        bool pass = ran && ref_energy > 1e-6 && e < tol;
+        all_ok &= pass;
+        printf("  %-20s cache/cpu-region2 nmse=%.2e  %s\n",
+            c.name, e, pass ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m");
+    }
+    return all_ok;
+}
+
 int main(int argc, char ** argv)
 {
     (void)argc;
@@ -785,21 +1022,56 @@ int main(int argc, char ** argv)
     }
     ggml_backend_t metalium = ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, 0), NULL);
 
+    bool row_fold_ok = test_row_fold_roundtrip(metalium);
+    bool wkv7_flat_ok = test_wkv7_flat_input(metalium, cpu);
+    bool swf_ok = test_slice_write_folded(metalium, cpu);
+
     std::vector<std::unique_ptr<test_case>> tests;
     // add_unittests(tests);
 
     ///////////////// put experiment code here /////////////////
     // easier on the eye to find it (also one line to disable UT)
-    tests.push_back(make_test([](ggml_context* ctx) {
-        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 32, 1, 1);
-        ggml_tensor* mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 32, 1, 1);
-        return ggml_soft_max_ext(ctx, a, mask, 1, 0);
-    }, "test softmax 0", 1e-5));
-    tests.push_back(make_test([](ggml_context* ctx) {
-        ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1023, 31, 1, 1);
-        ggml_tensor* mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1023, 31, 1, 1);
-        return ggml_soft_max_ext(ctx, a, mask, 1, 0);
-    }, "test softmax 1", 1e-5));
+    // Generic elementwise viewed fusion (compiler.cpp match_elemwise_view -> ttprm::mul/add/sub).
+    // UPSTREAM: one operand is a flat->head reshape the route absorbs as a producer-View (this is the
+    // RWKV7 kk*a shape -- the relayout we kill). hc>1 so it is a genuine per-head op.
+    for (const char * which : { "mul", "add", "sub" }) {
+        const std::string op = which;
+        tests.push_back(make_test([op](ggml_context* ctx) {
+            const int hs = 64, hc = 64, nt = 4;
+            ggml_tensor* head = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, hc, nt);
+            ggml_tensor* flat = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hs * hc, nt);
+            ggml_tensor* rsh  = ggml_reshape_3d(ctx, flat, hs, hc, nt);
+            if (op == "add") return ggml_add(ctx, head, rsh);
+            if (op == "sub") return ggml_sub(ctx, head, rsh);
+            return ggml_mul(ctx, head, rsh);
+        }, "Elementwise viewed " + op + " (upstream reshape)", 2e-2));
+    }
+    // DOWNSTREAM (head output flattened back to [n_embd, nt]) is NOT routed yet: relabeling the head-grid
+    // ttprm result to flat with ttnn::reshape is a real head->flat retile that corrupts for nt>1. It needs
+    // ttprm to write straight into the flat tile layout via an `out` View. Left here as the next step:
+    // tests.push_back(make_test([](ggml_context* ctx) {
+    //     const int hs = 64, hc = 64, nt = 4;
+    //     ggml_tensor* x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, hc, nt);
+    //     ggml_tensor* y = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, hc, nt);
+    //     return ggml_reshape_2d(ctx, ggml_mul(ctx, x, y), hs * hc, nt);
+    // }, "Elementwise viewed mul (downstream reshape)", 2e-2));
+
+    // Head-grid norm + per-channel affine (compiler.cpp match_head_affine -> head-grid layer_norm + two
+    // group-broadcast ttprm mul/add). This is RWKV7's ln_x: per-head NORM then a per-(head,lane) [n_embd]
+    // affine. Requires GGML_METALIUM_TTPRM_AFFINE=1 at runtime (the route is env-gated). nt=1 exercises the
+    // ttprm head-grid path with no broadcast (decode); nt=4 hits the token-group broadcast (or falls back).
+    for (const int nt : { 1, 4 }) {
+        tests.push_back(make_test([nt](ggml_context* ctx) {
+            const int hs = 64, hc = 64;
+            ggml_tensor* x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hs * hc, nt);
+            ggml_tensor* w    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hs * hc);
+            ggml_tensor* b    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hs * hc);
+            ggml_tensor* xh   = ggml_reshape_3d(ctx, x, hs, hc, nt);
+            ggml_tensor* nrm  = ggml_norm(ctx, xh, 64e-5f);
+            ggml_tensor* flat = ggml_reshape_2d(ctx, nrm, hs * hc, nt);
+            return ggml_add(ctx, ggml_mul(ctx, flat, w), b);
+        }, "Head norm + per-channel affine (nt=" + std::to_string(nt) + ")", 2e-2));
+    }
     ///////////////// end of experiment code /////////////////
 
     size_t total_tests = 0;
@@ -823,7 +1095,7 @@ int main(int argc, char ** argv)
         << "  Failed: " << total_tests - passed_tests - not_supported << " (" << std::round(1.0 - passed_ratio - not_supported_ratio) * 100 << "%)\n"
         << "  Not supported: " << not_supported << "\n";
 
-    bool failed = total_tests != passed_tests;
+    bool failed = (total_tests != passed_tests) || !row_fold_ok || !wkv7_flat_ok || !swf_ok;
     if(failed) {
         std::cout << "Some tests failed\n";
     }

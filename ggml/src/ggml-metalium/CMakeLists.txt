@@ -94,6 +94,60 @@ if(GGML_METALIUM_EMBED_KERNELS)
 endif()
 
 
+# ttPseudoRowMajor (ttprm): optional fused view/eltwise ops that consume ggml views without
+# materializing the reshape relayout. Enabled when $TTPRM_HOME points at the ttPseudoRowMajor
+# checkout, or when TTPRM_DIR points directly at its ttprm subdir.
+set(TTPRM_DIR "" CACHE PATH "ttPseudoRowMajor ttprm library dir")
+set(TTPRM_SOURCE_DIR "")
+if(DEFINED ENV{TTPRM_HOME} AND NOT "$ENV{TTPRM_HOME}" STREQUAL "")
+    set(TTPRM_SOURCE_DIR "$ENV{TTPRM_HOME}/ttprm")
+elseif(TTPRM_DIR)
+    set(TTPRM_SOURCE_DIR "${TTPRM_DIR}")
+endif()
+
+if(TTPRM_SOURCE_DIR)
+    # ttprm's lib subdir links two interface targets (ttmetal/ttnnlib). The real tt-metal/ttnn
+    # libraries are already linked into ggml-metalium, so here they only carry include paths +
+    # defines for compiling ttprm_ttnn; provide them if the surrounding build hasn't.
+    if(NOT TARGET ttmetal)
+        add_library(ttmetal INTERFACE)
+        target_include_directories(ttmetal INTERFACE
+            $ENV{TT_METAL_HOME}/build/include
+            $ENV{TT_METAL_HOME}
+            $ENV{TT_METAL_HOME}/tt_metal
+            $ENV{TT_METAL_HOME}/tt_metal/api
+            $ENV{TT_METAL_HOME}/tt_stl
+            $ENV{TT_METAL_HOME}/tt_metal/third_party/umd
+            $ENV{TT_METAL_HOME}/tt_metal/third_party/umd/device/
+            $ENV{TT_METAL_HOME}/tt_metal/third_party/umd/device/api
+            $ENV{TT_METAL_HOME}/tt_metal/third_party/umd/device/api/umd
+            $ENV{TT_METAL_HOME}/tt_metal/third_party/umd/device/api/umd/device
+            $ENV{TT_METAL_HOME}/tt_metal/hw/inc/
+            $ENV{TT_METAL_HOME}/tt_metal/third_party/tracy/public/tracy
+            $ENV{TT_METAL_HOME}/tt_metal/third_party/tracy/public/
+            $ENV{TT_METAL_HOME}/tt_metal/hostdevcommon/api/
+            $ENV{TT_METAL_HOME}/tt_metal/include
+        )
+        target_compile_definitions(ttmetal INTERFACE FMT_HEADER_ONLY SPDLOG_FMT_EXTERNAL)
+    endif()
+    if(NOT TARGET ttnnlib)
+        add_library(ttnnlib INTERFACE)
+        target_include_directories(ttnnlib INTERFACE
+            $ENV{TT_METAL_HOME}/ttnn
+            $ENV{TT_METAL_HOME}/ttnn/api
+            $ENV{TT_METAL_HOME}/ttnn/cpp
+        )
+    endif()
+    add_subdirectory(${TTPRM_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/ttprm)
+    target_compile_features(ttprm_ttnn PRIVATE cxx_std_20)
+    # ggml-metalium is a shared library, so the static ttprm_ttnn it absorbs must be PIC.
+    set_target_properties(ttprm_ttnn PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(ggml-metalium PRIVATE ttprm_ttnn)
+    target_compile_definitions(ggml-metalium PRIVATE GGML_METALIUM_HAVE_TTPRM)
+    message(STATUS "ttPseudoRowMajor (ttprm) enabled from ${TTPRM_SOURCE_DIR}")
+endif()
+
+
 target_compile_definitions(
     ggml-metalium PRIVATE
     FMT_HEADER_ONLY

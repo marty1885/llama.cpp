@@ -127,7 +127,7 @@ public:
         auto gathered = ttggml::EmbeddingGather::invoke(*a_meta->row_folded, *index, (uint32_t)dst->ne[0]);
 
         auto * dst_meta = (ggml_tensor_extra_metalium *)dst->extra;
-        dst_meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(gathered));
+        ggml_metalium_store_tensor(dst_meta, std::move(gathered));
     }
 };
 
@@ -1271,6 +1271,37 @@ L2HeadNormLowering::match(ggml_tensor * l2, const FusionFacts & facts) const {
     site.head_count = site.root->ne[1];
     memcpy(&site.eps, site.root->op_params, sizeof(site.eps));
     site.kill_requests = std::move(r->kill_requests);
+    const int64_t hs     = site.head_size;
+    const int64_t hc     = site.head_count;
+    const int64_t nt     = site.root->ne[2];
+    const int64_t n_embd = hs * hc;
+
+    auto is_private = [&](const ggml_tensor * n) { return facts.is_private(n); };
+    auto request_kill = [&](ggml_tensor * n) {
+        if (n != nullptr && std::find(site.kill_requests.begin(), site.kill_requests.end(), n) == site.kill_requests.end()) {
+            site.kill_requests.push_back(n);
+        }
+    };
+    auto request_leaf_relayout = [&](ggml_tensor * operand) {
+        if (operand == nullptr || !facts.is_private(operand)) {
+            return;
+        }
+        ViewChain chain = analyze_view_chain(operand, hs, hc, nt, is_private, /*is_root=*/false);
+        if (chain.kind != ViewChain::Leaf) {
+            return;
+        }
+        for (ggml_tensor * n : chain.absorbed) {
+            request_kill(n);
+        }
+        if (chain.leaf.target != operand) {
+            request_kill(operand);
+        }
+        if (is_flat_head_reshape(operand, n_embd, nt)) {
+            request_kill(operand);
+        }
+    };
+    request_leaf_relayout(site.a);
+    request_leaf_relayout(site.b);
     return site;
 #endif
 }
@@ -1716,7 +1747,7 @@ bool LerpLowering::apply(ggml_backend_metalium_context * ctx, const Site & site)
                                    /*canonical_out=*/true);
             if (res) {
                 auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
-                meta->tensor = std::make_shared<tt::tt_metal::Tensor>(res.value());
+                ggml_metalium_store_tensor(meta, res.value());
                 return true;
             }
         }
@@ -1725,13 +1756,14 @@ bool LerpLowering::apply(ggml_backend_metalium_context * ctx, const Site & site)
 
     auto out = ttnn::lerp(*cur, *x_prev, *weight);
     auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
-    meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(out));
+    ggml_metalium_store_tensor(meta, std::move(out));
     return true;
 }
 
 bool LinearLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) const {
     GGML_UNUSED(ctx);
     GGML_METALIUM_OP_SANITY_CHECK(site.root);
+    auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
 
     auto a    = realize_ggml_view(site.weight); // matmul src0
     auto b    = realize_ggml_view(site.input);  // matmul src1
@@ -1747,14 +1779,13 @@ bool LinearLowering::apply(ggml_backend_metalium_context * ctx, const Site & sit
         /* bias                   = */ *bias,
         /* transpose_a            = */ false,
         /* transpose_b            = */ true,
-        /* memory_config          = */ std::nullopt,
+        /* memory_config          = */ meta->memory_config,
         /* dtype                  = */ std::nullopt,
         /* program_config         = */ std::nullopt,
         /* activation             = */ std::nullopt,
         /* compute_kernel_config  = */ make_compute_kernel_config(b->device()));
 
-    auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
-    meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(out));
+    ggml_metalium_store_tensor(meta, std::move(out));
     return true;
 }
 
@@ -1782,7 +1813,7 @@ bool NormAffineLowering::apply(ggml_backend_metalium_context * ctx, const Site &
     auto out = site.is_rms ? ttnn::rms_norm(*x, eps, *weight, *bias)
                            : ttnn::layer_norm(*x, eps, *weight, *bias);
     auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
-    meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(out));
+    ggml_metalium_store_tensor(meta, std::move(out));
     return true;
 }
 
@@ -1841,7 +1872,7 @@ bool TtprmNormAffineLowering::apply(ggml_backend_metalium_context * ctx, const S
     }
 
     auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
-    meta->tensor = std::make_shared<tt::tt_metal::Tensor>(res.value());
+    ggml_metalium_store_tensor(meta, res.value());
     return true;
 #else
     GGML_UNUSED(site);
@@ -1861,7 +1892,7 @@ bool MacLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) 
     // dtype coercion is needed (matches the unfused path).
     auto out = ttnn::mac(*a, *b, *c, std::nullopt);
     auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
-    meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(out));
+    ggml_metalium_store_tensor(meta, std::move(out));
     return true;
 }
 
@@ -1953,33 +1984,45 @@ bool L2HeadNormLowering::apply(ggml_backend_metalium_context * ctx, const Site &
 #ifdef GGML_METALIUM_HAVE_TTPRM
     GGML_METALIUM_OP_SANITY_CHECK(site.root);
 
-    auto a = realize_ggml_view(site.a); // k     [nt, n_embd]
-    auto b = realize_ggml_view(site.b); // k_k   [1,  n_embd]  (broadcast over the tokens)
-
-    // ttprm::mul_l2_norm requires bf16 operands; bail to native otherwise (the lerp path gates the same).
-    if (a->dtype() != tt::tt_metal::DataType::BFLOAT16) {
-        return false;
-    }
-    if (b->dtype() != a->dtype()) {
-        b = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*b, a->dtype()));
-    }
-
     const int64_t hs = site.head_size;
     const int64_t hc = site.head_count;
     const int64_t nt = site.root->ne[2];
 
-    ttprm::View av = ttprm::view_of(*a);
-    ttprm::View bv = ttprm::view_of(*b);
+    auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
+    std::unordered_set<const ggml_tensor *> killed(site.kill_requests.begin(), site.kill_requests.end());
+    auto is_private = [&](const ggml_tensor * n) { return killed.find(n) != killed.end(); };
+    BuiltView a = build_view_chain(analyze_view_chain(site.a, hs, hc, nt, is_private, /*is_root=*/false), hs, hc, nt);
+    BuiltView b = build_view_chain(analyze_view_chain(site.b, hs, hc, nt, is_private, /*is_root=*/false), hs, hc, nt);
+
+    if (a.ok && b.ok && a.view && b.view) {
+        auto res = ttprm::mul_l2_norm(*a.view, *b.view, site.eps);
+        if (res) {
+            ggml_metalium_store_tensor(meta, reshape_tt_tensor_into_ggml(res.value(), site.root));
+            return true;
+        }
+    }
+
+    auto ar = realize_ggml_view(site.a); // k     [nt, n_embd]
+    auto br = realize_ggml_view(site.b); // k_k   [1,  n_embd]  (broadcast over the tokens)
+
+    if (ar->dtype() != tt::tt_metal::DataType::BFLOAT16) {
+        return false;
+    }
+    if (br->dtype() != ar->dtype()) {
+        br = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*br, ar->dtype()));
+    }
+
+    ttprm::View av = ttprm::view_of(*ar);
+    ttprm::View bv = ttprm::view_of(*br);
     ttprm::View a_head = av.slice({ { 0, av.rows(), 1 }, { 0, av.cols(), 1 } }).reshape({ hc * nt, hs });
     ttprm::View b_head = bv.slice({ { 0, bv.rows(), 1 }, { 0, bv.cols(), 1 } }).reshape({ hc, hs });
 
     auto res = ttprm::mul_l2_norm(a_head, b_head, site.eps);
-    if (!res) {
-        return false;
+    if (res) {
+        ggml_metalium_store_tensor(meta, reshape_tt_tensor_into_ggml(res.value(), site.root));
+        return true;
     }
-    auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
-    meta->tensor = std::make_shared<tt::tt_metal::Tensor>(reshape_tt_tensor_into_ggml(res.value(), site.root));
-    return true;
+    return false;
 #else
     GGML_UNUSED(site);
     return false;
@@ -2021,7 +2064,7 @@ bool HeadNormLowering::apply(ggml_backend_metalium_context * ctx, const Site & s
         return false;
     }
     auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
-    meta->tensor = std::make_shared<tt::tt_metal::Tensor>(reshape_tt_tensor_into_ggml(res.value(), site.root));
+    ggml_metalium_store_tensor(meta, reshape_tt_tensor_into_ggml(res.value(), site.root));
     return true;
 #else
     GGML_UNUSED(site);
@@ -2047,8 +2090,7 @@ bool HeadAffineLowering::apply(ggml_backend_metalium_context * ctx, const Site &
     ViewChain chain = analyze_view_chain(site.root, hs, hc, nt, is_priv);
     BuiltView bv    = build_view_chain(chain, hs, hc, nt);
     if (bv.ok && bv.result) {
-        meta->tensor =
-            std::make_shared<tt::tt_metal::Tensor>(reshape_tt_tensor_into_ggml(*bv.result, site.root));
+        ggml_metalium_store_tensor(meta, reshape_tt_tensor_into_ggml(*bv.result, site.root));
         return true;
     }
     // The absorbed nodes are inert, so fallback recomputes the native result here.
@@ -2061,7 +2103,7 @@ bool HeadAffineLowering::apply(ggml_backend_metalium_context * ctx, const Site &
     auto wt = realize_ggml_view(site.weight);    to_bf16(wt);
     auto bt = realize_ggml_view(site.bias);      to_bf16(bt);
     auto scaled = ttnn::multiply(*nf, *wt);
-    meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::add(scaled, *bt));
+    ggml_metalium_store_tensor(meta, ttnn::add(scaled, *bt));
     return true;
 #else
     GGML_UNUSED(site);
@@ -2150,7 +2192,7 @@ bool RkGateLowering::apply(ggml_backend_metalium_context * ctx, const Site & sit
         auto ov = head_view(out);
         auto res = ttprm::rk(rv, kv, wv, vv, *cv, ov);
         if (res) {
-            meta->tensor = std::make_shared<tt::tt_metal::Tensor>(res.value());
+            ggml_metalium_store_tensor(meta, res.value());
             return true;
         }
     }
@@ -2179,7 +2221,7 @@ bool RkGateLowering::apply(ggml_backend_metalium_context * ctx, const Site & sit
         cur_flat = realize_ggml_view(site.cur); // cur was left live (not absorbed)
     }
     to_bf16(cur_flat);
-    meta->tensor = std::make_shared<tt::tt_metal::Tensor>(ttnn::add(*cur_flat, v_rk_flat));
+    ggml_metalium_store_tensor(meta, ttnn::add(*cur_flat, v_rk_flat));
     return true;
 #else
     GGML_UNUSED(site);
@@ -2216,8 +2258,7 @@ bool ElemwiseViewLowering::apply(ggml_backend_metalium_context * ctx, const Site
             if (!res) {
                 return false;
             }
-            meta->tensor = std::make_shared<tt::tt_metal::Tensor>(
-                    reshape_tt_tensor_into_ggml(res.value(), site.root));
+            ggml_metalium_store_tensor(meta, reshape_tt_tensor_into_ggml(res.value(), site.root));
             return true;
         };
         switch (site.op) {
@@ -2248,7 +2289,7 @@ bool ElemwiseViewLowering::apply(ggml_backend_metalium_context * ctx, const Site
             default:          return ttnn::multiply(*ah, *bh);
         }
     }();
-    meta->tensor = std::make_shared<tt::tt_metal::Tensor>(reshape_tt_tensor_into_ggml(out, site.root));
+    ggml_metalium_store_tensor(meta, reshape_tt_tensor_into_ggml(out, site.root));
     return true;
 #else
     GGML_UNUSED(site);
@@ -2259,6 +2300,7 @@ bool ElemwiseViewLowering::apply(ggml_backend_metalium_context * ctx, const Site
 bool ActLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) const {
     GGML_UNUSED(ctx);
     GGML_METALIUM_OP_SANITY_CHECK(site.root);
+    auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
 
     // Same operand mapping as the backend's MUL_MAT lowering: (b=input, a=weight, transpose_b=true).
     auto a = realize_ggml_view(site.weight);
@@ -2273,17 +2315,16 @@ bool ActLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) 
         }
         out = ttnn::operations::matmul::linear(
             *b, *a, *bias, /*transpose_a*/ false, /*transpose_b*/ true,
-            std::nullopt, std::nullopt, std::nullopt, /*activation*/ act,
+            meta->memory_config, std::nullopt, std::nullopt, /*activation*/ act,
             make_compute_kernel_config(b->device()));
     } else {
         out = ttnn::operations::matmul::matmul(
             *b, *a, /*transpose_a*/ false, /*transpose_b*/ true,
-            std::nullopt, std::nullopt, std::nullopt, /*activation*/ act,
+            meta->memory_config, std::nullopt, std::nullopt, /*activation*/ act,
             make_compute_kernel_config(b->device()));
     }
 
-    auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
-    meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(out));
+    ggml_metalium_store_tensor(meta, std::move(out));
     return true;
 }
 

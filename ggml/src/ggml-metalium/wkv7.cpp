@@ -223,11 +223,11 @@ wkv7_device::program::WKV7ProgramFactory::create(
 
     KernelHandle compute;
     if (!decode) {
-        ComputeConfig cc{.math_fidelity = MathFidelity::HiFi4};
+        ComputeConfig cc{.math_fidelity = tt::tt_metal::MathFidelity::HiFi4};
         cc.fp32_dest_acc_en = true;
         compute = CreateMetaliumKernel(prog, "wkv7_chunked_compute", core, cc);
     } else {
-        ComputeConfig cc{.math_fidelity = MathFidelity::HiFi4};
+        ComputeConfig cc{.math_fidelity = tt::tt_metal::MathFidelity::HiFi4};
         compute = CreateMetaliumKernel(prog, "wkv7_decodeL_compute", core, cc);
     }
 

@@ -5,6 +5,7 @@
 // tensors and TTNN tensors; everything else stays private to ggml-metalium.cpp.
 
 #include <memory>
+#include <optional>
 #include <string>
 
 #include <ttnn/tensor/tensor.hpp>
@@ -25,6 +26,8 @@ struct ggml_tensor_extra_metalium {
     // authoritative device copy stored as [n_rows, dim/32, 32] and `tensor` is dropped
     std::shared_ptr<tt::tt_metal::Tensor> row_folded;
 
+    std::optional<tt::tt_metal::MemoryConfig> memory_config;
+
     bool is_row_folded() const { return row_folded != nullptr; }
 };
 
@@ -38,6 +41,10 @@ struct ggml_backend_metalium_context {
 
 // Materialises the TTNN tensor backing a (possibly lazily-viewed) ggml tensor.
 std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tensor);
+
+// Store a normal materialized tensor result while preserving output placement intent.
+void ggml_metalium_store_tensor(ggml_tensor_extra_metalium* meta, tt::tt_metal::Tensor value);
+void ggml_metalium_store_tensor(ggml_tensor_extra_metalium* meta, std::shared_ptr<tt::tt_metal::Tensor> value);
 
 // Adapt a TTNN tensor's logical shape to a ggml node's shape (no-op if already equal, else ttnn::reshape).
 // Fusions that emit a result in a different-but-equivalent tiling use this so the backend's post-op shape

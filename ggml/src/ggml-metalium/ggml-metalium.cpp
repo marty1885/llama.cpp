@@ -38,12 +38,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <mutex>
 #include <chrono>
 #include <map>
 #include <sstream>
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 #include <string_view>
 #include <ttnn/core.hpp>
@@ -79,7 +81,7 @@
 #include <ttnn/operations/experimental/slice_write/slice_write.hpp>
 
 #ifdef GGML_METALIUM_HAVE_TTPRM
-#include "view_realize_op.hpp"
+#include "ttprm.hpp"
 #endif
 
 
@@ -99,7 +101,7 @@ struct ggml_backend_metalium_device_context {
     int device_id = -1;
     std::string name;
     std::string description;
-    std::unique_ptr<MetaliumGraphCompiler> compiler;
+    std::unique_ptr<MetaliumGraphCompiler> op_support;
 };
 
 struct ggml_backend_metalium_reg_context {
@@ -207,8 +209,8 @@ struct ggml_backend_metalium_debug_flags {
     bool disable_program_cache = false;     // Disables the program cache
     bool experimental_ops = false;          // Enable experimental ops that is known to cause trouble
     bool disable_graph_compiler = false;    // Skip the graph compiler entirely; fall back to native per-op dispatch
-    bool print_local_timing = false;        // Per-op host+device timing (Finish after each op). Separate from Tracy.
     bool print_trace_mem = false;           // DRAM attribution under tracing: pinned intermediates vs IO vs trace cmd buffers
+    bool release_activations = false;       // Release intermediate device tensors after their last effective read
 };
 
 static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
@@ -230,8 +232,8 @@ static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
         .disable_program_cache = parse_env("GGML_METALIUM_DISABLE_PROGRAM_CACHE"),
         .experimental_ops = parse_env("GGML_METALIUM_EXPERIMENTAL_OPS"),
         .disable_graph_compiler = parse_env("GGML_METALIUM_DISABLE_GRAPH_COMPILER"),
-        .print_local_timing = parse_env("GGML_METALIUM_PRINT_LOCAL_TIMING"),
-        .print_trace_mem = parse_env("GGML_METALIUM_TRACE_MEM")
+        .print_trace_mem = parse_env("GGML_METALIUM_TRACE_MEM"),
+        .release_activations = parse_env("GGML_METALIUM_RELEASE_ACTIVATIONS")
     };
 }();
 
@@ -265,7 +267,8 @@ bool ggml_backend_metalium_tracing_enabled(void) {
 
 // [elease all captured traces. Defined further down where the state struct is complete;
 // forward-declared here because ggml_backend_metalium_free (above) calls it.
-static void metalium_trace_release_all(ttnn::MeshDevice* mesh);
+static void metalium_trace_release_all(ttnn::MeshDevice* mesh, MetaliumBackendRuntime * runtime);
+static void metalium_backend_runtime_free(MetaliumBackendRuntime * runtime);
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 // Actual backend code
@@ -2629,9 +2632,10 @@ static void ggml_backend_metalium_free(ggml_backend_t backend) {
     // atexit. Trace buffer deallocation calls GraphTracker::track_deallocate, which reads a
     // thread_local that is already destroyed during static teardown -> UAF segfault.
     // It's dumb
-    if(g_metalium_trace_enabled && ctx->device != nullptr) {
-        metalium_trace_release_all(ctx->device->get_mesh_device().get());
+    if(ctx->device != nullptr && ctx->runtime != nullptr) {
+        metalium_trace_release_all(ctx->device->get_mesh_device().get(), ctx->runtime);
     }
+    metalium_backend_runtime_free(ctx->runtime);
     delete ctx;
     delete backend;
 }
@@ -3133,7 +3137,31 @@ static ggml_backend_buffer_type_t ggml_backend_metalium_buffer_type(ggml_backend
     return &buffer_type_map[device_id];
 }
 
-// Persistent capture/replay state for one graph signature, held for the process lifetime.
+struct MetaliumReleaseScheduler {
+    bool finalized = false;
+    ggml_tensor ** graph_keys = nullptr;
+    ggml_bitset_t * graph_used = nullptr;
+    std::unordered_map<ggml_tensor *, ggml_tensor *> last_reader;
+    std::unordered_map<ggml_tensor *, ggml_tensor *> release_reader;
+    std::unordered_map<ggml_tensor *, std::vector<ggml_tensor *>> release_at;
+    std::unordered_map<ggml_tensor *, std::vector<ggml_tensor *>> final_release_at;
+    std::unordered_map<ggml_tensor *, int32_t> metalium_direct_uses;
+    std::unordered_map<ggml_tensor *, std::vector<ggml_tensor *>> views_by_source;
+
+    void reset() {
+        last_reader.clear();
+        release_reader.clear();
+        release_at.clear();
+        final_release_at.clear();
+        metalium_direct_uses.clear();
+        views_by_source.clear();
+        finalized = false;
+        graph_keys = nullptr;
+        graph_used = nullptr;
+    }
+};
+
+// Persistent capture/replay state for one graph signature, held for the backend lifetime.
 // @note Lifecycle across passes of the same signature: pass 1 runs eagerly (warmup: JIT compile,
 //   weight pre-transpose, allocs); pass 2 captures then executes once (capture only RECORDS the
 //   command stream, so an execute is needed to populate outputs); pass 3+ replay.
@@ -3151,10 +3179,6 @@ struct metalium_trace_exec_state {
     std::vector<std::pair<ggml_tensor*, std::shared_ptr<tt::tt_metal::Tensor>>> pin_plan;  // input node + baked anchor
     std::vector<std::pair<int, std::shared_ptr<tt::tt_metal::Tensor>>> rebind_plan;        // boundary node idx + tensor
 };
-static std::map<uint64_t, metalium_trace_exec_state>& metalium_trace_exec_states() {
-    static std::map<uint64_t, metalium_trace_exec_state> m;
-    return m;
-}
 
 
 // Tracking for tracing support
@@ -3197,22 +3221,33 @@ struct GGMLTensorEqual
     }
 };
 
-static std::unordered_map<GGMLTensorMeta, std::shared_ptr<tt::tt_metal::Tensor>, GGMLTensorHasher, GGMLTensorEqual> g_metalium_pinned_tensors;
+struct MetaliumBackendRuntime {
+    MetaliumReleaseScheduler release_sched;
+    std::map<uint64_t, metalium_trace_exec_state> trace_exec_states;
+    std::unordered_map<GGMLTensorMeta, std::shared_ptr<tt::tt_metal::Tensor>, GGMLTensorHasher, GGMLTensorEqual> pinned_tensors;
+};
 
-static void metalium_trace_release_all(ttnn::MeshDevice* mesh) {
-    auto& states = metalium_trace_exec_states();
-    for(auto& kv : states) {
+static void metalium_backend_runtime_free(MetaliumBackendRuntime * runtime) {
+    delete runtime;
+}
+
+static void metalium_trace_release_all(ttnn::MeshDevice* mesh, MetaliumBackendRuntime * runtime) {
+    if(runtime == nullptr) {
+        return;
+    }
+    for(auto& kv : runtime->trace_exec_states) {
         if(kv.second.captured) {
             try { ttnn::operations::trace::release_trace(mesh, kv.second.tid); }
             catch(...) {}
         }
     }
-    states.clear();
-    g_metalium_pinned_tensors.clear();
+    runtime->trace_exec_states.clear();
+    runtime->pinned_tensors.clear();
 }
 
-static void ggml_metalium_trace_mem_report(ttnn::MeshDevice* mesh, const char* tag) {
+static void ggml_metalium_trace_mem_report(ttnn::MeshDevice* mesh, MetaliumBackendRuntime * runtime, const char* tag) {
     if(!g_debug_flags.print_trace_mem) return;
+    if(runtime == nullptr) return;
 
     std::unordered_set<uint64_t> seen;
     auto buf_bytes = [&](const std::shared_ptr<tt::tt_metal::Tensor>& t) -> uint64_t {
@@ -3224,10 +3259,9 @@ static void ggml_metalium_trace_mem_report(ttnn::MeshDevice* mesh, const char* t
         } catch(...) { return 0; }
     };
 
-    auto& states = metalium_trace_exec_states();
     size_t n_traces = 0, n_nodes_pinned = 0;
     uint64_t node_bytes = 0;
-    for(auto& kv : states) {
+    for(auto& kv : runtime->trace_exec_states) {
         if(!kv.second.captured) continue;
         n_traces++;
         for(auto& nt : kv.second.node_tensors) {
@@ -3235,7 +3269,7 @@ static void ggml_metalium_trace_mem_report(ttnn::MeshDevice* mesh, const char* t
         }
     }
     uint64_t io_bytes = 0;
-    for(auto& kv : g_metalium_pinned_tensors) io_bytes += buf_bytes(kv.second);
+    for(auto& kv : runtime->pinned_tensors) io_bytes += buf_bytes(kv.second);
 
     uint64_t dram_alloc = 0, dram_free = 0;
     try {
@@ -3274,6 +3308,7 @@ uint64_t metalium_graph_key(const ggml_cgraph* g) {
 struct metalium_trace_dispatch {
     ggml_cgraph* graph = nullptr;
     ttnn::MeshDevice* mesh = nullptr;
+    MetaliumBackendRuntime * runtime = nullptr;
     metalium_trace_exec_state* state = nullptr;
     bool capturing = false;
 
@@ -3327,12 +3362,12 @@ struct metalium_trace_dispatch {
 
     // Pin one op == NONE external input to its anchor. Metal Trace bakes the device handle at
     // capture, so every input the trace reads must live at a stable handle across replays. Resolves
-    // (and on first sight populates) the anchor via the global map -- the SLOW pre-capture path.
+    // (and on first sight populates) the anchor via the backend pin map -- the SLOW pre-capture path.
     void pin_input(ggml_tensor* t, bool may_populate) const {
         if(t->op != GGML_OP_NONE || t->extra == nullptr) return;
         auto* m = (ggml_tensor_extra_metalium*)t->extra;
         if(m->tensor == nullptr || m->tensor->storage_type() != tt::tt_metal::StorageType::DEVICE) return;
-        auto& pins = g_metalium_pinned_tensors;
+        auto& pins = runtime->pinned_tensors;
         auto key = GGMLTensorMeta(t);
         auto it = pins.find(key);
         if(it == pins.end()) {
@@ -3357,8 +3392,8 @@ struct metalium_trace_dispatch {
                 if(!seen.insert(s).second) continue;
                 auto* m = (ggml_tensor_extra_metalium*)s->extra;
                 if(m->tensor == nullptr || m->tensor->storage_type() != tt::tt_metal::StorageType::DEVICE) continue;
-                auto it = g_metalium_pinned_tensors.find(GGMLTensorMeta(s));
-                if(it == g_metalium_pinned_tensors.end()) continue;
+                auto it = runtime->pinned_tensors.find(GGMLTensorMeta(s));
+                if(it == runtime->pinned_tensors.end()) continue;
                 state->pin_plan.emplace_back(s, it->second);
             }
         }
@@ -3398,10 +3433,11 @@ struct metalium_trace_dispatch {
         if(!g_metalium_trace_enabled) return false;
         graph = cgraph;
         mesh  = ctx->device->get_mesh_device().get();
+        runtime = ctx->runtime;
         // uid is OPTIONAL and some times not set. We use it if present, else fall back to a signature
         // of the graph's topology and node ops (slow).
         uint64_t key = cgraph->uid != 0 ? cgraph->uid : metalium_trace_graph_signature(cgraph);
-        state = &metalium_trace_exec_states()[key];
+        state = &runtime->trace_exec_states[key];
         state->passes++;
 
         if(state->captured) {
@@ -3434,12 +3470,102 @@ struct metalium_trace_dispatch {
         state->captured = true;
         snapshot_nodes();
         ttnn::operations::trace::execute_trace(mesh, state->tid, std::nullopt, /*blocking*/false);
-        ggml_metalium_trace_mem_report(mesh, "captured");
+        ggml_metalium_trace_mem_report(mesh, runtime, "captured");
     }
 };
 
+static ggml_tensor * metalium_release_resolve_view(ggml_tensor * t) {
+    while(t != nullptr && is_view(t)) {
+        t = t->view_src != nullptr ? t->view_src : t->src[0];
+    }
+    return t;
+}
+
+static bool metalium_release_reader_candidate(const ggml_tensor * node) {
+    return !is_view(node) && ggml_nelements(node) != 0;
+}
+
+static bool metalium_release_can_release_structural(const ggml_tensor * t) {
+    return t->op != GGML_OP_NONE &&
+        (t->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) == 0 &&
+        !is_view(t) &&
+        t->view_src == nullptr;
+}
+
+static void metalium_release_tensor(ggml_tensor * tensor) {
+    auto * meta = (ggml_tensor_extra_metalium *)tensor->extra;
+    if(meta == nullptr) {
+        return;
+    }
+    if(meta->tensor == nullptr && meta->row_folded == nullptr) {
+        return;
+    }
+    meta->tensor.reset();
+    meta->row_folded.reset();
+}
+
+static void metalium_release_finalize_schedule(MetaliumReleaseScheduler & sched, const ggml_cgraph * cgraph) {
+    auto global_use_count = [&](const ggml_tensor * t) -> int32_t {
+        size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+        if(pos == GGML_HASHSET_FULL ||
+            !ggml_bitset_get(cgraph->visited_hash_set.used, pos)) {
+            return 0;
+        }
+        return cgraph->use_counts[pos];
+    };
+
+    auto fully_local = [&](ggml_tensor * t) -> bool {
+        const int32_t global_uses = global_use_count(t);
+        const auto it = sched.metalium_direct_uses.find(t);
+        const int32_t metalium_uses = it == sched.metalium_direct_uses.end() ? 0 : it->second;
+        return global_uses >= 1 && metalium_uses == global_uses;
+    };
+
+    std::unordered_set<ggml_tensor *> releasable;
+    for(const auto & item : sched.last_reader) {
+        ggml_tensor * producer = item.first;
+        if(!metalium_release_can_release_structural(producer) || !fully_local(producer)) {
+            continue;
+        }
+        bool views_local = true;
+        const auto views = sched.views_by_source.find(producer);
+        if(views != sched.views_by_source.end()) {
+            for(ggml_tensor * view : views->second) {
+                if(!fully_local(view)) {
+                    views_local = false;
+                    break;
+                }
+            }
+        }
+        if(views_local) {
+            releasable.insert(producer);
+        }
+    }
+
+    sched.final_release_at.clear();
+    for(const auto & item : sched.release_at) {
+        ggml_tensor * reader = item.first;
+        for(ggml_tensor * producer : item.second) {
+            const auto final_reader = sched.release_reader.find(producer);
+            if(final_reader != sched.release_reader.end() &&
+                final_reader->second == reader &&
+                releasable.contains(producer)) {
+                sched.final_release_at[reader].push_back(producer);
+            }
+        }
+    }
+
+    sched.finalized = true;
+}
+
 static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
+
+    const bool release_activations = g_debug_flags.release_activations;
+    MetaliumReleaseScheduler & release_sched = ctx->runtime->release_sched;
+    if(release_activations && !release_sched.finalized) {
+        metalium_release_finalize_schedule(release_sched, cgraph);
+    }
 
     metalium_trace_dispatch trace;
     if(trace.begin(ctx, cgraph)) {
@@ -3452,8 +3578,14 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
         ctx->compiler->analyzeGraph(cgraph);
     }
 
+    std::vector<ggml_tensor *> pending_release;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
+        if(release_activations && release_sched.finalized) {
+            if(const auto it = release_sched.final_release_at.find(node); it != release_sched.final_release_at.end()) {
+                pending_release.insert(pending_release.end(), it->second.begin(), it->second.end());
+            }
+        }
 
         // std::cout << "Graph compute " << ggml_op_desc(node) << "\n"
         //     << "  dst addr: " << node->data << "\n"
@@ -3477,15 +3609,6 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
         }
 
         // std::cout << ggml_op_name(node->op) << " node " << node->name << " with address " << node->data << std::endl;
-
-        std::chrono::steady_clock::time_point lt_t0;
-        if(g_debug_flags.print_local_timing) {
-            // Serialize so the elapsed time below reflects this op's host+device cost,
-            // not pipelined overlap with later ops.
-            tt::tt_metal::distributed::Finish(ctx->device->get_mesh_device()->mesh_command_queue());
-            lt_t0 = std::chrono::steady_clock::now();
-        }
-
         if (ctx->compiler != nullptr && ctx->compiler->tryLowerNode(ctx, node)) {
             // handled by the graph compiler
         } else switch (node->op) {
@@ -3659,33 +3782,17 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
             }
         }
 
-        if(g_debug_flags.print_local_timing) {
-            // Finish so the device work this op enqueued is fully drained before we stop the clock.
-            tt::tt_metal::distributed::Finish(ctx->device->get_mesh_device()->mesh_command_queue());
-            double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lt_t0).count();
-            static std::map<std::string, std::pair<double, uint64_t>> acc; // op -> {total_us, calls}
-            static uint64_t timed_ops = 0;
-            auto& e = acc[ggml_op_desc(node)];
-            e.first += us;
-            e.second += 1;
-            // Print a cumulative table every so often; the last one before exit is the full picture.
-            timed_ops++;
-            if(timed_ops % 4096 == 0) {
-                double grand = 0;
-                for(auto& kv : acc) grand += kv.second.first;
-                std::vector<std::pair<std::string, std::pair<double, uint64_t>>> rows(acc.begin(), acc.end());
-                std::sort(rows.begin(), rows.end(), [](auto& a, auto& b){ return a.second.first > b.second.first; });
-                fprintf(stderr, "\n=== METALIUM LOCAL TIMING (cumulative, %lu timed ops, %.1f ms total device+host) ===\n",
-                    (unsigned long)timed_ops, grand / 1000.0);
-                fprintf(stderr, "%-28s %8s %12s %7s %12s\n", "op", "calls", "total_ms", "%", "us/call");
-                for(auto& r : rows) {
-                    fprintf(stderr, "%-28s %8lu %12.2f %6.1f%% %12.1f\n",
-                        r.first.c_str(), (unsigned long)r.second.second, r.second.first / 1000.0,
-                        grand > 0 ? 100.0 * r.second.first / grand : 0.0,
-                        r.second.first / r.second.second);
-                }
-                fflush(stderr);
+        if(release_activations) {
+            for(ggml_tensor * tensor : pending_release) {
+                metalium_release_tensor(tensor);
             }
+            pending_release.clear();
+        }
+    }
+
+    if(release_activations) {
+        for(ggml_tensor * tensor : pending_release) {
+            metalium_release_tensor(tensor);
         }
     }
 
@@ -3693,6 +3800,94 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
 
     return GGML_STATUS_SUCCESS;
     GGML_UNUSED(backend);
+}
+
+static void ggml_backend_metalium_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    if(!g_debug_flags.release_activations) {
+        return;
+    }
+
+    ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
+    MetaliumReleaseScheduler & release_sched = ctx->runtime->release_sched;
+
+    if(release_sched.finalized ||
+        release_sched.graph_keys != cgraph->visited_hash_set.keys ||
+        release_sched.graph_used != cgraph->visited_hash_set.used) {
+        release_sched.reset();
+        release_sched.graph_keys = cgraph->visited_hash_set.keys;
+        release_sched.graph_used = cgraph->visited_hash_set.used;
+    }
+
+    if(ctx->compiler != nullptr) {
+        ctx->compiler->analyzeGraph(cgraph);
+    }
+
+    for(int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        for(int j = 0; j < GGML_MAX_SRC; j++) {
+            ggml_tensor * src = node->src[j];
+            if(src != nullptr) {
+                release_sched.metalium_direct_uses[src]++;
+            }
+        }
+        if(is_view(node)) {
+            ggml_tensor * producer = metalium_release_resolve_view(node);
+            if(producer != nullptr) {
+                release_sched.views_by_source[producer].push_back(node);
+            }
+        }
+        if(!metalium_release_reader_candidate(node)) {
+            continue;
+        }
+        for(int j = 0; j < GGML_MAX_SRC; j++) {
+            ggml_tensor * src = node->src[j];
+            if(src == nullptr) {
+                continue;
+            }
+            ggml_tensor * producer = metalium_release_resolve_view(src);
+            if(producer != nullptr) {
+                release_sched.last_reader[producer] = node;
+            }
+        }
+    }
+
+    std::unordered_map<ggml_tensor *, ggml_tensor *> last_pos;
+    std::function<void(ggml_tensor *, ggml_tensor *)> collect = [&](ggml_tensor * tensor, ggml_tensor * reader) {
+        if(tensor == nullptr) {
+            return;
+        }
+        if(is_view(tensor)) {
+            collect(tensor->view_src != nullptr ? tensor->view_src : tensor->src[0], reader);
+            return;
+        }
+        if(ctx->compiler != nullptr && ctx->compiler->isInert(tensor)) {
+            for(int j = 0; j < GGML_MAX_SRC; j++) {
+                collect(tensor->src[j], reader);
+            }
+            return;
+        }
+        last_pos[tensor] = reader;
+    };
+
+    for(int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if(is_view(node) || ggml_nelements(node) == 0) {
+            continue;
+        }
+        if(ctx->compiler != nullptr && ctx->compiler->isInert(node)) {
+            continue;
+        }
+        for(int j = 0; j < GGML_MAX_SRC; j++) {
+            collect(node->src[j], node);
+        }
+    }
+
+    for(const auto & item : last_pos) {
+        ggml_tensor * producer = item.first;
+        ggml_tensor * reader = item.second;
+        release_sched.release_at[reader].push_back(producer);
+        release_sched.release_reader[producer] = reader;
+    }
 }
 
 static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t device, const struct ggml_tensor * op);
@@ -3736,7 +3931,7 @@ static bool ggml_backend_metalium_device_supports_op_internal(ggml_backend_dev_t
     ggml_backend_metalium_device_context * ctx = (ggml_backend_metalium_device_context *)device->context;
 
     // Keep nodes with a special lowering on the device instead of the CPU.
-    if (ctx->compiler != nullptr && ctx->compiler->hasLowering(op)) {
+    if (ctx->op_support != nullptr && ctx->op_support->hasLowering(op)) {
         return true;
     }
 
@@ -3902,7 +4097,7 @@ static struct ggml_backend_i metalium_backend_i = {
     /* .graph_compute           = */ ggml_backend_metalium_graph_compute,
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
-    /* .graph_optimize          = */ NULL,
+    /* .graph_optimize          = */ ggml_backend_metalium_graph_optimize,
 };
 
 static ggml_guid_t ggml_backend_metalium_guid(void) {
@@ -3916,12 +4111,14 @@ static ggml_backend_t ggml_backend_metalium_init(ggml_backend_metalium_device_co
     GGML_ASSERT(device_id >= 0 && (size_t)device_id < tt::tt_metal::GetNumAvailableDevices());
     GGML_ASSERT(device != nullptr);
 
-    ggml_backend_metalium_context * ctx = new ggml_backend_metalium_context {
-        /* device            = */ device,
-        /* device_id         = */ device_id,
-        /* name              = */ dev_ctx->name,
-        /* compiler          = */ dev_ctx->compiler.get(),
-    };
+    ggml_backend_metalium_context * ctx = new ggml_backend_metalium_context;
+    ctx->device = device;
+    ctx->device_id = device_id;
+    ctx->name = dev_ctx->name;
+    if(!g_debug_flags.disable_graph_compiler) {
+        ctx->compiler = std::make_unique<MetaliumGraphCompiler>();
+    }
+    ctx->runtime = new MetaliumBackendRuntime();
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_metalium_guid(),
@@ -4146,7 +4343,7 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
         dev_ctx->device_id = device_id;
         dev_ctx->name = "METALIUM" + std::to_string(device_id);
         if(!g_debug_flags.disable_graph_compiler) {
-            dev_ctx->compiler = std::make_unique<MetaliumGraphCompiler>();
+            dev_ctx->op_support = std::make_unique<MetaliumGraphCompiler>();
         }
         // WHY???
         // chip_id_t MeshDevice::build_id() const { return reference_device()->id(); }

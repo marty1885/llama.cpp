@@ -5,6 +5,7 @@
 // tensors and TTNN tensors; everything else stays private to ggml-metalium.cpp.
 
 #include <memory>
+#include <string>
 
 #include <ttnn/tensor/tensor.hpp>
 #include <ttnn/device.hpp>
@@ -13,6 +14,7 @@
 #include "ggml.h"
 
 class MetaliumGraphCompiler;
+struct MetaliumBackendRuntime;
 
 // Per ggml-tensor device state, hung off ggml_tensor::extra.
 struct ggml_tensor_extra_metalium {
@@ -30,7 +32,8 @@ struct ggml_backend_metalium_context {
     ttnn::IDevice* device = nullptr;
     int device_id = 0;
     std::string name;
-    MetaliumGraphCompiler * compiler = nullptr; // non-owning, owned by the device context
+    std::unique_ptr<MetaliumGraphCompiler> compiler;
+    MetaliumBackendRuntime * runtime = nullptr;
 };
 
 // Materialises the TTNN tensor backing a (possibly lazily-viewed) ggml tensor.

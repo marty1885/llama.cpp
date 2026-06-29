@@ -15,7 +15,7 @@
 #include <vector>
 
 #ifdef GGML_METALIUM_HAVE_TTPRM
-#include "view_realize_op.hpp"
+#include "ttprm.hpp"
 #endif
 
 #include <ttnn/operations/copy/typecast/typecast.hpp>
@@ -1253,6 +1253,7 @@ L2HeadNormLowering::match(ggml_tensor * l2, const FusionFacts & facts) const {
     static const Pat pattern = [] {
         Pat mul = op(GGML_OP_MUL)
             .bind(&L2HeadNormLowering::Site::mul)
+            .kill()
             .of(any().bind(&L2HeadNormLowering::Site::a), any().bind(&L2HeadNormLowering::Site::b));
         Pat reshape = op(GGML_OP_RESHAPE).of(mul);
         return op(GGML_OP_L2_NORM)
@@ -1269,6 +1270,7 @@ L2HeadNormLowering::match(ggml_tensor * l2, const FusionFacts & facts) const {
     site.head_size = site.root->ne[0];
     site.head_count = site.root->ne[1];
     memcpy(&site.eps, site.root->op_params, sizeof(site.eps));
+    site.kill_requests = std::move(r->kill_requests);
     return site;
 #endif
 }

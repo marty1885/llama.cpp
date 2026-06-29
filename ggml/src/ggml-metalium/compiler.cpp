@@ -4,6 +4,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <functional>
 #include <initializer_list>
@@ -19,8 +20,10 @@
 #endif
 
 #include <ttnn/operations/copy/typecast/typecast.hpp>
+#include <ttnn/operations/eltwise/binary/binary.hpp>
 #include <ttnn/operations/eltwise/ternary/ternary.hpp>
 #include <ttnn/operations/eltwise/ternary/ternary_composite_op.hpp>
+#include <ttnn/operations/eltwise/unary/common/unary_op_types.hpp>
 #include <ttnn/operations/matmul/matmul.hpp>
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
@@ -417,6 +420,29 @@ const char * ggml_unary_act_string(const ggml_tensor * u) {
     }
 }
 
+std::optional<ttnn::operations::unary::EltwiseUnaryWithParam> ggml_unary_post_activation(const ggml_tensor * u) {
+    if (u == nullptr || u->op != GGML_OP_UNARY) {
+        return std::nullopt;
+    }
+    using ttnn::operations::unary::EltwiseUnaryWithParam;
+    using ttnn::operations::unary::UnaryOpType;
+    using ttnn::operations::unary::VecMode;
+    switch (ggml_get_unary_op(u)) {
+        case GGML_UNARY_OP_ABS:         return EltwiseUnaryWithParam(UnaryOpType::ABS);
+        case GGML_UNARY_OP_SGN:         return EltwiseUnaryWithParam(UnaryOpType::SIGN);
+        case GGML_UNARY_OP_NEG:         return EltwiseUnaryWithParam(UnaryOpType::NEG);
+        case GGML_UNARY_OP_TANH:        return EltwiseUnaryWithParam(UnaryOpType::TANH, static_cast<float>(false));
+        case GGML_UNARY_OP_ELU:         return EltwiseUnaryWithParam(UnaryOpType::ELU, 1.0f);
+        case GGML_UNARY_OP_RELU:        return EltwiseUnaryWithParam(UnaryOpType::RELU);
+        case GGML_UNARY_OP_SIGMOID:     return EltwiseUnaryWithParam(UnaryOpType::SIGMOID, {static_cast<float>(VecMode::RC), static_cast<float>(false)});
+        case GGML_UNARY_OP_SILU:        return EltwiseUnaryWithParam(UnaryOpType::SILU);
+        case GGML_UNARY_OP_HARDSWISH:   return EltwiseUnaryWithParam(UnaryOpType::HARDSWISH);
+        case GGML_UNARY_OP_HARDSIGMOID: return EltwiseUnaryWithParam(UnaryOpType::HARDSIGMOID);
+        case GGML_UNARY_OP_EXP:         return EltwiseUnaryWithParam(UnaryOpType::EXP, static_cast<float>(true));
+        default:                        return std::nullopt;
+    }
+}
+
 bool is_linear_bias(const ggml_tensor * bias, const ggml_tensor * matmul) {
     // ttnn::linear takes a per-output-channel bias vector broadcast over rows, not a full matrix.
     return bias != nullptr && matmul != nullptr &&
@@ -761,6 +787,31 @@ private:
     mutable std::unordered_map<const ggml_tensor *, Site> sites_;
 };
 
+// Fusing a scalar SCALE into a following unary activation.
+//   UNARY(SCALE(x))
+//
+// The SCALE bias form is left to the existing two-op path.
+class ScaleActLowering final : public FusionLoweringBase {
+public:
+    struct Site {
+        ggml_tensor * root  = nullptr;
+        ggml_tensor * x     = nullptr;
+        ggml_tensor * scale = nullptr;
+        ttnn::operations::unary::EltwiseUnaryWithParam act{ttnn::operations::unary::UnaryOpType::SIGMOID};
+        std::vector<ggml_tensor *> kill_requests;
+    };
+
+    std::string_view name() const override { return "scale_activation"; }
+    void resetPlan() const override { sites_.clear(); }
+    std::optional<FusionCandidate> matchFusion(ggml_tensor * node, const FusionFacts & facts) const override;
+    bool bindFusion(ggml_tensor * node, const FusionFacts & facts) const override;
+    bool lowerFusion(ggml_backend_metalium_context * ctx, ggml_tensor * node) const override;
+    std::optional<Site> match(ggml_tensor * u, const FusionFacts & facts) const;
+    bool apply(ggml_backend_metalium_context * ctx, const Site & site) const;
+private:
+    mutable std::unordered_map<const ggml_tensor *, Site> sites_;
+};
+
 // Fusing multiply-add into ttnn::mac.
 //   ADD(MUL(a, b), c)
 //
@@ -971,6 +1022,7 @@ DEFINE_FUSION_PLUMBING(LinearLowering)
 DEFINE_FUSION_PLUMBING(TtprmNormAffineLowering)
 DEFINE_FUSION_PLUMBING(NormAffineLowering)
 DEFINE_FUSION_PLUMBING(ActLowering)
+DEFINE_FUSION_PLUMBING(ScaleActLowering)
 DEFINE_FUSION_PLUMBING(MacLowering)
 DEFINE_FUSION_PLUMBING(L2HeadNormLowering)
 DEFINE_FUSION_PLUMBING(HeadNormLowering)
@@ -1228,6 +1280,33 @@ ActLowering::match(ggml_tensor * u, const FusionFacts & facts) const {
         }
     }
     return std::nullopt;
+}
+
+std::optional<ScaleActLowering::Site>
+ScaleActLowering::match(ggml_tensor * u, const FusionFacts & facts) const {
+    auto act = ggml_unary_post_activation(u);
+    if (!act || u->src[0] == nullptr || u->src[0]->op != GGML_OP_SCALE) {
+        return std::nullopt;
+    }
+
+    ggml_tensor * scale = u->src[0];
+    if (!facts.is_private(scale) || scale->src[0] == nullptr) {
+        return std::nullopt;
+    }
+
+    std::array<float, 2> params;
+    memcpy(params.data(), scale->op_params, sizeof(params));
+    if (params[1] != 0.0f) {
+        return std::nullopt;
+    }
+
+    Site site;
+    site.root = u;
+    site.x = scale->src[0];
+    site.scale = scale;
+    site.act = *act;
+    site.kill_requests.push_back(scale);
+    return site;
 }
 
 bool L2HeadNormLowering::shape(const L2HeadNormLowering::Site & site) {
@@ -1896,6 +1975,23 @@ bool MacLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) 
     return true;
 }
 
+bool ScaleActLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) const {
+    GGML_UNUSED(ctx);
+    GGML_METALIUM_OP_SANITY_CHECK(site.root);
+
+    auto x = realize_ggml_view(site.x);
+
+    std::array<float, 2> params;
+    memcpy(params.data(), site.scale->op_params, sizeof(params));
+    const float scale = params[0];
+
+    std::vector<ttnn::operations::unary::EltwiseUnaryWithParam> post_activations{site.act};
+    auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
+    auto out = ttnn::multiply(*x, scale, std::nullopt, meta->memory_config, std::nullopt, post_activations);
+    ggml_metalium_store_tensor(meta, std::move(out));
+    return true;
+}
+
 #ifdef GGML_METALIUM_HAVE_TTPRM
 // Apply-time builder for a view-chain: realizes leaves and emits the ttprm ops, returning the head-grid
 // View plus the tensors that must outlive it (bases + intermediate results). ok=false on any ttprm REJECT
@@ -2330,6 +2426,7 @@ bool ActLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) 
 
 MetaliumGraphCompiler::MetaliumGraphCompiler() {
     lowerings.push_back(std::make_unique<ActLowering>());
+    lowerings.push_back(std::make_unique<ScaleActLowering>());
     lowerings.push_back(std::make_unique<RkGateLowering>());
     lowerings.push_back(std::make_unique<HeadAffineLowering>());
     lowerings.push_back(std::make_unique<L2HeadNormLowering>());

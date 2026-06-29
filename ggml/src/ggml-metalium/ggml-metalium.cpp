@@ -1,3 +1,4 @@
+#include "build_Release/include/tt-metalium/experimental/tensor/tensor_types.hpp"
 #include "fmt/base.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
@@ -40,6 +41,7 @@
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <chrono>
 #include <map>
@@ -211,6 +213,7 @@ struct ggml_backend_metalium_debug_flags {
     bool disable_graph_compiler = false;    // Skip the graph compiler entirely; fall back to native per-op dispatch
     bool print_trace_mem = false;           // DRAM attribution under tracing: pinned intermediates vs IO vs trace cmd buffers
     bool release_activations = false;       // Release intermediate device tensors after their last effective read
+    bool print_reorder_mem = false;         // Print modeled DRAM pressure before/after graph reordering
 };
 
 static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
@@ -233,7 +236,8 @@ static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
         .experimental_ops = parse_env("GGML_METALIUM_EXPERIMENTAL_OPS"),
         .disable_graph_compiler = parse_env("GGML_METALIUM_DISABLE_GRAPH_COMPILER"),
         .print_trace_mem = parse_env("GGML_METALIUM_TRACE_MEM"),
-        .release_activations = parse_env("GGML_METALIUM_RELEASE_ACTIVATIONS")
+        .release_activations = parse_env("GGML_METALIUM_RELEASE_ACTIVATIONS"),
+        .print_reorder_mem = parse_env("GGML_METALIUM_REORDER_MEM")
     };
 }();
 
@@ -3492,6 +3496,446 @@ static bool metalium_release_can_release_structural(const ggml_tensor * t) {
         t->view_src == nullptr;
 }
 
+static uint64_t div_up(uint64_t x, uint64_t y) {
+    return y == 0 ? 0 : (x + y - 1) / y;
+}
+
+static uint64_t saturating_add(uint64_t x, uint64_t y) {
+    if(x > std::numeric_limits<uint64_t>::max() - y) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return x + y;
+}
+
+static uint64_t saturating_mul(uint64_t x, uint64_t y) {
+    if(x != 0 && y > std::numeric_limits<uint64_t>::max() / x) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return x * y;
+}
+
+static uint64_t metalium_reorder_tt_type_bytes(tt::tt_metal::DataType type) {
+    return tt::tt_metal::tile_size(type);
+}
+
+static uint64_t metalium_reorder_estimated_device_bytes(const ggml_tensor * tensor, tt::ARCH arch) {
+    if(tensor == nullptr || ggml_nelements(tensor) == 0) {
+        return 0;
+    }
+    const int64_t memory_channels = arch == tt::ARCH::WORMHOLE_B0 ? 6 : 8;
+    // integer types are allocated row major, but TT flavored row major
+    if(is_integer_type(tensor->type)) {
+        return std::max(tensor->ne[0], memory_channels) * tensor->ne[1] * tensor->ne[2] * tensor->ne[3]
+            * ggml_type_size(tensor->type);
+    }
+
+    const uint64_t tiles =
+        div_up((uint64_t)tensor->ne[0], 32) *
+        div_up((uint64_t)tensor->ne[1], 32) *
+        (uint64_t)tensor->ne[2] *
+        (uint64_t)tensor->ne[3];
+    return div_up(tiles, memory_channels)*memory_channels * metalium_reorder_tt_type_bytes(ggml2tt_type(tensor->type, arch));
+}
+
+static uint64_t metalium_reorder_bank_span_bytes(const ggml_tensor * tensor, tt::ARCH arch, uint64_t bank_count) {
+    static constexpr uint64_t page_size = 2048;
+    const uint64_t bytes = metalium_reorder_estimated_device_bytes(tensor, arch);
+    if(bytes == 0 || bank_count == 0) {
+        return 0;
+    }
+    const uint64_t pages = div_up(bytes, page_size);
+    return div_up(pages, bank_count) * page_size;
+}
+
+struct MetaliumReorderFirstFit {
+    struct Span {
+        uint64_t start = 0;
+        uint64_t size = 0;
+    };
+
+    std::vector<Span> free_spans;
+    std::unordered_map<ggml_tensor *, Span> live;
+    uint64_t high_water = 0;
+    uint64_t current = 0;
+
+    void allocate(ggml_tensor * tensor, uint64_t size) {
+        if(tensor == nullptr || size == 0 || live.find(tensor) != live.end()) {
+            return;
+        }
+        for(size_t i = 0; i < free_spans.size(); i++) {
+            Span & span = free_spans[i];
+            if(span.size < size) {
+                continue;
+            }
+            const Span alloc{span.start, size};
+            span.start += size;
+            span.size -= size;
+            if(span.size == 0) {
+                free_spans.erase(free_spans.begin() + i);
+            }
+            live[tensor] = alloc;
+            current += size;
+            return;
+        }
+        live[tensor] = Span{high_water, size};
+        high_water += size;
+        current += size;
+    }
+
+    void release(ggml_tensor * tensor) {
+        const auto it = live.find(tensor);
+        if(it == live.end()) {
+            return;
+        }
+        Span span = it->second;
+        current -= span.size;
+        live.erase(it);
+
+        auto pos = free_spans.begin();
+        while(pos != free_spans.end() && pos->start < span.start) {
+            ++pos;
+        }
+        pos = free_spans.insert(pos, span);
+        if(pos != free_spans.begin()) {
+            auto prev = pos - 1;
+            if(prev->start + prev->size == pos->start) {
+                prev->size += pos->size;
+                pos = free_spans.erase(pos);
+                pos = prev;
+            }
+        }
+        auto next = pos + 1;
+        if(next != free_spans.end() && pos->start + pos->size == next->start) {
+            pos->size += next->size;
+            free_spans.erase(next);
+        }
+    }
+
+    uint64_t fragmentation_penalty() const {
+        uint64_t total = 0;
+        uint64_t largest = 0;
+        for(const Span & span : free_spans) {
+            total += span.size;
+            largest = std::max(largest, span.size);
+        }
+        return total - largest;
+    }
+
+    uint64_t live_size(ggml_tensor * tensor) const {
+        const auto it = live.find(tensor);
+        return it == live.end() ? 0 : it->second.size;
+    }
+
+    uint64_t projected_high_water(uint64_t size) const {
+        if(size == 0) {
+            return high_water;
+        }
+        for(const Span & span : free_spans) {
+            if(span.size >= size) {
+                return high_water;
+            }
+        }
+        return high_water + size;
+    }
+};
+
+struct MetaliumReorderPlan {
+    std::unordered_map<ggml_tensor *, int> index;
+    std::vector<std::vector<int>> users;
+    std::vector<int> indegree;
+    std::unordered_map<ggml_tensor *, std::vector<ggml_tensor *>> reads;
+    std::unordered_map<ggml_tensor *, int32_t> remaining_uses;
+    std::unordered_set<ggml_tensor *> releasable;
+    std::unordered_map<ggml_tensor *, uint64_t> alloc_size;
+    std::unordered_map<ggml_tensor *, int> first_reader_index;
+};
+
+static bool metalium_reorder_materializes(const ggml_tensor * node, MetaliumGraphCompiler * compiler) {
+    return node != nullptr &&
+        node->op != GGML_OP_NONE &&
+        !is_view(node) &&
+        ggml_nelements(node) != 0 &&
+        (compiler == nullptr || !compiler->isInert(node));
+}
+
+static void metalium_reorder_collect_effective_read(
+        ggml_tensor * tensor,
+        MetaliumGraphCompiler * compiler,
+        std::vector<ggml_tensor *> & out) {
+    if(tensor == nullptr) {
+        return;
+    }
+    if(is_view(tensor)) {
+        metalium_reorder_collect_effective_read(
+            tensor->view_src != nullptr ? tensor->view_src : tensor->src[0],
+            compiler,
+            out);
+        return;
+    }
+    if(compiler != nullptr && compiler->isInert(tensor)) {
+        for(int i = 0; i < GGML_MAX_SRC; i++) {
+            metalium_reorder_collect_effective_read(tensor->src[i], compiler, out);
+        }
+        return;
+    }
+    out.push_back(tensor);
+}
+
+static void metalium_reorder_add_edge(MetaliumReorderPlan & plan, int from, int to, std::unordered_set<uint64_t> & edges) {
+    if(from == to || from < 0 || to < 0) {
+        return;
+    }
+    const uint64_t key = ((uint64_t)(uint32_t)from << 32) | (uint32_t)to;
+    if(!edges.insert(key).second) {
+        return;
+    }
+    plan.users[from].push_back(to);
+    plan.indegree[to]++;
+}
+
+static void metalium_reorder_apply_node(
+        ggml_tensor * node,
+        const MetaliumReorderPlan & plan,
+        MetaliumReorderFirstFit & alloc,
+        std::unordered_map<ggml_tensor *, int32_t> & remaining_uses) {
+    const auto alloc_it = plan.alloc_size.find(node);
+    if(alloc_it != plan.alloc_size.end()) {
+        alloc.allocate(node, alloc_it->second);
+    }
+
+    const auto reads_it = plan.reads.find(node);
+    if(reads_it == plan.reads.end()) {
+        return;
+    }
+    for(ggml_tensor * producer : reads_it->second) {
+        const auto remaining_it = remaining_uses.find(producer);
+        if(remaining_it == remaining_uses.end()) {
+            continue;
+        }
+        remaining_it->second--;
+        if(remaining_it->second == 0 && plan.releasable.find(producer) != plan.releasable.end()) {
+            alloc.release(producer);
+        }
+    }
+}
+
+static int metalium_reorder_choose_node(
+        const std::vector<ggml_tensor *> & nodes,
+        const std::vector<int> & ready,
+        const std::vector<int> & indegree,
+        const MetaliumReorderPlan & plan,
+        const MetaliumReorderFirstFit & alloc,
+        const std::unordered_map<ggml_tensor *, int32_t> & remaining_uses) {
+    int best = -1;
+    uint64_t best_pressure = std::numeric_limits<uint64_t>::max();
+    uint64_t best_lifetime = std::numeric_limits<uint64_t>::max();
+    uint64_t best_peak = std::numeric_limits<uint64_t>::max();
+    uint64_t best_current = std::numeric_limits<uint64_t>::max();
+    uint64_t best_alloc_size = std::numeric_limits<uint64_t>::max();
+    uint64_t best_freed = 0;
+
+    for(int i : ready) {
+        ggml_tensor * node = nodes[i];
+        uint64_t alloc_size = 0;
+        if(const auto alloc_it = plan.alloc_size.find(node); alloc_it != plan.alloc_size.end()) {
+            alloc_size = alloc_it->second;
+        }
+
+        uint64_t freed = 0;
+        if(const auto reads_it = plan.reads.find(node); reads_it != plan.reads.end()) {
+            for(ggml_tensor * producer : reads_it->second) {
+                const auto remaining_it = remaining_uses.find(producer);
+                if(remaining_it != remaining_uses.end() &&
+                    remaining_it->second == 1 &&
+                    plan.releasable.find(producer) != plan.releasable.end()) {
+                    freed += alloc.live_size(producer);
+                }
+            }
+        }
+
+        const uint64_t peak = alloc.projected_high_water(alloc_size);
+        const uint64_t current = alloc.current + alloc_size - std::min(freed, alloc.current + alloc_size);
+        uint64_t lifetime = 0;
+        if(alloc_size > 0 && plan.releasable.find(node) != plan.releasable.end()) {
+            bool unlocks_consumer = false;
+            for(int user : plan.users[i]) {
+                if(indegree[user] == 1) {
+                    unlocks_consumer = true;
+                    break;
+                }
+            }
+            const auto reader_it = plan.first_reader_index.find(node);
+            if(!unlocks_consumer && reader_it != plan.first_reader_index.end()) {
+                const int distance = std::max(0, reader_it->second - i);
+                lifetime = saturating_mul(alloc_size, (uint64_t)distance);
+            }
+        }
+        const uint64_t pressure = saturating_add(peak, lifetime);
+
+        if(best == -1 ||
+            pressure < best_pressure ||
+            (pressure == best_pressure && lifetime < best_lifetime) ||
+            (pressure == best_pressure && lifetime == best_lifetime && peak < best_peak) ||
+            (pressure == best_pressure && lifetime == best_lifetime && peak == best_peak && current < best_current) ||
+            (pressure == best_pressure && lifetime == best_lifetime && peak == best_peak && current == best_current && freed > best_freed) ||
+            (pressure == best_pressure && lifetime == best_lifetime && peak == best_peak && current == best_current && freed == best_freed && alloc_size < best_alloc_size)) {
+            best = i;
+            best_pressure = pressure;
+            best_lifetime = lifetime;
+            best_peak = peak;
+            best_current = current;
+            best_alloc_size = alloc_size;
+            best_freed = freed;
+        }
+    }
+
+    return best;
+}
+
+static uint64_t metalium_reorder_modeled_peak(const std::vector<ggml_tensor *> & order, const MetaliumReorderPlan & plan) {
+    MetaliumReorderFirstFit alloc;
+    std::unordered_map<ggml_tensor *, int32_t> remaining_uses = plan.remaining_uses;
+    for(ggml_tensor * node : order) {
+        metalium_reorder_apply_node(node, plan, alloc, remaining_uses);
+    }
+    return alloc.high_water;
+}
+
+static bool metalium_reorder_split(ggml_backend_metalium_context * ctx, ggml_cgraph * cgraph) {
+    if(cgraph->n_nodes < 3 || ctx->device == nullptr) {
+        return false;
+    }
+
+    MetaliumGraphCompiler * compiler = ctx->compiler.get();
+    const tt::ARCH arch = ctx->device->arch();
+    const uint64_t bank_count = std::max<uint64_t>(1, ctx->device->num_dram_channels());
+    std::vector<ggml_tensor *> nodes(cgraph->nodes, cgraph->nodes + cgraph->n_nodes);
+
+    MetaliumReorderPlan plan;
+    plan.users.resize(nodes.size());
+    plan.indegree.assign(nodes.size(), 0);
+    for(int i = 0; i < (int)nodes.size(); i++) {
+        plan.index[nodes[i]] = i;
+    }
+
+    std::unordered_map<ggml_tensor *, int32_t> local_direct_uses;
+    std::unordered_set<uint64_t> edges;
+    for(int i = 0; i < (int)nodes.size(); i++) {
+        ggml_tensor * node = nodes[i];
+        for(int j = 0; j < GGML_MAX_SRC; j++) {
+            ggml_tensor * src = node->src[j];
+            if(src == nullptr) {
+                continue;
+            }
+            local_direct_uses[src]++;
+
+            const auto direct = plan.index.find(src);
+            if(direct != plan.index.end()) {
+                metalium_reorder_add_edge(plan, direct->second, i, edges);
+            }
+            ggml_tensor * resolved = metalium_release_resolve_view(src);
+            const auto resolved_it = plan.index.find(resolved);
+            if(resolved_it != plan.index.end()) {
+                metalium_reorder_add_edge(plan, resolved_it->second, i, edges);
+            }
+        }
+    }
+
+    auto global_use_count = [&](const ggml_tensor * t) -> int32_t {
+        size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+        if(pos == GGML_HASHSET_FULL || !ggml_bitset_get(cgraph->visited_hash_set.used, pos)) {
+            return 0;
+        }
+        return cgraph->use_counts[pos];
+    };
+
+    for(ggml_tensor * node : nodes) {
+        if(metalium_reorder_materializes(node, compiler)) {
+            plan.alloc_size[node] = metalium_reorder_bank_span_bytes(node, arch, bank_count);
+        }
+
+        if(!metalium_reorder_materializes(node, compiler)) {
+            continue;
+        }
+        for(int j = 0; j < GGML_MAX_SRC; j++) {
+            std::vector<ggml_tensor *> reads;
+            metalium_reorder_collect_effective_read(node->src[j], compiler, reads);
+            for(ggml_tensor * producer : reads) {
+                plan.reads[node].push_back(producer);
+                plan.remaining_uses[producer]++;
+                auto it = plan.first_reader_index.find(producer);
+                if(it == plan.first_reader_index.end() || plan.index[node] < it->second) {
+                    plan.first_reader_index[producer] = plan.index[node];
+                }
+            }
+        }
+    }
+
+    for(const auto & item : plan.remaining_uses) {
+        ggml_tensor * producer = item.first;
+        const auto local_it = local_direct_uses.find(producer);
+        const int32_t local_uses = local_it == local_direct_uses.end() ? 0 : local_it->second;
+        if(metalium_release_can_release_structural(producer) && global_use_count(producer) == local_uses) {
+            plan.releasable.insert(producer);
+        }
+    }
+
+    const uint64_t pre_peak = g_debug_flags.print_reorder_mem ? metalium_reorder_modeled_peak(nodes, plan) : 0;
+
+    MetaliumReorderFirstFit alloc;
+    std::unordered_map<ggml_tensor *, int32_t> remaining_uses = plan.remaining_uses;
+    std::vector<int> indegree = plan.indegree;
+    std::vector<int> ready;
+    ready.reserve(nodes.size());
+    for(int i = 0; i < (int)nodes.size(); i++) {
+        if(indegree[i] == 0) {
+            ready.push_back(i);
+        }
+    }
+    std::vector<ggml_tensor *> ordered;
+    ordered.reserve(nodes.size());
+
+    for(int step = 0; step < (int)nodes.size(); step++) {
+        const int choice = metalium_reorder_choose_node(nodes, ready, indegree, plan, alloc, remaining_uses);
+        if(choice < 0) {
+            return false;
+        }
+
+        ready.erase(std::find(ready.begin(), ready.end(), choice));
+        ordered.push_back(nodes[choice]);
+        metalium_reorder_apply_node(nodes[choice], plan, alloc, remaining_uses);
+        for(int user : plan.users[choice]) {
+            indegree[user]--;
+            if(indegree[user] == 0) {
+                ready.push_back(user);
+            }
+        }
+    }
+
+    bool changed = false;
+    int moved = 0;
+    for(int i = 0; i < (int)ordered.size(); i++) {
+        if(cgraph->nodes[i] != ordered[i]) {
+            changed = true;
+            moved++;
+        }
+        cgraph->nodes[i] = ordered[i];
+    }
+    if(g_debug_flags.print_reorder_mem) {
+        const uint64_t post_peak = alloc.high_water;
+        const double mb = 1024.0 * 1024.0;
+        fprintf(stderr,
+            "[metalium-reorder] nodes=%d moved=%d modeled_peak=%.2fMB -> %.2fMB bank_span=%.2fMB -> %.2fMB\n",
+            cgraph->n_nodes,
+            moved,
+            (pre_peak * bank_count) / mb,
+            (post_peak * bank_count) / mb,
+            pre_peak / mb,
+            post_peak / mb);
+    }
+    return changed;
+}
+
 static void metalium_release_tensor(ggml_tensor * tensor) {
     auto * meta = (ggml_tensor_extra_metalium *)tensor->extra;
     if(meta == nullptr) {
@@ -3821,6 +4265,8 @@ static void ggml_backend_metalium_graph_optimize(ggml_backend_t backend, ggml_cg
     if(ctx->compiler != nullptr) {
         ctx->compiler->analyzeGraph(cgraph);
     }
+
+    metalium_reorder_split(ctx, cgraph);
 
     for(int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];

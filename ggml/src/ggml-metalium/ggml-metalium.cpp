@@ -70,6 +70,7 @@
 #include <ttnn/operations/data_movement/concat/concat.hpp>
 #include <ttnn/operations/data_movement/copy/copy.hpp>
 #include <ttnn/operations/data_movement/clone/clone.hpp>
+#include <ttnn/operations/data_movement/narrow/narrow.hpp>
 #include <ttnn/operations/copy/typecast/typecast.hpp>
 #include <ttnn/operations/normalization/softmax/softmax.hpp>
 #include <tt-metalium/experimental/kernel_cache.hpp>
@@ -812,6 +813,118 @@ static void metalium_persist_inplace_view(const ggml_tensor* node, const std::sh
     ggml_metalium_store_tensor(root_meta, reshape_tt_tensor_into_ggml(*value, root));
 }
 
+static bool ggml_metalium_can_narrow_dram_interleaved(
+        const tt::tt_metal::Tensor& tensor,
+        uint32_t dim,
+        uint32_t start,
+        uint32_t length) {
+    if(tensor.storage_type() != tt::tt_metal::StorageType::DEVICE) {
+        return false;
+    }
+    if(tensor.memory_config().buffer_type() != tt::tt_metal::BufferType::DRAM ||
+            tensor.memory_config().memory_layout() != tt::tt_metal::TensorMemoryLayout::INTERLEAVED) {
+        return false;
+    }
+
+    const auto& shape = tensor.padded_shape();
+    if(dim >= shape.rank() || start >= shape[dim] || length == 0 || start + length > shape[dim]) {
+        return false;
+    }
+    for(uint32_t i = 0; i < dim; ++i) {
+        if(shape[i] != 1) {
+            return false;
+        }
+    }
+
+    const auto& storage = tensor.device_storage();
+    if(storage.get_mesh_buffer().global_layout() != tt::tt_metal::distributed::MeshBufferLayout::REPLICATED) {
+        return false;
+    }
+
+    tt::tt_metal::Buffer* buffer = storage.get_buffer();
+    if(buffer == nullptr) {
+        return false;
+    }
+
+    const bool narrow_width = dim == shape.rank() - 1;
+    const bool narrow_height = dim == shape.rank() - 2;
+    if(tensor.layout() == tt::tt_metal::Layout::TILE) {
+        if(narrow_width && (start % tt::constants::TILE_WIDTH != 0 || length % tt::constants::TILE_WIDTH != 0)) {
+            return false;
+        }
+        if(narrow_height && (start % tt::constants::TILE_HEIGHT != 0 || length % tt::constants::TILE_HEIGHT != 0)) {
+            return false;
+        }
+    }
+    if(tensor.layout() == tt::tt_metal::Layout::ROW_MAJOR && narrow_width && start % buffer->alignment() != 0) {
+        return false;
+    }
+
+    uint64_t elements_per_block = 1;
+    for(uint32_t i = dim + 1; i < shape.rank(); ++i) {
+        elements_per_block *= shape[i];
+    }
+    const uint64_t logical_page_size = tensor.layout() == tt::tt_metal::Layout::TILE
+        ? tt::constants::TILE_HW * tensor.element_size()
+        : buffer->page_size();
+    if(logical_page_size == 0) {
+        return false;
+    }
+    const uint64_t start_page_id = (uint64_t)start * tensor.element_size() * elements_per_block / logical_page_size;
+    const uint32_t num_banks = buffer->allocator()->get_num_banks(buffer->buffer_type());
+    return num_banks != 0 && start_page_id % num_banks == 0;
+}
+
+template<typename SliceVec>
+static tt::tt_metal::Tensor ggml_metalium_narrow_or_slice(
+        const tt::tt_metal::Tensor& tensor,
+        uint32_t dim,
+        uint32_t start,
+        uint32_t length,
+        const SliceVec& slice_begins,
+        const SliceVec& slice_ends,
+        const SliceVec& slice_step) {
+    if(ggml_metalium_can_narrow_dram_interleaved(tensor, dim, start, length)) {
+        return ttnn::narrow(tensor, (int32_t)dim, (int32_t)start, length);
+    }
+    return ttnn::slice(tensor, slice_begins, slice_ends, slice_step);
+}
+
+template<typename SliceVec>
+static tt::tt_metal::Tensor ggml_metalium_narrow_single_dim_or_slice(
+        const tt::tt_metal::Tensor& tensor,
+        const SliceVec& slice_begins,
+        const SliceVec& slice_ends,
+        const SliceVec& slice_step) {
+    const auto shape = tensor.logical_shape();
+    if(slice_begins.size() == shape.rank()) {
+        int32_t narrow_dim = -1;
+        for(uint32_t i = 0; i < shape.rank(); ++i) {
+            if(slice_step[i] != 1 || slice_begins[i] > slice_ends[i] || slice_ends[i] > shape[i]) {
+                narrow_dim = -2;
+                break;
+            }
+            if(slice_begins[i] == 0 && slice_ends[i] == shape[i]) {
+                continue;
+            }
+            if(narrow_dim != -1) {
+                narrow_dim = -2;
+                break;
+            }
+            narrow_dim = (int32_t)i;
+        }
+        if(narrow_dim >= 0) {
+            const uint32_t dim = (uint32_t)narrow_dim;
+            const uint32_t start = slice_begins[dim];
+            const uint32_t length = slice_ends[dim] - slice_begins[dim];
+            if(ggml_metalium_can_narrow_dram_interleaved(tensor, dim, start, length)) {
+                return ttnn::narrow(tensor, narrow_dim, (int32_t)start, length);
+            }
+        }
+    }
+    return ttnn::slice(tensor, slice_begins, slice_ends, slice_step);
+}
+
 static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_tensor* tensor);
 static tt::tt_metal::Tensor ggml_metalium_row_unfold(const tt::tt_metal::Tensor& folded);
 std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tensor)
@@ -944,7 +1057,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
             std::array<uint32_t, GGML_MAX_DIMS> start{0, 0, 0, offset_elements};
             std::array<uint32_t, GGML_MAX_DIMS> end({1, 1, 1, dst_volume + offset_elements});
             std::array<uint32_t, GGML_MAX_DIMS> step = {1, 1, 1, 1};
-            tt::tt_metal::Tensor tmp = ttnn::slice(*parent, start, end, step);
+            tt::tt_metal::Tensor tmp = ggml_metalium_narrow_single_dim_or_slice(*parent, start, end, step);
             res = reshape_tt_tensor_into_ggml(tmp, tensor);
         }
         // 1-D contiguous sub-view (with offset) of a contiguous parent: it is a flat
@@ -955,11 +1068,33 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
             uint32_t offset_elements = offset / ggml_type_size(src0->type);
             uint32_t dst_volume = (uint32_t)ggml_nelements(tensor);
             uint32_t parent_volume = (uint32_t)ggml_nelements(src0);
+            const auto pshape = parent->logical_shape();
+            // fast path to slice out a row of a 4D tensor (e.g. the RWKV token-shift / wkv-state split of a flat tensor)
+            if(pshape.rank() == 4 && pshape[2] == 1 && dst_volume == pshape[3] &&
+                    offset_elements % dst_volume == 0 && offset_elements + dst_volume <= parent_volume &&
+                    (pshape[0] == 1 || pshape[1] == 1)) {
+                const uint32_t row = offset_elements / dst_volume;
+                if(row < pshape[0] * pshape[1]) {
+                    std::array<uint32_t, GGML_MAX_DIMS> rstart{0, 0, 0, 0};
+                    std::array<uint32_t, GGML_MAX_DIMS> rend{pshape[0], pshape[1], 1, dst_volume};
+                    if(pshape[1] == 1) {
+                        rstart[0] = row;
+                        rend[0] = row + 1;
+                    } else {
+                        rstart[1] = row;
+                        rend[1] = row + 1;
+                    }
+                    std::array<uint32_t, GGML_MAX_DIMS> rstep{1, 1, 1, 1};
+                    const uint32_t dim = pshape[1] == 1 ? 0 : 1;
+                    res = ggml_metalium_narrow_or_slice(*parent, dim, row, 1, rstart, rend, rstep);
+                    return std::make_shared<tt::tt_metal::Tensor>(std::move(res));
+                }
+            }
             tt::tt_metal::Tensor flat = ttnn::reshape(*parent, ttnn::Shape({1, 1, 1, parent_volume}));
             std::array<uint32_t, GGML_MAX_DIMS> fstart{0, 0, 0, offset_elements};
             std::array<uint32_t, GGML_MAX_DIMS> fend{1, 1, 1, dst_volume + offset_elements};
             std::array<uint32_t, GGML_MAX_DIMS> fstep{1, 1, 1, 1};
-            tt::tt_metal::Tensor tmp = ttnn::slice(flat, fstart, fend, fstep);
+            tt::tt_metal::Tensor tmp = ggml_metalium_narrow_single_dim_or_slice(flat, fstart, fend, fstep);
             res = reshape_tt_tensor_into_ggml(tmp, tensor);
         }
         // Flat (contiguous) view of a multi-dimensional parent whose generic per-dim step degenerated to 0
@@ -976,12 +1111,12 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
             std::array<uint32_t, GGML_MAX_DIMS> start{0, 0, r0, 0};
             std::array<uint32_t, GGML_MAX_DIMS> end{pshape[0], pshape[1], r1, Cc};
             std::array<uint32_t, GGML_MAX_DIMS> step = {1, 1, 1, 1};
-            tt::tt_metal::Tensor tmp = ttnn::slice(*parent, start, end, step);
+            tt::tt_metal::Tensor tmp = ggml_metalium_narrow_single_dim_or_slice(*parent, start, end, step);
             res = reshape_tt_tensor_into_ggml(tmp, tensor);
         }
         // The fast path, this is what TTNN is designed for (direct slicing)
         else {
-            res = ttnn::slice(*parent, start, end, step);
+            res = ggml_metalium_narrow_single_dim_or_slice(*parent, start, end, step);
         }
 
         return std::make_shared<tt::tt_metal::Tensor>(std::move(res));
@@ -2174,8 +2309,8 @@ static void ggml_backend_metalium_glu(ggml_backend_metalium_context * ctx, struc
         Slice begin = {0, 0, 0, 0};
         Slice stride = {1, 1, 1, 1};
 
-        a = ttnn::slice(*t, mid_start, end, stride);
-        b = ttnn::slice(*t, begin, mid, stride);
+        a = ggml_metalium_narrow_single_dim_or_slice(*t, mid_start, end, stride);
+        b = ggml_metalium_narrow_single_dim_or_slice(*t, begin, mid, stride);
     }
 
 
@@ -2533,7 +2668,7 @@ static void ggml_backend_metalium_flash_attn(ggml_backend_metalium_context * ctx
         // requires mask Sq == Q Sq, so trim the padded rows.
         const auto ms = mt.logical_shape();
         if((uint32_t)ms[2] != Sq) {
-            mt = ttnn::slice(mt,
+            mt = ggml_metalium_narrow_single_dim_or_slice(mt,
                 ttsl::SmallVector<uint32_t>{0u, 0u, 0u, 0u},
                 ttsl::SmallVector<uint32_t>{(uint32_t)ms[0], (uint32_t)ms[1], Sq, (uint32_t)ms[3]},
                 ttsl::SmallVector<uint32_t>{1u, 1u, 1u, 1u});
@@ -2691,7 +2826,7 @@ static void ggml_backend_metalium_get_tensor_folded(const ggml_tensor *tensor, g
     ttsl::SmallVector<uint32_t> begins{0, head, 0, 0};
     ttsl::SmallVector<uint32_t> ends{1, head + cells, dim_t, 32};
     ttsl::SmallVector<uint32_t> step{1, 1, 1, 1};
-    auto sliced = ttnn::slice(*meta->row_folded, begins, ends, step);
+    auto sliced = ggml_metalium_narrow_or_slice(*meta->row_folded, 1, head, cells, begins, ends, step);
     // Logical [1, cells, dim/32, 32] row-major order is exactly canonical [cells, dim].
     copy_tt_tensor_to_host_pointer<bfloat16>(sliced, data, ggtype);
 }

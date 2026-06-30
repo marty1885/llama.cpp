@@ -44,7 +44,17 @@ struct FusionFacts {
 
 struct FusionCandidate {
     std::vector<ggml_tensor *> kill_requests;
+    std::vector<ggml_tensor *> internal_kill_requests;
 };
+
+static bool is_rwkv_width_sharded_mlp_weight(const ggml_tensor * tensor) {
+    if(tensor == nullptr || tensor->op != GGML_OP_NONE) {
+        return false;
+    }
+    const std::string_view name(tensor->name);
+    return name.find(".channel_mix_key.weight") != std::string_view::npos ||
+        name.find(".channel_mix_value.weight") != std::string_view::npos;
+}
 
 class MetaliumLowering {
 public:
@@ -420,13 +430,19 @@ const char * ggml_unary_act_string(const ggml_tensor * u) {
     }
 }
 
-std::optional<ttnn::operations::unary::EltwiseUnaryWithParam> ggml_unary_post_activation(const ggml_tensor * u) {
-    if (u == nullptr || u->op != GGML_OP_UNARY) {
+std::optional<ttnn::operations::unary::EltwiseUnaryWithParam> ggml_unary_to_tt_activation(const ggml_tensor * u) {
+    if (u == nullptr) {
         return std::nullopt;
     }
     using ttnn::operations::unary::EltwiseUnaryWithParam;
     using ttnn::operations::unary::UnaryOpType;
     using ttnn::operations::unary::VecMode;
+    if (u->op == GGML_OP_SQR) {
+        return EltwiseUnaryWithParam(UnaryOpType::SQUARE);
+    }
+    if (u->op != GGML_OP_UNARY) {
+        return std::nullopt;
+    }
     switch (ggml_get_unary_op(u)) {
         case GGML_UNARY_OP_ABS:         return EltwiseUnaryWithParam(UnaryOpType::ABS);
         case GGML_UNARY_OP_SGN:         return EltwiseUnaryWithParam(UnaryOpType::SIGN);
@@ -812,18 +828,80 @@ private:
     mutable std::unordered_map<const ggml_tensor *, Site> sites_;
 };
 
+// Fusing two unary-like activations into a scalar multiply using lhs and post activations.
+//   POST(PRE(x)) -> multiply(x, 1, lhs_activation=PRE, post_activation=POST)
+class UnaryActLowering final : public FusionLoweringBase {
+public:
+    struct Site {
+        ggml_tensor * root = nullptr;
+        ggml_tensor * x    = nullptr;
+        ggml_tensor * pre  = nullptr;
+        ttnn::operations::unary::EltwiseUnaryWithParam lhs_act{ttnn::operations::unary::UnaryOpType::SIGMOID};
+        ttnn::operations::unary::EltwiseUnaryWithParam post_act{ttnn::operations::unary::UnaryOpType::SIGMOID};
+        std::vector<ggml_tensor *> kill_requests;
+    };
+
+    std::string_view name() const override { return "unary_activation"; }
+    void resetPlan() const override { sites_.clear(); }
+    std::optional<FusionCandidate> matchFusion(ggml_tensor * node, const FusionFacts & facts) const override;
+    bool bindFusion(ggml_tensor * node, const FusionFacts & facts) const override;
+    bool lowerFusion(ggml_backend_metalium_context * ctx, ggml_tensor * node) const override;
+    std::optional<Site> match(ggml_tensor * u, const FusionFacts & facts) const;
+    bool apply(ggml_backend_metalium_context * ctx, const Site & site) const;
+private:
+    mutable std::unordered_map<const ggml_tensor *, Site> sites_;
+};
+
+// Fusing unary-like activations into a multiply operand.
+//   MUL(ACT(a), b)
+//   MUL(a, ACT(b))
+//   MUL(ACT(a), ACT(b))
+//
+// A plain MUL is intentionally not matched; empty activation lists are identity for the side
+// without an activation.
+class MulActLowering final : public FusionLoweringBase {
+public:
+    struct Site {
+        ggml_tensor * root  = nullptr;
+        ggml_tensor * a     = nullptr;
+        ggml_tensor * b     = nullptr;
+        ggml_tensor * act_a = nullptr;
+        ggml_tensor * act_b = nullptr;
+        std::vector<ttnn::operations::unary::EltwiseUnaryWithParam> lhs_activations;
+        std::vector<ttnn::operations::unary::EltwiseUnaryWithParam> rhs_activations;
+        std::vector<ggml_tensor *> kill_requests;
+    };
+
+    std::string_view name() const override { return "mul_activation"; }
+    void resetPlan() const override { sites_.clear(); }
+    std::optional<FusionCandidate> matchFusion(ggml_tensor * node, const FusionFacts & facts) const override;
+    bool bindFusion(ggml_tensor * node, const FusionFacts & facts) const override;
+    bool lowerFusion(ggml_backend_metalium_context * ctx, ggml_tensor * node) const override;
+    std::optional<Site> match(ggml_tensor * mul, const FusionFacts & facts) const;
+    bool apply(ggml_backend_metalium_context * ctx, const Site & site) const;
+private:
+    mutable std::unordered_map<const ggml_tensor *, Site> sites_;
+};
+
 // Fusing multiply-add into ttnn::mac.
 //   ADD(MUL(a, b), c)
+//   POST(ADD(MUL(a, b), c))
 //
 // Lower priority than more specific ADD-rooted fusions.
 class MacLowering final : public FusionLoweringBase {
 public:
     struct Site {
-        ggml_tensor * root = nullptr;
-        ggml_tensor * a    = nullptr;
-        ggml_tensor * b    = nullptr;
-        ggml_tensor * c    = nullptr;
-        ggml_tensor * mul  = nullptr;
+        ggml_tensor * root  = nullptr;
+        ggml_tensor * add   = nullptr;
+        ggml_tensor * a     = nullptr;
+        ggml_tensor * b     = nullptr;
+        ggml_tensor * c     = nullptr;
+        ggml_tensor * mul   = nullptr;
+        ggml_tensor * act_a = nullptr;
+        ggml_tensor * act_b = nullptr;
+        std::vector<ttnn::operations::unary::EltwiseUnaryWithParam> lhs_activations;
+        std::vector<ttnn::operations::unary::EltwiseUnaryWithParam> rhs_activations;
+        std::vector<ttnn::operations::unary::EltwiseUnaryWithParam> post_activations;
         std::vector<ggml_tensor *> kill_requests;
     };
 
@@ -964,6 +1042,36 @@ private:
     mutable std::unordered_map<const ggml_tensor *, Site> sites_;
 };
 
+// Fusing RWKV k update into ttprm::k_update.
+//   ADD(k, SUB(MUL(a, MUL(k, k_a)), MUL(k, k_a)))
+class KUpdateLowering final : public FusionLoweringBase {
+public:
+    struct Site {
+        ggml_tensor * root       = nullptr;
+        ggml_tensor * k          = nullptr;
+        ggml_tensor * a          = nullptr;
+        ggml_tensor * k_a        = nullptr;
+        ggml_tensor * ka         = nullptr;
+        ggml_tensor * mul_a_ka   = nullptr;
+        ggml_tensor * sub        = nullptr;
+        int64_t       head_size  = 0;
+        int64_t       head_count = 0;
+        std::vector<ggml_tensor *> kill_requests;
+        std::vector<ggml_tensor *> internal_kill_requests;
+    };
+
+    std::string_view name() const override { return "k_update"; }
+    void resetPlan() const override { sites_.clear(); }
+    std::optional<FusionCandidate> matchFusion(ggml_tensor * node, const FusionFacts & facts) const override;
+    bool bindFusion(ggml_tensor * node, const FusionFacts & facts) const override;
+    bool lowerFusion(ggml_backend_metalium_context * ctx, ggml_tensor * node) const override;
+    std::optional<Site> match(ggml_tensor * add, const FusionFacts & facts) const;
+    bool apply(ggml_backend_metalium_context * ctx, const Site & site) const;
+    static bool shape(const Site & site);
+private:
+    mutable std::unordered_map<const ggml_tensor *, Site> sites_;
+};
+
 // Fusing head-grid elementwise ops over absorbable operand views.
 //   ADD/MUL/SUB(a, b)
 //
@@ -1023,6 +1131,8 @@ DEFINE_FUSION_PLUMBING(TtprmNormAffineLowering)
 DEFINE_FUSION_PLUMBING(NormAffineLowering)
 DEFINE_FUSION_PLUMBING(ActLowering)
 DEFINE_FUSION_PLUMBING(ScaleActLowering)
+DEFINE_FUSION_PLUMBING(UnaryActLowering)
+DEFINE_FUSION_PLUMBING(MulActLowering)
 DEFINE_FUSION_PLUMBING(MacLowering)
 DEFINE_FUSION_PLUMBING(L2HeadNormLowering)
 DEFINE_FUSION_PLUMBING(HeadNormLowering)
@@ -1102,6 +1212,9 @@ LinearLowering::match(ggml_tensor * add, const FusionFacts & facts) const {
         return std::nullopt;
     }
     LinearLowering::Site site = std::move(r->site);
+    if (is_rwkv_width_sharded_mlp_weight(site.weight)) {
+        return std::nullopt;
+    }
     site.kill_requests = std::move(r->kill_requests);
     return site;
 }
@@ -1216,23 +1329,53 @@ TtprmNormAffineLowering::match(ggml_tensor * add, const FusionFacts & facts) con
 
 std::optional<MacLowering::Site>
 MacLowering::match(ggml_tensor * add, const FusionFacts & facts) const {
-    GGML_UNUSED(facts);
-    static const Pat pattern = [] {
-        Pat mul = op(GGML_OP_MUL)
-            .bind(&MacLowering::Site::mul)
-            .kill()
-            .of(any().bind(&MacLowering::Site::a), any().bind(&MacLowering::Site::b));
-        return any_order(GGML_OP_ADD)
-            .bind(&MacLowering::Site::root)
-            .of(mul, any().bind(&MacLowering::Site::c));
-    }();
+    Site site;
+    site.root = add;
 
-    auto r = match_site<MacLowering::Site>(pattern, add);
-    if (!r) {
+    auto post = ggml_unary_to_tt_activation(add);
+    if (post) {
+        if (add->src[0] == nullptr || add->src[0]->op != GGML_OP_ADD || !facts.is_private(add->src[0])) {
+            return std::nullopt;
+        }
+        site.add = add->src[0];
+        site.post_activations.push_back(*post);
+        site.kill_requests.push_back(site.add);
+    } else if (add != nullptr && add->op == GGML_OP_ADD) {
+        site.add = add;
+    } else {
         return std::nullopt;
     }
-    MacLowering::Site site = std::move(r->site);
-    site.kill_requests = std::move(r->kill_requests);
+
+    auto bind = [&](ggml_tensor * lhs, ggml_tensor * rhs) {
+        if (lhs == nullptr || rhs == nullptr || lhs->op != GGML_OP_MUL || !facts.is_private(lhs)) {
+            return false;
+        }
+        site.mul = lhs;
+        site.a = lhs->src[0];
+        site.b = lhs->src[1];
+        site.c = rhs;
+        site.kill_requests.push_back(lhs);
+        return true;
+    };
+    if (!bind(site.add->src[0], site.add->src[1]) && !bind(site.add->src[1], site.add->src[0])) {
+        return std::nullopt;
+    }
+
+    auto peel = [&](ggml_tensor *& operand,
+                    ggml_tensor *& act_node,
+                    std::vector<ttnn::operations::unary::EltwiseUnaryWithParam> & activations) {
+        auto act = ggml_unary_to_tt_activation(operand);
+        if (!act || operand->src[0] == nullptr || !facts.is_private(operand)) {
+            return;
+        }
+        act_node = operand;
+        operand = operand->src[0];
+        activations.push_back(*act);
+        site.kill_requests.push_back(act_node);
+    };
+    peel(site.a, site.act_a, site.lhs_activations);
+    peel(site.b, site.act_b, site.rhs_activations);
+
     return site;
 }
 
@@ -1273,6 +1416,9 @@ ActLowering::match(ggml_tensor * u, const FusionFacts & facts) const {
     for (const Pat * pattern : forms) {
         if (auto r = match_site<ActLowering::Site>(*pattern, u)) {
             ActLowering::Site site = std::move(r->site);
+            if (is_rwkv_width_sharded_mlp_weight(site.weight)) {
+                return std::nullopt;
+            }
             site.kill_requests = std::move(r->kill_requests);
             site.act = act;
             site.is_linear = site.bias != nullptr;
@@ -1284,7 +1430,7 @@ ActLowering::match(ggml_tensor * u, const FusionFacts & facts) const {
 
 std::optional<ScaleActLowering::Site>
 ScaleActLowering::match(ggml_tensor * u, const FusionFacts & facts) const {
-    auto act = ggml_unary_post_activation(u);
+    auto act = ggml_unary_to_tt_activation(u);
     if (!act || u->src[0] == nullptr || u->src[0]->op != GGML_OP_SCALE) {
         return std::nullopt;
     }
@@ -1306,6 +1452,62 @@ ScaleActLowering::match(ggml_tensor * u, const FusionFacts & facts) const {
     site.scale = scale;
     site.act = *act;
     site.kill_requests.push_back(scale);
+    return site;
+}
+
+std::optional<UnaryActLowering::Site>
+UnaryActLowering::match(ggml_tensor * u, const FusionFacts & facts) const {
+    auto post_act = ggml_unary_to_tt_activation(u);
+    if (!post_act || u->src[0] == nullptr) {
+        return std::nullopt;
+    }
+
+    ggml_tensor * pre = u->src[0];
+    auto lhs_act = ggml_unary_to_tt_activation(pre);
+    if (!lhs_act || pre->src[0] == nullptr || !facts.is_private(pre)) {
+        return std::nullopt;
+    }
+
+    Site site;
+    site.root = u;
+    site.x = pre->src[0];
+    site.pre = pre;
+    site.lhs_act = *lhs_act;
+    site.post_act = *post_act;
+    site.kill_requests.push_back(pre);
+    return site;
+}
+
+std::optional<MulActLowering::Site>
+MulActLowering::match(ggml_tensor * mul, const FusionFacts & facts) const {
+    if (mul == nullptr || mul->op != GGML_OP_MUL || mul->src[0] == nullptr || mul->src[1] == nullptr) {
+        return std::nullopt;
+    }
+
+    Site site;
+    site.root = mul;
+    site.a = mul->src[0];
+    site.b = mul->src[1];
+
+    auto peel = [&](ggml_tensor *& operand,
+                    ggml_tensor *& act_node,
+                    std::vector<ttnn::operations::unary::EltwiseUnaryWithParam> & activations) {
+        auto act = ggml_unary_to_tt_activation(operand);
+        if (!act || operand->src[0] == nullptr || !facts.is_private(operand)) {
+            return false;
+        }
+        act_node = operand;
+        operand = operand->src[0];
+        activations.push_back(*act);
+        site.kill_requests.push_back(act_node);
+        return true;
+    };
+
+    const bool lhs = peel(site.a, site.act_a, site.lhs_activations);
+    const bool rhs = peel(site.b, site.act_b, site.rhs_activations);
+    if (!lhs && !rhs) {
+        return std::nullopt;
+    }
     return site;
 }
 
@@ -1601,6 +1803,105 @@ RkGateLowering::match(ggml_tensor * add, const FusionFacts & facts) const {
 #endif
 }
 
+bool KUpdateLowering::shape(const KUpdateLowering::Site & site) {
+    ggml_tensor * add = site.root;
+    ggml_tensor * k   = site.k;
+    ggml_tensor * a   = site.a;
+    ggml_tensor * k_a = site.k_a;
+    ggml_tensor * ka  = site.ka;
+    if (add == nullptr || k == nullptr || a == nullptr || k_a == nullptr || ka == nullptr) {
+        return false;
+    }
+    const int64_t n_embd = add->ne[0];
+    const int64_t nt     = add->ne[1];
+    if (add->ne[2] != 1 || add->ne[3] != 1 || n_embd % 64 != 0) {
+        return false;
+    }
+    const int64_t hc = n_embd / 64;
+    if (hc <= 1 || hc % 32 != 0) {
+        return false;
+    }
+    auto flat = [&](const ggml_tensor * x) {
+        return x != nullptr && x->ne[0] == n_embd && x->ne[1] == nt && x->ne[2] == 1 && x->ne[3] == 1;
+    };
+    if (!flat(k) || !flat(a) || !flat(ka)) {
+        return false;
+    }
+    return k_a->ne[0] == n_embd && k_a->ne[1] == 1 && k_a->ne[2] == 1 && k_a->ne[3] == 1;
+}
+
+std::optional<KUpdateLowering::Site>
+KUpdateLowering::match(ggml_tensor * add, const FusionFacts & facts) const {
+#ifndef GGML_METALIUM_HAVE_TTPRM
+    GGML_UNUSED(add);
+    GGML_UNUSED(facts);
+    return std::nullopt;
+#else
+    static const Pat pattern = [] {
+        Pat k = any().bind(&KUpdateLowering::Site::k);
+        Pat ka = any_order(GGML_OP_MUL)
+            .bind(&KUpdateLowering::Site::ka)
+            .of(k, any().bind(&KUpdateLowering::Site::k_a));
+        Pat mul_a_ka = any_order(GGML_OP_MUL)
+            .bind(&KUpdateLowering::Site::mul_a_ka)
+            .kill()
+            .of(any().bind(&KUpdateLowering::Site::a), ka);
+        Pat sub = op(GGML_OP_SUB)
+            .bind(&KUpdateLowering::Site::sub)
+            .kill()
+            .of(mul_a_ka, ka);
+        return any_order(GGML_OP_ADD)
+            .bind(&KUpdateLowering::Site::root)
+            .guard(&KUpdateLowering::shape)
+            .of(k, sub);
+    }();
+
+    auto r = match_site<KUpdateLowering::Site>(pattern, add);
+    if (!r) {
+        return std::nullopt;
+    }
+    KUpdateLowering::Site site = std::move(r->site);
+    if (facts.uses == nullptr) {
+        return std::nullopt;
+    }
+    const auto uses_it = facts.uses->find(site.ka);
+    if (uses_it == facts.uses->end() || uses_it->second != 2) {
+        return std::nullopt;
+    }
+    site.kill_requests = std::move(r->kill_requests);
+    site.internal_kill_requests.push_back(site.ka);
+    site.head_size = 64;
+    site.head_count = site.root->ne[0] / site.head_size;
+    return site;
+#endif
+}
+
+std::optional<FusionCandidate>
+KUpdateLowering::matchFusion(ggml_tensor * node, const FusionFacts & facts) const {
+    auto site = match(node, facts);
+    if (!site) {
+        return std::nullopt;
+    }
+    FusionCandidate candidate;
+    candidate.kill_requests = site->kill_requests;
+    candidate.internal_kill_requests = site->internal_kill_requests;
+    return candidate;
+}
+
+bool KUpdateLowering::bindFusion(ggml_tensor * node, const FusionFacts & facts) const {
+    auto site = match(node, facts);
+    if (!site) {
+        return false;
+    }
+    sites_[site->root] = std::move(*site);
+    return true;
+}
+
+bool KUpdateLowering::lowerFusion(ggml_backend_metalium_context * ctx, ggml_tensor * node) const {
+    auto it = sites_.find(node);
+    return it != sites_.end() && apply(ctx, it->second);
+}
+
 bool ElemwiseViewLowering::shape(const ElemwiseViewLowering::Site & site) {
     ggml_tensor * op_node = site.op_node;
     ggml_tensor * a = site.a;
@@ -1725,7 +2026,9 @@ MetaliumGraphCompiler::FusionPlan MetaliumGraphCompiler::buildPlan(const ggml_cg
     auto commit = [&](const MetaliumLowering * lowering, int root_idx, const FusionCandidate & candidate) {
         plan.roots.push_back({ root_idx, lowering });
         claimed.insert(cgraph->nodes[root_idx]);
-        for (ggml_tensor * n : candidate.kill_requests) {
+        std::vector<ggml_tensor *> all_kills = candidate.kill_requests;
+        all_kills.insert(all_kills.end(), candidate.internal_kill_requests.begin(), candidate.internal_kill_requests.end());
+        for (ggml_tensor * n : all_kills) {
             auto it = index_of.find(n);
             if (n != nullptr && it != index_of.end()) {
                 plan.inert_idx.push_back(it->second);
@@ -1737,6 +2040,12 @@ MetaliumGraphCompiler::FusionPlan MetaliumGraphCompiler::buildPlan(const ggml_cg
     auto blocked = [&](const FusionCandidate & candidate) {
         for (const ggml_tensor * n : candidate.kill_requests) {
             if (!facts.is_private(n) || claimed.find(n) != claimed.end() || index_of.find(n) == index_of.end()) {
+                return true;
+            }
+        }
+        for (const ggml_tensor * n : candidate.internal_kill_requests) {
+            if (n == nullptr || claimed.find(n) != claimed.end() || index_of.find(n) == index_of.end() ||
+                (n->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
                 return true;
             }
         }
@@ -1967,10 +2276,21 @@ bool MacLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) 
     auto b = realize_ggml_view(site.b);
     auto c = realize_ggml_view(site.c);
 
-    // mac == multiply(a,b) + c via the same broadcasting binaries the standalone MUL/ADD use, so no
-    // dtype coercion is needed (matches the unfused path).
-    auto out = ttnn::mac(*a, *b, *c, std::nullopt);
     auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
+    auto prod = ttnn::multiply(
+        *a, *b,
+        std::nullopt,
+        meta->memory_config,
+        std::nullopt,
+        /* post_activations = */ {},
+        site.lhs_activations,
+        site.rhs_activations);
+    auto out = ttnn::add(
+        prod, *c,
+        std::nullopt,
+        meta->memory_config,
+        std::nullopt,
+        site.post_activations);
     ggml_metalium_store_tensor(meta, std::move(out));
     return true;
 }
@@ -1988,6 +2308,41 @@ bool ScaleActLowering::apply(ggml_backend_metalium_context * ctx, const Site & s
     std::vector<ttnn::operations::unary::EltwiseUnaryWithParam> post_activations{site.act};
     auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
     auto out = ttnn::multiply(*x, scale, std::nullopt, meta->memory_config, std::nullopt, post_activations);
+    ggml_metalium_store_tensor(meta, std::move(out));
+    return true;
+}
+
+bool UnaryActLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) const {
+    GGML_UNUSED(ctx);
+    GGML_METALIUM_OP_SANITY_CHECK(site.root);
+
+    auto x = realize_ggml_view(site.x);
+
+    std::vector<ttnn::operations::unary::EltwiseUnaryWithParam> lhs_activations{site.lhs_act};
+    std::vector<ttnn::operations::unary::EltwiseUnaryWithParam> post_activations{site.post_act};
+    auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
+    auto out = ttnn::multiply(
+        *x, 1.0f, std::nullopt, meta->memory_config, std::nullopt, post_activations, lhs_activations);
+    ggml_metalium_store_tensor(meta, std::move(out));
+    return true;
+}
+
+bool MulActLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) const {
+    GGML_UNUSED(ctx);
+    GGML_METALIUM_OP_SANITY_CHECK(site.root);
+
+    auto a = realize_ggml_view(site.a);
+    auto b = realize_ggml_view(site.b);
+
+    auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
+    auto out = ttnn::multiply(
+        *a, *b,
+        std::nullopt,
+        meta->memory_config,
+        std::nullopt,
+        /* post_activations = */ {},
+        site.lhs_activations,
+        site.rhs_activations);
     ggml_metalium_store_tensor(meta, std::move(out));
     return true;
 }
@@ -2325,6 +2680,65 @@ bool RkGateLowering::apply(ggml_backend_metalium_context * ctx, const Site & sit
 #endif
 }
 
+bool KUpdateLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) const {
+    GGML_UNUSED(ctx);
+#ifdef GGML_METALIUM_HAVE_TTPRM
+    GGML_METALIUM_OP_SANITY_CHECK(site.root);
+
+    const int64_t hs     = site.head_size;
+    const int64_t hc     = site.head_count;
+    const int64_t nt     = site.root->ne[1];
+    const auto    BF16   = tt::tt_metal::DataType::BFLOAT16;
+
+    auto to_bf16 = [&](std::shared_ptr<tt::tt_metal::Tensor> & t) {
+        if (t->dtype() != BF16) {
+            t = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*t, BF16));
+        }
+    };
+
+    auto kt  = realize_ggml_view(site.k);   to_bf16(kt);
+    auto at  = realize_ggml_view(site.a);   to_bf16(at);
+    auto kat = realize_ggml_view(site.k_a); to_bf16(kat);
+
+    auto head_flat = [&](const tt::tt_metal::Tensor & t) {
+        ttprm::View v = ttprm::view_of(t);
+        return v.slice({ { 0, v.rows(), 1 }, { 0, v.cols(), 1 } }).reshape({ hc * nt, hs });
+    };
+
+    ttprm::View kv  = head_flat(*kt);
+    ttprm::View av  = head_flat(*at);
+    ttprm::View kav0 = ttprm::view_of(*kat);
+    ttprm::View kav = kav0.slice({ { 0, kav0.rows(), 1 }, { 0, kav0.cols(), 1 } }).reshape({ hc, hs });
+
+    auto out = tt::tt_metal::create_device_tensor(
+        ttnn::TensorSpec(
+            ttnn::Shape({
+                (uint32_t) site.root->ne[3],
+                (uint32_t) site.root->ne[2],
+                (uint32_t) site.root->ne[1],
+                (uint32_t) site.root->ne[0],
+            }),
+            tt::tt_metal::TensorLayout(
+                BF16,
+                tt::tt_metal::PageConfig(tt::tt_metal::Layout::TILE),
+                tt::tt_metal::MemoryConfig{})),
+        kt->device());
+    ttprm::View ov0 = ttprm::view_of(out);
+    ttprm::View ov = ov0.slice({ { 0, ov0.rows(), 1 }, { 0, ov0.cols(), 1 } }).reshape({ hc * nt, hs });
+
+    auto res = ttprm::k_update(kv, av, kav, ov);
+    if (res) {
+        auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
+        ggml_metalium_store_tensor(meta, res.value());
+        return true;
+    }
+    return false;
+#else
+    GGML_UNUSED(site);
+    return false;
+#endif
+}
+
 bool ElemwiseViewLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) const {
     GGML_UNUSED(ctx);
 #ifdef GGML_METALIUM_HAVE_TTPRM
@@ -2427,6 +2841,8 @@ bool ActLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) 
 MetaliumGraphCompiler::MetaliumGraphCompiler() {
     lowerings.push_back(std::make_unique<ActLowering>());
     lowerings.push_back(std::make_unique<ScaleActLowering>());
+    lowerings.push_back(std::make_unique<UnaryActLowering>());
+    lowerings.push_back(std::make_unique<KUpdateLowering>());
     lowerings.push_back(std::make_unique<RkGateLowering>());
     lowerings.push_back(std::make_unique<HeadAffineLowering>());
     lowerings.push_back(std::make_unique<L2HeadNormLowering>());
@@ -2436,6 +2852,7 @@ MetaliumGraphCompiler::MetaliumGraphCompiler() {
     lowerings.push_back(std::make_unique<TtprmNormAffineLowering>());
     lowerings.push_back(std::make_unique<NormAffineLowering>());
     lowerings.push_back(std::make_unique<MacLowering>());
+    lowerings.push_back(std::make_unique<MulActLowering>());
     lowerings.push_back(std::make_unique<ElemwiseViewLowering>());
     lowerings.push_back(std::make_unique<EmbeddingGetRowsLowering>());
 }

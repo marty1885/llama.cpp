@@ -8,6 +8,8 @@
 
 #include <cstdint>
 #include <map>
+#include <string>
+#include <vector>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -124,3 +126,80 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+
+//
+// interpretability research API
+//
+
+struct llama_interp_rwkv_layer_state {
+    std::vector<ggml_fp16_t> r;
+    std::vector<ggml_fp16_t> s;
+};
+
+struct llama_interp_rwkv_state {
+    llama_pos pos = -1;
+    bool has_next = false;
+    llama_token next_token = LLAMA_TOKEN_NULL;
+
+    uint32_t n_layer  = 0;
+    uint32_t n_embd_r = 0;
+    uint32_t n_embd_s = 0;
+
+    std::vector<llama_interp_rwkv_layer_state> layers;
+};
+
+struct llama_interp_activation {
+    std::string name;
+    std::string backend;
+    int32_t layer = -1;
+    int32_t head_size = 0;
+    int32_t n_head = 0;
+    std::vector<int64_t> shape;
+    std::vector<ggml_fp16_t> data;
+};
+
+using llama_interp_activation_set = std::vector<llama_interp_activation>;
+
+enum llama_interp_perturb_op {
+    LLAMA_INTERP_PERTURB_ADD = 0,
+    LLAMA_INTERP_PERTURB_REPLACE = 1,
+};
+
+struct llama_interp_capture_spec {
+    std::string regex;
+    llama_interp_activation_set * dst = nullptr;
+};
+
+struct llama_interp_perturb_spec {
+    std::string regex;
+    llama_interp_perturb_op op = LLAMA_INTERP_PERTURB_ADD;
+    int32_t head = -1; // -1 means whole tensor; otherwise RWKV head index
+    std::vector<ggml_fp16_t> data;
+};
+
+struct llama_interp_request {
+    uint64_t id = 0;
+    bool enable_captures = false;
+    bool enable_perturbations = false;
+
+    std::vector<llama_interp_capture_spec> captures;
+    std::vector<llama_interp_perturb_spec> perturbations;
+};
+
+LLAMA_API bool llama_interp_rwkv_state_init(
+        const struct llama_context * ctx,
+              llama_interp_rwkv_state * state);
+
+LLAMA_API bool llama_interp_rwkv_state_export(
+        const struct llama_context * ctx,
+              llama_seq_id seq_id,
+              llama_interp_rwkv_state * state);
+
+LLAMA_API bool llama_interp_rwkv_state_import(
+              struct llama_context * ctx,
+              llama_seq_id seq_id,
+        const llama_interp_rwkv_state * state);
+
+LLAMA_API void llama_interp_set_request(
+        struct llama_context * ctx,
+        const llama_interp_request * request);

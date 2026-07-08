@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstring>
 #include <numeric>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -62,6 +63,82 @@ static bool can_reuse_kq_mask(
 }
 
 // impl
+
+static std::string interp_tensor_name(const char * name, int il) {
+    if (il >= 0) {
+        return std::string("rwkv.layer.") + std::to_string(il) + ".time." + name;
+    }
+    return std::string("rwkv.time.") + name;
+}
+
+static bool interp_regex_match(const std::string & text, const std::string & pattern) {
+    try {
+        return std::regex_search(text, std::regex(pattern, std::regex::optimize));
+    } catch (const std::regex_error &) {
+        return false;
+    }
+}
+
+static void interp_set_fp16_value(std::vector<uint8_t> & dst, ggml_type type, size_t i, ggml_fp16_t v) {
+    if (type == GGML_TYPE_F16) {
+        ((ggml_fp16_t *) dst.data())[i] = v;
+    } else if (type == GGML_TYPE_F32) {
+        ((float *) dst.data())[i] = ggml_fp16_to_fp32(v);
+    } else {
+        GGML_ABORT("unsupported interp perturb tensor type");
+    }
+}
+
+static ggml_tensor * interp_build_perturb_tensor(
+        const llm_graph_context & gctx,
+        ggml_tensor * cur,
+        const llama_interp_perturb_spec & spec) {
+    const size_t ne = ggml_nelements(cur);
+    const size_t el = ggml_element_size(cur);
+    std::vector<uint8_t> data(ne * el, 0);
+
+    if (spec.head >= 0) {
+        const int64_t head_size = cur->ne[0];
+        const int64_t n_head    = cur->ne[1];
+        const int64_t n_token   = cur->ne[2];
+        GGML_ASSERT(spec.head < n_head);
+        GGML_ASSERT((int64_t) spec.data.size() == head_size || (int64_t) spec.data.size() == head_size * n_token);
+
+        for (int64_t t = 0; t < n_token; ++t) {
+            for (int64_t d = 0; d < head_size; ++d) {
+                const size_t src = spec.data.size() == (size_t) head_size ? d : t * head_size + d;
+                const size_t dst = (size_t) t * head_size * n_head + (size_t) spec.head * head_size + d;
+                interp_set_fp16_value(data, cur->type, dst, spec.data[src]);
+            }
+        }
+    } else if (!spec.data.empty()) {
+        GGML_ASSERT(spec.data.size() == ne);
+        for (size_t i = 0; i < ne; ++i) {
+            interp_set_fp16_value(data, cur->type, i, spec.data[i]);
+        }
+    }
+
+    auto inp = std::make_unique<llm_graph_input_interp_perturb>(std::move(data));
+    inp->tensor = ggml_new_tensor(gctx.ctx0, cur->type, GGML_MAX_DIMS, cur->ne);
+    ggml_set_input(inp->tensor);
+    ggml_set_name(inp->tensor, "interp_perturb");
+
+    ggml_tensor * t = inp->tensor;
+    gctx.res->add_input(std::move(inp));
+    return t;
+}
+
+void llm_graph_input_interp_perturb::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (tensor && !data.empty()) {
+        ggml_backend_tensor_set(tensor, data.data(), 0, data.size());
+    }
+}
+
+bool llm_graph_input_interp_perturb::can_reuse(const llm_graph_params & params) {
+    GGML_UNUSED(params);
+    return true;
+}
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
@@ -1198,6 +1275,8 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
+    interp_captures.clear();
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -1267,6 +1346,11 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     for (auto & [seq_id, t] : t_candidates) {
         if (t != nullptr) {
             ggml_set_output(t);
+        }
+    }
+    for (auto & cap : interp_captures) {
+        if (cap.tensor != nullptr) {
+            ggml_set_output(cap.tensor);
         }
     }
 }
@@ -1371,7 +1455,57 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     }
 }
 
+ggml_tensor * llm_graph_context::interp_rwkv_tap(ggml_tensor * cur, const char * name, int il) const {
+    const llama_interp_request * req = cparams.interp_request;
+    if (req == nullptr) {
+        return cur;
+    }
 
+    const std::string full_name = interp_tensor_name(name, il);
+    ggml_set_name(cur, full_name.c_str());
+
+    if (req->enable_perturbations) {
+        for (const auto & spec : req->perturbations) {
+            if (!interp_regex_match(full_name, spec.regex)) {
+                continue;
+            }
+
+            switch (spec.op) {
+                case LLAMA_INTERP_PERTURB_ADD:
+                    if (!spec.data.empty()) {
+                        ggml_tensor * perturb = interp_build_perturb_tensor(*this, cur, spec);
+                        cur = ggml_add(ctx0, cur, perturb);
+                    }
+                    break;
+                case LLAMA_INTERP_PERTURB_REPLACE:
+                    if (spec.data.empty()) {
+                        cur = ggml_sub(ctx0, cur, cur);
+                    } else {
+                        cur = interp_build_perturb_tensor(*this, cur, spec);
+                    }
+                    break;
+            }
+            ggml_set_name(cur, full_name.c_str());
+        }
+    }
+
+    if (req->enable_captures) {
+        for (const auto & spec : req->captures) {
+            if (spec.dst && interp_regex_match(full_name, spec.regex)) {
+                res->interp_captures.push_back({
+                    full_name,
+                    il,
+                    (int32_t) cur->ne[0],
+                    (int32_t) cur->ne[1],
+                    cur,
+                    spec.dst,
+                });
+            }
+        }
+    }
+
+    return cur;
+}
 
 ggml_tensor * llm_graph_context::build_cvec(
          ggml_tensor * cur,

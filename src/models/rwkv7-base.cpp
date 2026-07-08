@@ -102,6 +102,9 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix(llm_graph_input_rs * in
     v = ggml_reshape_3d(ctx0, v, head_size, head_count, n_tokens);
     a = ggml_reshape_3d(ctx0, a, head_size, head_count, n_tokens);
 
+    r = interp_rwkv_tap(r, "r", il);
+    v = interp_rwkv_tap(v, "v", il);
+
     ggml_tensor * wkv_state = build_rs(inp, mctx_cur->get_s_l(il), hparams.n_embd_s(), n_seqs);
 
     ggml_tensor * wkv_output = ggml_rwkv_wkv7(ctx0, r, w, k, v, ggml_neg(ctx0, kk), ggml_mul(ctx0, kk, a), wkv_state);

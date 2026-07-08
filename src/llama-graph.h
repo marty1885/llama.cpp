@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
+#include "llama-ext.h"
 
 #include <cstdint>
 #include <vector>
@@ -11,6 +12,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <string>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -204,6 +206,19 @@ public:
     const llama_hparams hparams;
 
     const llama_kv_cache_context * mctx;
+};
+
+class llm_graph_input_interp_perturb : public llm_graph_input_i {
+public:
+    llm_graph_input_interp_perturb(std::vector<uint8_t> data) : data(std::move(data)) {}
+    virtual ~llm_graph_input_interp_perturb() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * tensor = nullptr;
+    std::vector<uint8_t> data;
 };
 
 class llm_graph_input_out_ids : public llm_graph_input_i {
@@ -773,6 +788,8 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            cparams.interp_request          == other.cparams.interp_request          &&
+            cparams.interp_request_id       == other.cparams.interp_request_id       &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -835,6 +852,17 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
+
+    struct interp_capture {
+        std::string name;
+        int32_t layer;
+        int32_t head_size;
+        int32_t n_head;
+        ggml_tensor * tensor;
+        llama_interp_activation_set * dst;
+    };
+
+    std::vector<interp_capture> interp_captures;
 
     std::map<llama_seq_id, ggml_tensor *> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor *> t_candidates;
@@ -937,6 +965,8 @@ struct llm_graph_context {
     virtual ~llm_graph_context() = default;
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
+
+    ggml_tensor * interp_rwkv_tap(ggml_tensor * cur, const char * name, int il) const;
 
     //
     // common

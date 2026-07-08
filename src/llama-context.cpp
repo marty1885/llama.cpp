@@ -1127,6 +1127,11 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::set_interp_request(const llama_interp_request * request) {
+    cparams.interp_request = request;
+    cparams.interp_request_id = request ? request->id : 0;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1268,6 +1273,46 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+static void interp_collect_captures(ggml_backend_sched_t sched, const llm_graph_result * res) {
+    if (!res->interp_captures.empty()) {
+        ggml_backend_sched_synchronize(sched);
+    }
+
+    for (const auto & cap : res->interp_captures) {
+        if (!cap.dst || !cap.tensor) {
+            continue;
+        }
+
+        llama_interp_activation out;
+        out.name = cap.name;
+        out.layer = cap.layer;
+        out.head_size = cap.head_size;
+        out.n_head = cap.n_head;
+        out.shape.assign(cap.tensor->ne, cap.tensor->ne + GGML_MAX_DIMS);
+
+        const size_t n = ggml_nelements(cap.tensor);
+        out.data.resize(n);
+
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, cap.tensor);
+        GGML_ASSERT(backend != nullptr);
+        out.backend = ggml_backend_name(backend);
+
+        if (cap.tensor->type == GGML_TYPE_F16) {
+            ggml_backend_tensor_get(cap.tensor, out.data.data(), 0, n * sizeof(ggml_fp16_t));
+        } else if (cap.tensor->type == GGML_TYPE_F32) {
+            std::vector<float> tmp(n);
+            ggml_backend_tensor_get(cap.tensor, tmp.data(), 0, n * sizeof(float));
+            for (size_t i = 0; i < n; ++i) {
+                out.data[i] = ggml_fp32_to_fp16(tmp[i]);
+            }
+        } else {
+            GGML_ABORT("unsupported interp capture tensor type");
+        }
+
+        cap.dst->push_back(std::move(out));
+    }
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1336,6 +1381,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     ret = GGML_STATUS_SUCCESS;
+
+    interp_collect_captures(sched.get(), res);
 
     return res;
 }
@@ -3676,6 +3723,10 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+void llama_interp_set_request(llama_context * ctx, const llama_interp_request * request) {
+    ctx->set_interp_request(request);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

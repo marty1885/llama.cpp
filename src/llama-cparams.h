@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <vector>
 
+struct llama_interp_request;
+
 #define LLAMA_MAX_SEQ 256
 
 struct llama_cparams {
@@ -48,6 +50,9 @@ struct llama_cparams {
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+
+    const llama_interp_request * interp_request = nullptr;
+    uint64_t interp_request_id = 0;
 
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;

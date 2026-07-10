@@ -89,7 +89,7 @@ static llama_interp::task<> run_probe(
 
     auto proof = rt.decode(out.prefill_state, 1);
     proof.perturb("rwkv\\.layer\\.[0-9]+\\.time\\.v", zero_v);
-    proof.capture("rwkv\\.layer\\.[0-9]+\\.time\\.v", out.zero_v_caps);
+    proof.capture_f16("rwkv\\.layer\\.[0-9]+\\.time\\.v", out.zero_v_caps);
     out.zero_v_one = co_await proof;
 
     auto full = rt.decode(out.prefill_state, n_predict);
@@ -103,7 +103,7 @@ int main(int argc, char ** argv) {
     std::string model_path;
     std::string prompt = "The Eiffel Tower is located in";
     int n_predict = 64;
-    int n_gpu_layers = 999;
+    int n_gpu_layers = 0;
     int max_parallel = 4;
 
     for (int i = 1; i < argc; ++i) {

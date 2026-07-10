@@ -86,6 +86,7 @@ public:
     class decode_op;
 
     prefill_op prefill(const rwkv_state & state, std::string text);
+    prefill_op prefill_tokens(const rwkv_state & state, std::vector<llama_token> tokens);
     decode_op decode(const rwkv_state & state, int32_t n_tokens);
 
     void run();
@@ -127,8 +128,26 @@ public:
             tokens = common_tokenize(rt.ctx, this->text, false, true);
         }
 
+        prefill_op(runtime & rt, const rwkv_state & state, std::vector<llama_token> tokens)
+            : op_base(rt, kind::prefill, state), tokens(std::move(tokens)) {}
+
         prefill_op & capture(std::string regex, activation_set & dst) {
-            request.captures.push_back({std::move(regex), &dst});
+            request.captures.push_back({std::move(regex), &dst, true});
+            return *this;
+        }
+
+        prefill_op & capture_f16(std::string regex, activation_set & dst) {
+            request.captures.push_back({std::move(regex), &dst, false});
+            return *this;
+        }
+
+        prefill_op & capture_f32(std::string regex, activation_set & dst) {
+            request.captures.push_back({std::move(regex), &dst, true});
+            return *this;
+        }
+
+        prefill_op & discard_state() {
+            export_state = false;
             return *this;
         }
 
@@ -146,6 +165,7 @@ public:
         std::string text;
         std::vector<llama_token> tokens;
         rwkv_state output;
+        bool export_state = true;
     };
 
     class decode_op : public op_base {
@@ -154,7 +174,17 @@ public:
             : op_base(rt, kind::decode, state), n_tokens(n_tokens) {}
 
         decode_op & capture(std::string regex, activation_set & dst) {
-            request.captures.push_back({std::move(regex), &dst});
+            request.captures.push_back({std::move(regex), &dst, true});
+            return *this;
+        }
+
+        decode_op & capture_f16(std::string regex, activation_set & dst) {
+            request.captures.push_back({std::move(regex), &dst, false});
+            return *this;
+        }
+
+        decode_op & capture_f32(std::string regex, activation_set & dst) {
+            request.captures.push_back({std::move(regex), &dst, true});
             return *this;
         }
 
@@ -266,11 +296,13 @@ private:
 
         for (size_t i = 0; i < group.size(); ++i) {
             auto * op = static_cast<prefill_op *>(group[i]);
-            if (!llama_interp_rwkv_state_export(ctx, (llama_seq_id) i, &op->output)) {
-                throw std::runtime_error("failed to export RWKV interp state");
+            if (op->export_state) {
+                if (!llama_interp_rwkv_state_export(ctx, (llama_seq_id) i, &op->output)) {
+                    throw std::runtime_error("failed to export RWKV interp state");
+                }
+                op->output.has_next = true;
+                op->output.next_token = greedy_token(ctx, (int32_t) i);
             }
-            op->output.has_next = true;
-            op->output.next_token = greedy_token(ctx, (int32_t) i);
         }
     }
 
@@ -319,6 +351,10 @@ private:
 
 inline runtime::prefill_op runtime::prefill(const rwkv_state & state, std::string text) {
     return prefill_op(*this, state, std::move(text));
+}
+
+inline runtime::prefill_op runtime::prefill_tokens(const rwkv_state & state, std::vector<llama_token> tokens) {
+    return prefill_op(*this, state, std::move(tokens));
 }
 
 inline runtime::decode_op runtime::decode(const rwkv_state & state, int32_t n_tokens) {

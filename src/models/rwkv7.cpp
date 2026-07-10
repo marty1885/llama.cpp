@@ -143,6 +143,7 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
     for (int il = 0; il < n_layer; ++il) {
         const llama_layer * layer = &model.layers[il];
         inpL                      = ggml_reshape_3d(ctx0, inpL, n_embd, n_seq_tokens, n_seqs);
+        inpL                      = interp_rwkv_tap(inpL, "resid", "in", il);
 
         ggml_tensor * token_shift = build_rwkv_token_shift_load(rs_inp, ubatch, il);
 
@@ -189,6 +190,7 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
         }
         cur = build_rwkv7_channel_mix(layer, ffn_norm, x_prev, LLM_ARCH_RWKV7);
         cur = ggml_add(ctx0, cur, ffn_inp);
+        cur = interp_rwkv_tap(cur, "resid", "out", il);
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);

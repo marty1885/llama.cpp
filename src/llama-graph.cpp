@@ -64,11 +64,11 @@ static bool can_reuse_kq_mask(
 
 // impl
 
-static std::string interp_tensor_name(const char * name, int il) {
+static std::string interp_tensor_name(const char * group, const char * name, int il) {
     if (il >= 0) {
-        return std::string("rwkv.layer.") + std::to_string(il) + ".time." + name;
+        return std::string("rwkv.layer.") + std::to_string(il) + "." + group + "." + name;
     }
-    return std::string("rwkv.time.") + name;
+    return std::string("rwkv.") + group + "." + name;
 }
 
 static bool interp_regex_match(const std::string & text, const std::string & pattern) {
@@ -1455,14 +1455,40 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     }
 }
 
-ggml_tensor * llm_graph_context::interp_rwkv_tap(ggml_tensor * cur, const char * name, int il) const {
+ggml_tensor * llm_graph_context::interp_rwkv_tap(
+        ggml_tensor * cur,
+        const char * group,
+        const char * name,
+        int il) const {
     const llama_interp_request * req = cparams.interp_request;
     if (req == nullptr) {
         return cur;
     }
 
-    const std::string full_name = interp_tensor_name(name, il);
+    const std::string full_name = interp_tensor_name(group, name, il);
     ggml_set_name(cur, full_name.c_str());
+
+    if (req->enable_captures) {
+        const std::string pre_name = full_name + ".pre";
+        for (const auto & spec : req->captures) {
+            if (spec.dst && interp_regex_match(pre_name, spec.regex)) {
+                // Intermediate buffers can be reused before host-side collection. Materialize the
+                // value here and retain it as a graph output for a stable capture.
+                ggml_tensor * snapshot = ggml_dup(ctx0, cur);
+                ggml_set_name(snapshot, pre_name.c_str());
+                ggml_build_forward_expand(gf, snapshot);
+                res->interp_captures.push_back({
+                    pre_name,
+                    il,
+                    (int32_t) snapshot->ne[0],
+                    (int32_t) snapshot->ne[1],
+                    snapshot,
+                    spec.dst,
+                    spec.f32,
+                });
+            }
+        }
+    }
 
     if (req->enable_perturbations) {
         for (const auto & spec : req->perturbations) {
@@ -1492,13 +1518,18 @@ ggml_tensor * llm_graph_context::interp_rwkv_tap(ggml_tensor * cur, const char *
     if (req->enable_captures) {
         for (const auto & spec : req->captures) {
             if (spec.dst && interp_regex_match(full_name, spec.regex)) {
+                // See the pre-perturb capture above: the snapshot must outlive downstream reuse.
+                ggml_tensor * snapshot = ggml_dup(ctx0, cur);
+                ggml_set_name(snapshot, full_name.c_str());
+                ggml_build_forward_expand(gf, snapshot);
                 res->interp_captures.push_back({
                     full_name,
                     il,
-                    (int32_t) cur->ne[0],
-                    (int32_t) cur->ne[1],
-                    cur,
+                    (int32_t) snapshot->ne[0],
+                    (int32_t) snapshot->ne[1],
+                    snapshot,
                     spec.dst,
+                    spec.f32,
                 });
             }
         }
@@ -2400,6 +2431,12 @@ ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
 }
 
 ggml_tensor * llm_graph_context::build_inp_out_ids() const {
+    // Interp POCs decode one output per token, so selecting output rows is an identity operation.
+    // Avoid creating an otherwise unused host input for this graph shape.
+    if (cparams.interp_request != nullptr && n_outputs == n_tokens) {
+        return nullptr;
+    }
+
     // note: when all tokens are output, we could skip this optimization to spare the ggml_get_rows() calls,
     //       but this would make the graph topology depend on the number of output tokens, which can interfere with
     //       features that require constant topology such as pipeline parallelism

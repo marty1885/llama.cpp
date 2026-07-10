@@ -119,8 +119,8 @@ ggml_tensor * llm_build_rwkv6_base::build_rwkv6_time_mix(llm_graph_input_rs * in
     v = ggml_reshape_3d(ctx0, v, head_size, n_head, n_tokens);
     r = ggml_reshape_3d(ctx0, r, head_size, n_head, n_tokens);
 
-    r = interp_rwkv_tap(r, "r", il);
-    v = interp_rwkv_tap(v, "v", il);
+    r = interp_rwkv_tap(r, "time", "r", il);
+    v = interp_rwkv_tap(v, "time", "v", il);
 
     ggml_tensor * w =
         ggml_mul_mat(ctx0, layer.time_mix_decay_w2, ggml_tanh(ctx0, ggml_mul_mat(ctx0, layer.time_mix_decay_w1, xw)));

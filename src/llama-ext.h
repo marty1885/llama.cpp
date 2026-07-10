@@ -156,6 +156,7 @@ struct llama_interp_activation {
     int32_t n_head = 0;
     std::vector<int64_t> shape;
     std::vector<ggml_fp16_t> data;
+    std::vector<float> data_f32;
 };
 
 using llama_interp_activation_set = std::vector<llama_interp_activation>;
@@ -168,6 +169,7 @@ enum llama_interp_perturb_op {
 struct llama_interp_capture_spec {
     std::string regex;
     llama_interp_activation_set * dst = nullptr;
+    bool f32 = true;
 };
 
 struct llama_interp_perturb_spec {

@@ -1291,17 +1291,27 @@ static void interp_collect_captures(ggml_backend_sched_t sched, const llm_graph_
         out.shape.assign(cap.tensor->ne, cap.tensor->ne + GGML_MAX_DIMS);
 
         const size_t n = ggml_nelements(cap.tensor);
-        out.data.resize(n);
-
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, cap.tensor);
         GGML_ASSERT(backend != nullptr);
         out.backend = ggml_backend_name(backend);
 
-        if (cap.tensor->type == GGML_TYPE_F16) {
+        if (cap.f32 && cap.tensor->type == GGML_TYPE_F32) {
+            out.data_f32.resize(n);
+            ggml_backend_tensor_get(cap.tensor, out.data_f32.data(), 0, n * sizeof(float));
+        } else if (cap.f32 && cap.tensor->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> tmp(n);
+            ggml_backend_tensor_get(cap.tensor, tmp.data(), 0, n * sizeof(ggml_fp16_t));
+            out.data_f32.resize(n);
+            for (size_t i = 0; i < n; ++i) {
+                out.data_f32[i] = ggml_fp16_to_fp32(tmp[i]);
+            }
+        } else if (cap.tensor->type == GGML_TYPE_F16) {
+            out.data.resize(n);
             ggml_backend_tensor_get(cap.tensor, out.data.data(), 0, n * sizeof(ggml_fp16_t));
         } else if (cap.tensor->type == GGML_TYPE_F32) {
             std::vector<float> tmp(n);
             ggml_backend_tensor_get(cap.tensor, tmp.data(), 0, n * sizeof(float));
+            out.data.resize(n);
             for (size_t i = 0; i < n; ++i) {
                 out.data[i] = ggml_fp32_to_fp16(tmp[i]);
             }

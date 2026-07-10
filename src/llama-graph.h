@@ -860,6 +860,7 @@ public:
         int32_t n_head;
         ggml_tensor * tensor;
         llama_interp_activation_set * dst;
+        bool f32;
     };
 
     std::vector<interp_capture> interp_captures;
@@ -966,7 +967,7 @@ struct llm_graph_context {
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
 
-    ggml_tensor * interp_rwkv_tap(ggml_tensor * cur, const char * name, int il) const;
+    ggml_tensor * interp_rwkv_tap(ggml_tensor * cur, const char * group, const char * name, int il) const;
 
     //
     // common

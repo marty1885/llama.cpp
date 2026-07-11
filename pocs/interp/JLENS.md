@@ -1,6 +1,6 @@
 # RWKV J-Lens
 
-`llama-interp-jlens-build` estimates a low-rank, strict-future Jacobian operator from
+`llama-interp-jlens-build` estimates a low-rank, current-and-future Jacobian operator from
 `rwkv.layer.L.resid.out` to the final residual. It writes FP32 Rademacher probe
 directions, their averaged FP32 responses, a manifest, and the exact corpus line and
 position samples used for the build and held-out validation.
@@ -58,5 +58,20 @@ The stored operator is applied as:
 Jhat(x) = (input_dimension / rank) * sum_k response[k] * dot(direction[k], x)
 ```
 
-The remaining reader work is to apply `Jhat` to captured activations and route the
-final residual through RWKV's production final normalization and output head.
+## Applied Readout
+
+`llama-interp-jlens-readout --operator` applies a saved builder artifact to the
+source residual at the final token of a prompt, then routes the resulting final
+residual through RWKV's production final normalization and output head:
+
+```bash
+build/bin/llama-interp-jlens-readout \
+  -m MODEL -ngl 12 \
+  --operator OUTPUT_PREFIX \
+  --output READOUT_PREFIX \
+  -p "The capital of France is"
+```
+
+This produces `READOUT_PREFIX.action.f16`, a manifest, and a top-token readout.
+A low-rank smoke artifact is only a plumbing check: do not interpret its tokens
+until held-out operator accuracy converges as rank and corpus samples increase.

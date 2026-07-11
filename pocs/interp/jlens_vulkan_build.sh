@@ -16,6 +16,8 @@ layer=${JLEN_VK_BUILD_LAYER:-59}
 rank=${JLEN_VK_BUILD_RANK:-4}
 samples_per_direction=${JLEN_VK_BUILD_SAMPLES_PER_DIRECTION:-2}
 validation_samples=${JLEN_VK_BUILD_VALIDATION_SAMPLES:-2}
+min_future=${JLEN_VK_BUILD_MIN_FUTURE:-0}
+future_window=${JLEN_VK_BUILD_FUTURE_WINDOW:-63}
 visible_devices=${JLEN_VK_BUILD_VISIBLE_DEVICES:-}
 
 if [[ ! -x $binary ]]; then
@@ -43,8 +45,8 @@ exec "$binary" \
     --validation-samples "$validation_samples" \
     --validation-modulo 5 \
     --max-corpus-tokens 64 \
-    --min-future 1 \
-    --future-window 1 \
+    --min-future "$min_future" \
+    --future-window "$future_window" \
     --epsilon 0.20 \
     --compare-epsilon 0.10 \
     --repeat-plus

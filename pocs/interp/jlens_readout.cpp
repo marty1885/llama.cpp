@@ -29,16 +29,103 @@ struct average_result {
     std::vector<double> repeat_plus_error;
 };
 
+struct operator_artifact {
+    int source_layer = -1;
+    int target_layer = -1;
+    size_t input_dimension = 0;
+    size_t output_dimension = 0;
+    size_t rank = 0;
+    std::string directions_path;
+    std::string responses_path;
+    std::vector<float> directions;
+    std::vector<float> responses;
+};
+
 static void usage(const char * argv0) {
     std::fprintf(stderr,
-        "usage: %s -m MODEL --output PREFIX [-p PROMPT] [-ngl N] [--layer N] [--epsilon E] [--compare-epsilon E] [--samples N] [--corpus FILE] [--max-corpus-tokens N] [--min-future N] [--future-window N] [--repeat-plus]\n"
+        "usage: %s -m MODEL --output PREFIX [--operator PREFIX] [-p PROMPT] [-ngl N] [--layer N] [--epsilon E] [--compare-epsilon E] [--samples N] [--corpus FILE] [--max-corpus-tokens N] [--min-future N] [--future-window N] [--repeat-plus]\n"
         "\n"
-        "Estimates one J-lens readout by averaging finite differences along a held-out activation.\n",
+        "Estimates one J-lens readout by averaging finite differences along a held-out activation,\n"
+        "or applies a saved low-rank operator to the prompt's final-token residual.\n",
         argv0);
 }
 
 static std::string residual_name(int layer) {
     return "rwkv.layer." + std::to_string(layer) + ".resid.out";
+}
+
+static std::string manifest_path(const std::string & prefix) {
+    return prefix.ends_with(".txt") ? prefix : prefix + ".txt";
+}
+
+static void read_f32(const std::string & path, std::vector<float> & values, size_t count) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("failed to open operator data: " + path);
+    }
+    values.resize(count);
+    input.read((char *) values.data(), (std::streamsize) (count * sizeof(float)));
+    if (input.gcount() != (std::streamsize) (count * sizeof(float)) || input.peek() != std::char_traits<char>::eof()) {
+        throw std::runtime_error("unexpected operator data size: " + path);
+    }
+}
+
+static operator_artifact load_operator(const std::string & prefix) {
+    operator_artifact out;
+    std::ifstream manifest(manifest_path(prefix));
+    if (!manifest) {
+        throw std::runtime_error("failed to open operator manifest: " + manifest_path(prefix));
+    }
+
+    std::string line;
+    while (std::getline(manifest, line)) {
+        const size_t separator = line.find('=');
+        if (separator == std::string::npos) {
+            continue;
+        }
+        const std::string key = line.substr(0, separator);
+        const std::string value = line.substr(separator + 1);
+        if (key == "source_layer") {
+            out.source_layer = std::stoi(value);
+        } else if (key == "target_layer") {
+            out.target_layer = std::stoi(value);
+        } else if (key == "input_dimension") {
+            out.input_dimension = std::stoull(value);
+        } else if (key == "output_dimension") {
+            out.output_dimension = std::stoull(value);
+        } else if (key == "rank") {
+            out.rank = std::stoull(value);
+        } else if (key == "directions_f32") {
+            out.directions_path = value;
+        } else if (key == "responses_f32") {
+            out.responses_path = value;
+        }
+    }
+    if (out.source_layer < 0 || out.target_layer < 0 || out.input_dimension == 0 || out.output_dimension == 0 || out.rank == 0 ||
+        out.directions_path.empty() || out.responses_path.empty()) {
+        throw std::runtime_error("operator manifest is missing required fields: " + manifest_path(prefix));
+    }
+    read_f32(out.directions_path, out.directions, out.rank * out.input_dimension);
+    read_f32(out.responses_path, out.responses, out.rank * out.output_dimension);
+    return out;
+}
+
+static std::vector<float> apply_operator(const operator_artifact & op, const std::vector<float> & input) {
+    if (input.size() != op.input_dimension) {
+        throw std::runtime_error("operator input dimension differs from captured residual");
+    }
+    std::vector<float> out(op.output_dimension, 0.0f);
+    const double scale = (double) op.input_dimension / op.rank;
+    for (size_t k = 0; k < op.rank; ++k) {
+        double dot = 0.0;
+        for (size_t i = 0; i < op.input_dimension; ++i) {
+            dot += (double) op.directions[k * op.input_dimension + i] * input[i];
+        }
+        for (size_t i = 0; i < op.output_dimension; ++i) {
+            out[i] += (float) (scale * dot * op.responses[k * op.output_dimension + i]);
+        }
+    }
+    return out;
 }
 
 static const llama_interp_activation & require_capture(
@@ -640,6 +727,7 @@ int main(int argc, char ** argv) {
     std::string model_path;
     std::string output_prefix;
     std::string corpus_path;
+    std::string operator_prefix;
     std::string prompt = "The Eiffel Tower is located in";
     int n_gpu_layers = 0;
     int source_layer = -1;
@@ -656,6 +744,8 @@ int main(int argc, char ** argv) {
             model_path = argv[++i];
         } else if (std::strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
             output_prefix = argv[++i];
+        } else if (std::strcmp(argv[i], "--operator") == 0 && i + 1 < argc) {
+            operator_prefix = argv[++i];
         } else if (std::strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             prompt = argv[++i];
         } else if (std::strcmp(argv[i], "-ngl") == 0 && i + 1 < argc) {
@@ -746,7 +836,17 @@ int main(int argc, char ** argv) {
 
     llama_interp::runtime rt(ctx, 1);
     const llama_interp::rwkv_state initial_state = rt.make_state();
-    if (source_layer < 0) {
+    operator_artifact saved_operator;
+    if (!operator_prefix.empty()) {
+        saved_operator = load_operator(operator_prefix);
+        if (source_layer >= 0 && source_layer != saved_operator.source_layer) {
+            throw std::runtime_error("--layer does not match the saved operator source layer");
+        }
+        source_layer = saved_operator.source_layer;
+        if (saved_operator.target_layer != (int) initial_state.n_layer - 1) {
+            throw std::runtime_error("saved operator does not target this model's final residual layer");
+        }
+    } else if (source_layer < 0) {
         source_layer = (int) initial_state.n_layer / 2;
     }
     if (source_layer < 0 || source_layer >= (int) initial_state.n_layer) {
@@ -767,6 +867,46 @@ int main(int argc, char ** argv) {
     const auto & query = require_capture_f32(evaluation.captures, source);
     const auto & clean_final = require_capture_f32(evaluation.captures, final);
     const double query_norm = l2_norm(query);
+
+    if (!operator_prefix.empty()) {
+        if (saved_operator.output_dimension != clean_final.size()) {
+            throw std::runtime_error("operator output dimension differs from the final residual");
+        }
+        const std::vector<float> action = apply_operator(saved_operator, query);
+        {
+            auto lens_task = evaluate_head(rt, initial_state, evaluation_tokens.back(), as_fp16(action));
+            rt.run();
+            lens_task.rethrow_if_failed();
+        }
+        const std::vector<float> lens_logits = copy_logits(ctx, llama_vocab_n_tokens(vocab));
+        const std::string action_path = output_prefix + ".action.f16";
+        const std::string readout_manifest_path = output_prefix + ".txt";
+        write_f16(action_path, action);
+        std::ofstream manifest(readout_manifest_path);
+        if (!manifest) {
+            throw std::runtime_error("failed to open output: " + readout_manifest_path);
+        }
+        manifest << "format=rwkv_jlens_applied_readout_v1\n";
+        manifest << "operator_manifest=" << manifest_path(operator_prefix) << '\n';
+        manifest << "source_layer=" << source_layer << '\n';
+        manifest << "target_layer=" << saved_operator.target_layer << '\n';
+        manifest << "dimension=" << action.size() << '\n';
+        manifest << "rank=" << saved_operator.rank << '\n';
+        manifest << "prompt=" << prompt << '\n';
+        manifest << "action_f16=" << action_path << '\n';
+
+        std::printf("applied operator source=%s target=%s rank=%zu prompt_tokens=%zu\n",
+            source.c_str(), final.c_str(), saved_operator.rank, evaluation_tokens.size());
+        std::printf("source_l2=%g action_l2=%g\n", query_norm, l2_norm(action));
+        std::printf("--- Applied J-lens top tokens ---\n");
+        print_top_tokens(vocab, lens_logits, 10);
+        std::printf("wrote %s\n", readout_manifest_path.c_str());
+
+        llama_free(ctx);
+        llama_model_free(model);
+        llama_backend_free();
+        return 0;
+    }
 
     std::vector<sample_spec> sample_specs;
     sample_specs.reserve(samples);

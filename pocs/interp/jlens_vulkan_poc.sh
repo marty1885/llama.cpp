@@ -13,6 +13,8 @@ vmem_kib=${JLEN_VK_POC_VMEM_KIB:-30000000}
 n_gpu_layers=${JLEN_VK_POC_N_GPU_LAYERS:-2}
 layer=${JLEN_VK_POC_LAYER:-59}
 samples=${JLEN_VK_POC_SAMPLES:-1}
+min_future=${JLEN_VK_POC_MIN_FUTURE:-0}
+future_window=${JLEN_VK_POC_FUTURE_WINDOW:-63}
 visible_devices=${JLEN_VK_POC_VISIBLE_DEVICES:-}
 
 if [[ ! -x $binary ]]; then
@@ -31,8 +33,8 @@ exec "$binary" \
     -ngl "$n_gpu_layers" \
     --layer "$layer" \
     --samples "$samples" \
-    --min-future 1 \
-    --future-window 1 \
+    --min-future "$min_future" \
+    --future-window "$future_window" \
     --epsilon 0.20 \
     --compare-epsilon 0.10 \
     --repeat-plus \

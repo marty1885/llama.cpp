@@ -475,7 +475,7 @@ int main(int argc, char ** argv) {
     }
 
     if (model_path.empty() || corpus_path.empty() || output_prefix.empty() || rank <= 0 || samples_per_direction <= 0 ||
-        validation_samples <= 0 || validation_modulo < 2 || max_corpus_tokens <= min_future || min_future < 1 ||
+        validation_samples <= 0 || validation_modulo < 2 || max_corpus_tokens <= min_future || min_future < 0 ||
         future_window < min_future || epsilon <= 0.0f || compare_epsilon < 0.0f) {
         usage(argv[0]);
         return 1;

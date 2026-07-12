@@ -56,11 +56,6 @@ target_compile_features(llama-interp-rwkv-unembed PRIVATE cxx_std_20)
 target_include_directories(llama-interp-rwkv-unembed PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ../../src ../../common)
 target_link_libraries(llama-interp-rwkv-unembed PRIVATE llama-interp-rwkv-activation-store llama llama-common)
 
-add_executable(llama-interp-rwkv-perturb-trace rwkv_perturb_trace.cpp)
-target_compile_features(llama-interp-rwkv-perturb-trace PRIVATE cxx_std_20)
-target_include_directories(llama-interp-rwkv-perturb-trace PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ../../src ../../common)
-target_link_libraries(llama-interp-rwkv-perturb-trace PRIVATE llama-interp-rwkv-activation-store llama llama-common)
-
 add_executable(llama-interp-rwkv-activation-collect rwkv_activation_collect.cpp)
 target_compile_features(llama-interp-rwkv-activation-collect PRIVATE cxx_std_20)
 target_include_directories(llama-interp-rwkv-activation-collect PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ../../src ../../common)

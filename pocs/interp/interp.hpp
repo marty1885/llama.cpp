@@ -3,6 +3,7 @@
 #include "common.h"
 #include "llama-ext.h"
 
+#include <algorithm>
 #include <coroutine>
 #include <deque>
 #include <exception>
@@ -234,9 +235,18 @@ private:
         req.id = ++request_id;
         req.enable_perturbations = perturb;
         req.enable_captures = capture;
-        for (op_base * op : group) {
+        for (size_t i = 0; i < group.size(); ++i) {
+            op_base * op = group[i];
             if (perturb) {
-                req.perturbations.insert(req.perturbations.end(), op->request.perturbations.begin(), op->request.perturbations.end());
+                for (const auto & requested : op->request.perturbations) {
+                    llama_interp_perturb_spec spec = requested;
+                    if (group.size() > 1 && !spec.data.empty()) {
+                        std::vector<ggml_fp16_t> batched(spec.data.size() * group.size(), ggml_fp32_to_fp16(0.0f));
+                        std::copy(spec.data.begin(), spec.data.end(), batched.begin() + i * spec.data.size());
+                        spec.data = std::move(batched);
+                    }
+                    req.perturbations.push_back(std::move(spec));
+                }
             }
             if (capture) {
                 req.captures.insert(req.captures.end(), op->request.captures.begin(), op->request.captures.end());
@@ -369,7 +379,9 @@ inline void runtime::run() {
         std::vector<op_base *> group;
         for (auto it = queue.begin(); it != queue.end() && group.size() < max_parallel_experiments;) {
             op_base * op = *it;
-            if (op->op_kind != k || (op->has_perturb() && !group.empty()) || (!group.empty() && group.front()->has_perturb())) {
+            if (op->op_kind != k ||
+                (!group.empty() && op->has_perturb() != group.front()->has_perturb()) ||
+                (op->has_perturb() && group.size() >= 2)) {
                 ++it;
                 continue;
             }

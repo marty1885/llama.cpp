@@ -68,6 +68,7 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix(llm_graph_input_rs * in
         ctx0, ggml_mul_mat(ctx0, layer.time_mix_w2, ggml_tanh(ctx0, ggml_mul_mat(ctx0, layer.time_mix_w1, xw))),
         layer.time_mix_w0);
     w = ggml_exp(ctx0, ggml_scale(ctx0, ggml_sigmoid(ctx0, w), -0.606531));
+    w = interp_rwkv_tap(w, "time", "w", il);
 
     ggml_tensor * k = build_lora_mm(layer.time_mix_key, xk);
     ggml_tensor * v = build_lora_mm(layer.time_mix_value, xv);
@@ -85,16 +86,19 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix(llm_graph_input_rs * in
     ggml_tensor * g = nullptr;
     if (layer.time_mix_g1 && layer.time_mix_g2) {
         g = ggml_mul_mat(ctx0, layer.time_mix_g2, ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, layer.time_mix_g1, xg)));
+        g = interp_rwkv_tap(g, "time", "g", il);
     }
     ggml_tensor * a = ggml_sigmoid(
         ctx0, ggml_add(ctx0, ggml_mul_mat(ctx0, layer.time_mix_a2, ggml_mul_mat(ctx0, layer.time_mix_a1, xa)),
                        layer.time_mix_a0));
+    a = interp_rwkv_tap(a, "time", "a", il);
 
     ggml_tensor * kk = ggml_reshape_3d(ctx0, ggml_mul(ctx0, k, layer.time_mix_k_k), head_size, head_count, n_tokens);
     kk               = ggml_l2_norm(ctx0, kk, 1e-12);
 
     ggml_tensor * ka = ggml_mul(ctx0, k, layer.time_mix_k_a);
     k                = ggml_add(ctx0, k, ggml_sub(ctx0, ggml_mul(ctx0, a, ka), ka));
+    k                = interp_rwkv_tap(k, "time", "k", il);
 
     r = ggml_reshape_3d(ctx0, r, head_size, head_count, n_tokens);
     w = ggml_reshape_3d(ctx0, w, head_size, head_count, n_tokens);
@@ -131,11 +135,13 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix(llm_graph_input_rs * in
     ggml_tensor * rk = ggml_sum_rows(
         ctx0, ggml_mul(ctx0, ggml_mul(ctx0, k, r), ggml_reshape_2d(ctx0, layer.time_mix_r_k, head_size, head_count)));
     cur = ggml_add(ctx0, cur, ggml_reshape_2d(ctx0, ggml_mul(ctx0, v, rk), n_embd, n_tokens));
+    cur = interp_rwkv_tap(cur, "time", "rkv", il);
 
     if (has_gating) {
         cur = ggml_mul(ctx0, cur, g);
     }
     cur = build_lora_mm(layer.time_mix_output, cur);
+    cur = interp_rwkv_tap(cur, "time", "out", il);
 
     return ggml_reshape_3d(ctx0, cur, n_embd, n_seq_tokens, n_seqs);
 }

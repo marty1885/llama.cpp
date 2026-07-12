@@ -52,7 +52,7 @@ struct operator_data {
 
 static void usage(const char * argv0) {
     std::fprintf(stderr,
-        "usage: %s -m MODEL --corpus FILE --output PREFIX [-ngl N] [--layer N] [--rank N] [--samples-per-direction N] [--validation-samples N] [--validation-modulo N] [--split-seed N] [--max-corpus-tokens N] [--min-future N] [--future-window N] [--epsilon E] [--compare-epsilon E] [--repeat-plus]\n"
+        "usage: %s -m MODEL --corpus FILE --output PREFIX [-ngl N] [--layer N] [--source-activation residual|time-wkv] [--target-layer N] [--rank N] [--samples-per-direction N] [--validation-samples N] [--validation-modulo N] [--split-seed N] [--max-corpus-tokens N] [--min-future N] [--future-window N] [--all-future] [--epsilon E] [--compare-epsilon E] [--repeat-plus]\n"
         "\n"
         "Builds a low-rank, strict-future Jacobian lens operator and validates it on held-out corpus lines.\n",
         argv0);
@@ -60,6 +60,16 @@ static void usage(const char * argv0) {
 
 static std::string residual_name(int layer) {
     return "rwkv.layer." + std::to_string(layer) + ".resid.out";
+}
+
+static std::string source_name(int layer, const std::string & activation) {
+    if (activation == "residual") {
+        return residual_name(layer);
+    }
+    if (activation == "time-wkv") {
+        return "rwkv.layer." + std::to_string(layer) + ".time.wkv";
+    }
+    throw std::runtime_error("unknown source activation: " + activation);
 }
 
 static const std::vector<float> & require_capture_f32(
@@ -138,14 +148,15 @@ static sample_spec choose_sample(
         const std::vector<llama_token> & tokens,
         int min_future,
         int future_window,
-        uint64_t seed) {
+        uint64_t seed,
+        bool all_future) {
     if (tokens.size() <= (size_t) min_future) {
         throw std::runtime_error("corpus sample is too short for the requested future offset");
     }
     const size_t source = (size_t) (splitmix64(seed) % (tokens.size() - (size_t) min_future));
     const size_t min_target = source + (size_t) min_future;
     const size_t max_target = std::min(tokens.size() - 1, source + (size_t) future_window);
-    const size_t target = min_target + (size_t) (splitmix64(seed + 1) % (max_target - min_target + 1));
+    const size_t target = all_future ? max_target : min_target + (size_t) (splitmix64(seed + 1) % (max_target - min_target + 1));
     return { source, target };
 }
 
@@ -247,7 +258,7 @@ static llama_interp::task<> capture_target(
     co_await path;
 }
 
-static response_measurement measure_response(
+static response_measurement measure_single_response(
         llama_interp::runtime & rt,
         const llama_interp::rwkv_state & before_source,
         const std::vector<llama_token> & tokens,
@@ -327,6 +338,39 @@ static response_measurement measure_response(
     return out;
 }
 
+static response_measurement measure_response(
+        llama_interp::runtime & rt,
+        const llama_interp::rwkv_state & before_source,
+        const std::vector<llama_token> & tokens,
+        const sample_spec & spec,
+        const std::string & source,
+        const std::string & target,
+        const std::vector<ggml_fp16_t> & perturbation,
+        bool repeat_plus,
+        size_t first_target,
+        bool all_future) {
+    if (!all_future) {
+        return measure_single_response(rt, before_source, tokens, spec, source, target, perturbation, repeat_plus);
+    }
+    response_measurement out;
+    for (size_t target_index = first_target; target_index <= spec.target_index; ++target_index) {
+        sample_spec one = spec;
+        one.target_index = target_index;
+        const response_measurement value = measure_single_response(rt, before_source, tokens, one, source, target, perturbation, repeat_plus);
+        if (out.response.empty()) out.response.assign(value.response.size(), 0.0f);
+        for (size_t i = 0; i < out.response.size(); ++i) out.response[i] += value.response[i];
+        out.response_l2 += value.response_l2;
+        out.symmetry_error += value.symmetry_error;
+        out.repeat_plus_error += value.repeat_plus_error;
+    }
+    const double count = (double) (spec.target_index - first_target + 1);
+    for (float & value : out.response) value = (float) (value / count);
+    out.response_l2 /= count;
+    out.symmetry_error /= count;
+    out.repeat_plus_error /= count;
+    return out;
+}
+
 template <typename F>
 static int stream_partition(
         const llama_vocab * vocab,
@@ -336,6 +380,7 @@ static int stream_partition(
         int future_window,
         int validation_modulo,
         uint64_t split_seed,
+        bool all_future,
         bool validation,
         int requested,
         F && consume) {
@@ -359,9 +404,20 @@ static int stream_partition(
         if (tokens.size() <= (size_t) min_future) {
             continue;
         }
-        const sample_spec spec = choose_sample(tokens, min_future, future_window, splitmix64(split_seed + line_number + accepted));
+        const sample_spec spec = choose_sample(tokens, min_future, future_window, splitmix64(split_seed + line_number + accepted), all_future);
         consume(tokens, spec, line_number, accepted);
         ++accepted;
+        const int progress_interval = std::max(1, requested / 20);
+        if (accepted == 1 || accepted == requested || accepted % progress_interval == 0) {
+            if (all_future) {
+                std::fprintf(stderr, "jlens %s %d/%d line=%zu source=%zu targets=%zu-%zu\n",
+                    validation ? "validation" : "build", accepted, requested, line_number, spec.source_index,
+                    spec.source_index + (size_t) min_future, spec.target_index);
+            } else {
+                std::fprintf(stderr, "jlens %s %d/%d line=%zu source=%zu target=%zu\n",
+                    validation ? "validation" : "build", accepted, requested, line_number, spec.source_index, spec.target_index);
+            }
+        }
     }
     return accepted;
 }
@@ -423,6 +479,8 @@ int main(int argc, char ** argv) {
     std::string output_prefix;
     int n_gpu_layers = 0;
     int source_layer = -1;
+    int target_layer = -1;
+    std::string source_activation = "residual";
     int rank = 4;
     int samples_per_direction = 2;
     int validation_samples = 2;
@@ -434,6 +492,7 @@ int main(int argc, char ** argv) {
     float epsilon = 0.2f;
     float compare_epsilon = 0.1f;
     bool repeat_plus = false;
+    bool all_future = false;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -446,6 +505,10 @@ int main(int argc, char ** argv) {
             n_gpu_layers = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--layer") == 0 && i + 1 < argc) {
             source_layer = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--source-activation") == 0 && i + 1 < argc) {
+            source_activation = argv[++i];
+        } else if (std::strcmp(argv[i], "--target-layer") == 0 && i + 1 < argc) {
+            target_layer = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--rank") == 0 && i + 1 < argc) {
             rank = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--samples-per-direction") == 0 && i + 1 < argc) {
@@ -466,6 +529,8 @@ int main(int argc, char ** argv) {
             epsilon = std::strtof(argv[++i], nullptr);
         } else if (std::strcmp(argv[i], "--compare-epsilon") == 0 && i + 1 < argc) {
             compare_epsilon = std::strtof(argv[++i], nullptr);
+        } else if (std::strcmp(argv[i], "--all-future") == 0) {
+            all_future = true;
         } else if (std::strcmp(argv[i], "--repeat-plus") == 0) {
             repeat_plus = true;
         } else {
@@ -509,12 +574,15 @@ int main(int argc, char ** argv) {
     if (source_layer < 0) {
         source_layer = (int) initial_state.n_layer - 2;
     }
-    if (source_layer < 0 || source_layer >= (int) initial_state.n_layer - 1) {
-        std::fprintf(stderr, "source layer must precede the final layer\n");
+    if (target_layer < 0) {
+        target_layer = (int) initial_state.n_layer - 1;
+    }
+    if (source_layer < 0 || target_layer < 0 || target_layer >= (int) initial_state.n_layer || source_layer >= target_layer) {
+        std::fprintf(stderr, "source layer must precede target layer\n");
         return 1;
     }
-    const std::string source = residual_name(source_layer);
-    const std::string target = residual_name((int) initial_state.n_layer - 1);
+    const std::string source = source_name(source_layer, source_activation);
+    const std::string target = residual_name(target_layer);
 
     operator_data op;
     std::vector<std::vector<ggml_fp16_t>> perturbations;
@@ -527,7 +595,7 @@ int main(int argc, char ** argv) {
 
     const int requested_build = rank * samples_per_direction;
     const int completed_build = stream_partition(
-        vocab, corpus_path, max_corpus_tokens, min_future, future_window, validation_modulo, split_seed, false, requested_build,
+        vocab, corpus_path, max_corpus_tokens, min_future, future_window, validation_modulo, split_seed, all_future, false, requested_build,
         [&](const std::vector<llama_token> & tokens, const sample_spec & spec, size_t line, int sample_index) {
             llama_interp::rwkv_state before_source;
             {
@@ -553,7 +621,7 @@ int main(int argc, char ** argv) {
             }
             const int direction = sample_index % rank;
             const response_measurement primary = measure_response(
-                rt, before_source, tokens, spec, source, target, perturbations[direction], repeat_plus);
+                rt, before_source, tokens, spec, source, target, perturbations[direction], repeat_plus, spec.source_index + min_future, all_future);
             if (op.responses.empty()) {
                 op.output_dimension = primary.response.size();
                 op.responses.assign(rank, std::vector<float>(op.output_dimension, 0.0f));
@@ -573,7 +641,7 @@ int main(int argc, char ** argv) {
                 const std::vector<ggml_fp16_t> comparison = rademacher_perturbation(
                     op.input_dimension, compare_epsilon, splitmix64((uint64_t) direction));
                 const response_measurement secondary = measure_response(
-                    rt, before_source, tokens, spec, source, target, comparison, repeat_plus);
+                    rt, before_source, tokens, spec, source, target, comparison, repeat_plus, spec.source_index + min_future, all_future);
                 for (size_t i = 0; i < op.output_dimension; ++i) {
                     comparison_responses[direction][i] += secondary.response[i];
                 }
@@ -599,7 +667,7 @@ int main(int argc, char ** argv) {
     }
 
     const int completed_validation = stream_partition(
-        vocab, corpus_path, max_corpus_tokens, min_future, future_window, validation_modulo, split_seed, true, validation_samples,
+        vocab, corpus_path, max_corpus_tokens, min_future, future_window, validation_modulo, split_seed, all_future, true, validation_samples,
         [&](const std::vector<llama_token> & tokens, const sample_spec & spec, size_t line, int) {
             llama_interp::rwkv_state before_source;
             {
@@ -622,7 +690,7 @@ int main(int argc, char ** argv) {
             const std::vector<ggml_fp16_t> primary_perturbation = normalized_query_perturbation(
                 query, epsilon, effective_query, query_norm);
             const response_measurement primary = measure_response(
-                rt, before_source, tokens, spec, source, target, primary_perturbation, repeat_plus);
+                rt, before_source, tokens, spec, source, target, primary_perturbation, repeat_plus, spec.source_index + min_future, all_future);
             std::vector<float> actual = primary.response;
             for (float & value : actual) {
                 value = (float) (value * query_norm);
@@ -639,7 +707,7 @@ int main(int argc, char ** argv) {
                 const std::vector<ggml_fp16_t> secondary_perturbation = normalized_query_perturbation(
                     query, compare_epsilon, ignored_effective_query, ignored_query_norm);
                 const response_measurement secondary = measure_response(
-                    rt, before_source, tokens, spec, source, target, secondary_perturbation, repeat_plus);
+                rt, before_source, tokens, spec, source, target, secondary_perturbation, repeat_plus, spec.source_index + min_future, all_future);
                 std::vector<float> comparison = secondary.response;
                 for (float & value : comparison) {
                     value = (float) (value * ignored_query_norm);
@@ -666,7 +734,9 @@ int main(int argc, char ** argv) {
     }
     manifest << "format=rwkv_jlens_low_rank_v1\n";
     manifest << "source_layer=" << source_layer << '\n';
-    manifest << "target_layer=" << initial_state.n_layer - 1 << '\n';
+    manifest << "source_activation=" << source_activation << '\n';
+    manifest << "source_name=" << source << '\n';
+    manifest << "target_layer=" << target_layer << '\n';
     manifest << "input_dimension=" << op.input_dimension << '\n';
     manifest << "output_dimension=" << op.output_dimension << '\n';
     manifest << "rank=" << rank << '\n';
@@ -679,6 +749,7 @@ int main(int argc, char ** argv) {
     manifest << "split_seed=" << split_seed << '\n';
     manifest << "min_future=" << min_future << '\n';
     manifest << "future_window=" << future_window << '\n';
+    manifest << "future_aggregation=" << (all_future ? "all" : "sampled") << '\n';
     manifest << "epsilon_requested=" << epsilon << '\n';
     manifest << "compare_epsilon_requested=" << compare_epsilon << '\n';
     manifest << "n_gpu_layers=" << n_gpu_layers << '\n';

@@ -51,13 +51,13 @@ static double state_l1_diff(const llama_interp::rwkv_state & a, const llama_inte
         const auto & ar = a.layers[il].r;
         const auto & br = b.layers[il].r;
         for (size_t i = 0; i < std::min(ar.size(), br.size()); ++i) {
-            diff += std::abs(ggml_fp16_to_fp32(ar[i]) - ggml_fp16_to_fp32(br[i]));
+            diff += std::abs(ar[i] - br[i]);
         }
 
         const auto & as = a.layers[il].s;
         const auto & bs = b.layers[il].s;
         for (size_t i = 0; i < std::min(as.size(), bs.size()); ++i) {
-            diff += std::abs(ggml_fp16_to_fp32(as[i]) - ggml_fp16_to_fp32(bs[i]));
+            diff += std::abs(as[i] - bs[i]);
         }
     }
     return diff;
@@ -78,8 +78,8 @@ static llama_interp::task<> run_probe(
 
     rwkv_state zero = out.prefill_state;
     for (auto & layer : zero.layers) {
-        std::fill(layer.r.begin(), layer.r.end(), ggml_fp32_to_fp16(0.0f));
-        std::fill(layer.s.begin(), layer.s.end(), ggml_fp32_to_fp16(0.0f));
+        std::fill(layer.r.begin(), layer.r.end(), 0.0f);
+        std::fill(layer.s.begin(), layer.s.end(), 0.0f);
     }
     out.zero_state = co_await rt.decode(zero, n_predict);
 

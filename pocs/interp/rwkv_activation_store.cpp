@@ -1,0 +1,229 @@
+#include "rwkv_activation_store.h"
+
+#include "ggml.h"
+
+#include <ROOT/RNTupleModel.hxx>
+#include <ROOT/RNTupleReader.hxx>
+#include <ROOT/RNTupleWriter.hxx>
+
+#include <cstdio>
+#include <memory>
+#include <stdexcept>
+#include <utility>
+
+namespace {
+
+using ROOT::RNTupleModel;
+using ROOT::RNTupleReader;
+using ROOT::RNTupleWriter;
+
+constexpr const char * k_dataset_name = "rwkv_activations";
+constexpr const char * k_centroid_name = "rwkv_centroids";
+
+std::string source_field(size_t source_index) {
+    char name[32];
+    std::snprintf(name, sizeof(name), "activation_%03zu", source_index);
+    return name;
+}
+
+} // namespace
+
+namespace rwkv_activation_store {
+
+struct activation_dataset_writer::impl {
+    std::unique_ptr<RNTupleWriter> writer;
+    std::shared_ptr<uint64_t> sample_id;
+    std::shared_ptr<uint64_t> corpus_line;
+    std::shared_ptr<int32_t> token_position;
+    std::shared_ptr<int32_t> token_id;
+    std::shared_ptr<int32_t> prompt_tokens;
+    std::vector<std::shared_ptr<std::vector<uint16_t>>> activations;
+    size_t dimension;
+};
+
+activation_dataset_writer::activation_dataset_writer(std::unique_ptr<impl> impl) : impl_(std::move(impl)) {}
+activation_dataset_writer::activation_dataset_writer(activation_dataset_writer &&) noexcept = default;
+activation_dataset_writer & activation_dataset_writer::operator=(activation_dataset_writer &&) noexcept = default;
+activation_dataset_writer::~activation_dataset_writer() = default;
+
+activation_dataset_writer activation_dataset_writer::create(
+        const std::string & path,
+        std::vector<std::string> sources,
+        size_t dimension) {
+    if (sources.empty() || dimension == 0) {
+        throw std::runtime_error("activation dataset needs sources and a nonzero dimension");
+    }
+    auto model = RNTupleModel::Create();
+    auto result = std::make_unique<impl>();
+    result->sample_id = model->MakeField<uint64_t>("sample_id");
+    result->corpus_line = model->MakeField<uint64_t>("corpus_line");
+    result->token_position = model->MakeField<int32_t>("token_position");
+    result->token_id = model->MakeField<int32_t>("token_id");
+    result->prompt_tokens = model->MakeField<int32_t>("prompt_tokens");
+    result->activations.reserve(sources.size());
+    for (size_t source = 0; source < sources.size(); ++source) {
+        result->activations.push_back(model->MakeField<std::vector<uint16_t>>(source_field(source)));
+    }
+    result->dimension = dimension;
+    result->writer = RNTupleWriter::Recreate(std::move(model), k_dataset_name, path);
+    return activation_dataset_writer(std::move(result));
+}
+
+void activation_dataset_writer::append(
+        const sample_metadata & metadata,
+        const std::vector<std::span<const ggml_fp16_t>> & activations) {
+    if (!impl_ || activations.size() != impl_->activations.size()) {
+        throw std::runtime_error("activation source count differs from dataset schema");
+    }
+    *impl_->sample_id = metadata.sample_id;
+    *impl_->corpus_line = metadata.corpus_line;
+    *impl_->token_position = metadata.token_position;
+    *impl_->token_id = metadata.token_id;
+    *impl_->prompt_tokens = metadata.prompt_tokens;
+    for (size_t source = 0; source < activations.size(); ++source) {
+        const auto activation = activations[source];
+        if (activation.size() != impl_->dimension) {
+            throw std::runtime_error("activation dimension differs from dataset schema");
+        }
+        auto & encoded = *impl_->activations[source];
+        encoded.assign(activation.begin(), activation.end());
+    }
+    impl_->writer->Fill();
+}
+
+void activation_dataset_writer::commit() {
+    if (impl_ && impl_->writer) {
+        impl_->writer->CommitCluster();
+    }
+}
+
+struct activation_dataset_reader::impl {
+    std::unique_ptr<RNTupleReader> reader;
+    std::vector<std::string> sources;
+    size_t dimension = 0;
+};
+
+activation_dataset_reader::activation_dataset_reader(std::unique_ptr<impl> impl) : impl_(std::move(impl)) {}
+activation_dataset_reader::activation_dataset_reader(activation_dataset_reader &&) noexcept = default;
+activation_dataset_reader & activation_dataset_reader::operator=(activation_dataset_reader &&) noexcept = default;
+activation_dataset_reader::~activation_dataset_reader() = default;
+
+activation_dataset_reader activation_dataset_reader::open(const std::string & path, std::vector<std::string> sources) {
+    if (sources.empty()) {
+        throw std::runtime_error("activation dataset needs source names");
+    }
+    auto result = std::make_unique<impl>();
+    result->reader = RNTupleReader::Open(k_dataset_name, path);
+    result->sources = std::move(sources);
+    auto first = result->reader->GetView<std::vector<uint16_t>>(source_field(0));
+    if (result->reader->GetNEntries() == 0) {
+        throw std::runtime_error("activation dataset is empty");
+    }
+    result->dimension = first(0).size();
+    if (result->dimension == 0) {
+        throw std::runtime_error("activation dataset has zero-dimensional rows");
+    }
+    return activation_dataset_reader(std::move(result));
+}
+
+uint64_t activation_dataset_reader::entries() const {
+    return impl_->reader->GetNEntries();
+}
+
+size_t activation_dataset_reader::dimension() const {
+    return impl_->dimension;
+}
+
+void activation_dataset_reader::for_each_source_batch(
+        size_t source_index,
+        size_t max_rows,
+        const std::function<void(source_batch &&)> & callback) const {
+    if (!impl_ || source_index >= impl_->sources.size() || max_rows == 0) {
+        throw std::runtime_error("invalid source batch request");
+    }
+    auto sample_id = impl_->reader->GetView<uint64_t>("sample_id");
+    auto corpus_line = impl_->reader->GetView<uint64_t>("corpus_line");
+    auto token_position = impl_->reader->GetView<int32_t>("token_position");
+    auto token_id = impl_->reader->GetView<int32_t>("token_id");
+    auto prompt_tokens = impl_->reader->GetView<int32_t>("prompt_tokens");
+    auto activation = impl_->reader->GetView<std::vector<uint16_t>>(source_field(source_index));
+
+    source_batch batch;
+    batch.dimension = impl_->dimension;
+    batch.metadata.reserve(max_rows);
+    batch.values.reserve(max_rows * impl_->dimension);
+    for (auto entry : impl_->reader->GetEntryRange()) {
+        const auto & encoded = activation(entry);
+        if (encoded.size() != impl_->dimension) {
+            throw std::runtime_error("activation row does not match dataset dimension");
+        }
+        batch.metadata.push_back({ sample_id(entry), corpus_line(entry), token_position(entry), token_id(entry), prompt_tokens(entry) });
+        for (uint16_t value : encoded) {
+            batch.values.push_back(ggml_fp16_to_fp32((ggml_fp16_t) value));
+        }
+        if (batch.metadata.size() == max_rows) {
+            callback(std::move(batch));
+            batch = {};
+            batch.dimension = impl_->dimension;
+            batch.metadata.reserve(max_rows);
+            batch.values.reserve(max_rows * impl_->dimension);
+        }
+    }
+    if (!batch.metadata.empty()) {
+        callback(std::move(batch));
+    }
+}
+
+void write_centroids(const std::string & path, const std::vector<centroid> & centroids, size_t dimension) {
+    auto model = RNTupleModel::Create();
+    auto source_index = model->MakeField<uint32_t>("source_index");
+    auto k = model->MakeField<uint32_t>("k");
+    auto cluster = model->MakeField<uint32_t>("cluster");
+    auto count = model->MakeField<uint64_t>("count");
+    auto values = model->MakeField<std::vector<float>>("values");
+    auto writer = RNTupleWriter::Recreate(std::move(model), k_centroid_name, path);
+    for (const auto & center : centroids) {
+        if (center.values.size() != dimension) {
+            throw std::runtime_error("centroid dimension differs from dataset dimension");
+        }
+        *source_index = center.source_index;
+        *k = center.k;
+        *cluster = center.cluster;
+        *count = center.count;
+        *values = center.values;
+        writer->Fill();
+    }
+    writer->CommitCluster();
+}
+
+struct centroid_store_reader::impl {
+    std::unique_ptr<RNTupleReader> reader;
+};
+
+centroid_store_reader::centroid_store_reader(std::unique_ptr<impl> impl) : impl_(std::move(impl)) {}
+centroid_store_reader::centroid_store_reader(centroid_store_reader &&) noexcept = default;
+centroid_store_reader & centroid_store_reader::operator=(centroid_store_reader &&) noexcept = default;
+centroid_store_reader::~centroid_store_reader() = default;
+
+centroid_store_reader centroid_store_reader::open(const std::string & path) {
+    auto result = std::make_unique<impl>();
+    result->reader = RNTupleReader::Open(k_centroid_name, path);
+    return centroid_store_reader(std::move(result));
+}
+
+std::vector<centroid> centroid_store_reader::read_source(uint32_t wanted_source, uint32_t wanted_k) const {
+    auto source_index = impl_->reader->GetView<uint32_t>("source_index");
+    auto k = impl_->reader->GetView<uint32_t>("k");
+    auto cluster = impl_->reader->GetView<uint32_t>("cluster");
+    auto count = impl_->reader->GetView<uint64_t>("count");
+    auto values = impl_->reader->GetView<std::vector<float>>("values");
+    std::vector<centroid> result;
+    for (auto entry : impl_->reader->GetEntryRange()) {
+        if (source_index(entry) == wanted_source && k(entry) == wanted_k) {
+            result.push_back({ source_index(entry), k(entry), cluster(entry), count(entry), values(entry) });
+        }
+    }
+    return result;
+}
+
+} // namespace rwkv_activation_store

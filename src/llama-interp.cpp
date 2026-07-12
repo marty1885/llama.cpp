@@ -12,23 +12,24 @@ static llama_memory_recurrent * interp_get_recurrent_memory(const llama_context 
     return dynamic_cast<llama_memory_recurrent *>(ctx->get_memory());
 }
 
-static bool interp_tensor_row_to_fp16(ggml_tensor * tensor, uint32_t row, uint32_t n, std::vector<ggml_fp16_t> & dst) {
+static bool interp_tensor_row_to_f32(ggml_tensor * tensor, uint32_t row, uint32_t n, std::vector<float> & dst) {
     if (!tensor || row >= (uint32_t) tensor->ne[1] || n != (uint32_t) tensor->ne[0]) {
         return false;
     }
 
-    dst.resize(n);
     const size_t row_offset = row * tensor->nb[1];
 
-    if (tensor->type == GGML_TYPE_F16) {
-        ggml_backend_tensor_get(tensor, dst.data(), row_offset, n * sizeof(ggml_fp16_t));
+    if (tensor->type == GGML_TYPE_F32) {
+        dst.resize(n);
+        ggml_backend_tensor_get(tensor, dst.data(), row_offset, n * sizeof(float));
         return true;
     }
-    if (tensor->type == GGML_TYPE_F32) {
-        std::vector<float> tmp(n);
-        ggml_backend_tensor_get(tensor, tmp.data(), row_offset, n * sizeof(float));
+    if (tensor->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> tmp(n);
+        ggml_backend_tensor_get(tensor, tmp.data(), row_offset, n * sizeof(ggml_fp16_t));
+        dst.resize(n);
         for (uint32_t i = 0; i < n; ++i) {
-            dst[i] = ggml_fp32_to_fp16(tmp[i]);
+            dst[i] = ggml_fp16_to_fp32(tmp[i]);
         }
         return true;
     }
@@ -36,23 +37,23 @@ static bool interp_tensor_row_to_fp16(ggml_tensor * tensor, uint32_t row, uint32
     return false;
 }
 
-static bool interp_fp16_to_tensor_row(ggml_tensor * tensor, uint32_t row, uint32_t n, const std::vector<ggml_fp16_t> & src) {
+static bool interp_f32_to_tensor_row(ggml_tensor * tensor, uint32_t row, uint32_t n, const std::vector<float> & src) {
     if (!tensor || row >= (uint32_t) tensor->ne[1] || n != (uint32_t) tensor->ne[0] || src.size() != n) {
         return false;
     }
 
     const size_t row_offset = row * tensor->nb[1];
 
-    if (tensor->type == GGML_TYPE_F16) {
-        ggml_backend_tensor_set(tensor, src.data(), row_offset, n * sizeof(ggml_fp16_t));
+    if (tensor->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_set(tensor, src.data(), row_offset, n * sizeof(float));
         return true;
     }
-    if (tensor->type == GGML_TYPE_F32) {
-        std::vector<float> tmp(n);
+    if (tensor->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> fp16(n);
         for (uint32_t i = 0; i < n; ++i) {
-            tmp[i] = ggml_fp16_to_fp32(src[i]);
+            fp16[i] = ggml_fp32_to_fp16(src[i]);
         }
-        ggml_backend_tensor_set(tensor, tmp.data(), row_offset, n * sizeof(float));
+        ggml_backend_tensor_set(tensor, fp16.data(), row_offset, n * sizeof(ggml_fp16_t));
         return true;
     }
 
@@ -73,8 +74,8 @@ bool llama_interp_rwkv_state_init(const llama_context * ctx, llama_interp_rwkv_s
     state->n_embd_s = hparams.n_embd_s();
     state->layers.assign(state->n_layer, {});
     for (auto & layer : state->layers) {
-        layer.r.assign(state->n_embd_r, ggml_fp32_to_fp16(0.0f));
-        layer.s.assign(state->n_embd_s, ggml_fp32_to_fp16(0.0f));
+        layer.r.assign(state->n_embd_r, 0.0f);
+        layer.s.assign(state->n_embd_s, 0.0f);
     }
 
     return true;
@@ -90,6 +91,9 @@ bool llama_interp_rwkv_state_export(const llama_context * ctx, llama_seq_id seq_
         return false;
     }
 
+    // RWKV state resides on the active backend and may still be in flight after decode.
+    const_cast<llama_context *>(ctx)->synchronize();
+
     const int32_t tail = mem->cells[seq_id].tail;
     if (tail < 0) {
         return llama_interp_rwkv_state_init(ctx, state);
@@ -104,10 +108,10 @@ bool llama_interp_rwkv_state_export(const llama_context * ctx, llama_seq_id seq_
 
     const uint32_t row = mem->n_rs_seq == 0 ? (uint32_t) tail : mem->rs_idx[seq_id] * mem->size + (uint32_t) tail;
     for (uint32_t il = 0; il < state->n_layer; ++il) {
-        if (!interp_tensor_row_to_fp16(mem->r_l[il], row, state->n_embd_r, state->layers[il].r)) {
+        if (!interp_tensor_row_to_f32(mem->r_l[il], row, state->n_embd_r, state->layers[il].r)) {
             return false;
         }
-        if (!interp_tensor_row_to_fp16(mem->s_l[il], row, state->n_embd_s, state->layers[il].s)) {
+        if (!interp_tensor_row_to_f32(mem->s_l[il], row, state->n_embd_s, state->layers[il].s)) {
             return false;
         }
     }
@@ -138,10 +142,10 @@ bool llama_interp_rwkv_state_import(llama_context * ctx, llama_seq_id seq_id, co
 
     const uint32_t row = (uint32_t) seq_id;
     for (uint32_t il = 0; il < state->n_layer; ++il) {
-        if (!interp_fp16_to_tensor_row(mem->r_l[il], row, state->n_embd_r, state->layers[il].r)) {
+        if (!interp_f32_to_tensor_row(mem->r_l[il], row, state->n_embd_r, state->layers[il].r)) {
             return false;
         }
-        if (!interp_fp16_to_tensor_row(mem->s_l[il], row, state->n_embd_s, state->layers[il].s)) {
+        if (!interp_f32_to_tensor_row(mem->s_l[il], row, state->n_embd_s, state->layers[il].s)) {
             return false;
         }
     }

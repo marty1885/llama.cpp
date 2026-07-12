@@ -1397,6 +1397,56 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     return res;
 }
 
+bool llama_context::interp_rwkv_final_readout(const float * residuals, uint32_t n_rows, float * logits_out) {
+    if (!residuals || !logits_out || n_rows == 0 || n_rows > n_ubatch() || model.arch != LLM_ARCH_RWKV7) {
+        return false;
+    }
+
+    // This uses the context scheduler, so invalidate the normal decode graph before building
+    // an output-only graph and ensure no previous asynchronous compute still owns its buffers.
+    synchronize();
+    gf_res_prev->reset();
+    ggml_backend_sched_reset(sched.get());
+
+    llama_ubatch ubatch = {};
+    ubatch.b_equal_seqs = true;
+    ubatch.n_tokens = n_rows;
+    ubatch.n_seq_tokens = n_rows;
+    ubatch.n_seqs = 1;
+    ubatch.n_seqs_unq = 1;
+    ubatch.n_pos = 1;
+
+    llm_graph_result result(gf_res_prev->get_max_nodes());
+    auto gparams = graph_params(&result, ubatch, nullptr, ctx_type_to_graph_type(cparams.ctx_type));
+    gparams.n_outputs = n_rows;
+    llm_graph_context gctx(gparams);
+
+    ggml_tensor * input = ggml_new_tensor_2d(gctx.ctx0, GGML_TYPE_F32, model.hparams.n_embd, n_rows);
+    ggml_set_input(input);
+    ggml_tensor * cur = input;
+    // resid.out is tapped immediately before this final block-level control-vector application.
+    cur = gctx.build_cvec(cur, model.hparams.n_layer() - 1);
+    cur = gctx.build_norm(cur, model.output_norm, model.output_norm_b, LLM_NORM, -1);
+    cur = gctx.build_lora_mm(model.output, cur, model.output_s);
+    ggml_set_output(cur);
+    ggml_build_forward_expand(gctx.gf, cur);
+
+    if (!ggml_backend_sched_alloc_graph(sched.get(), gctx.gf)) {
+        return false;
+    }
+    ggml_backend_tensor_set(input, residuals, 0, (size_t) model.hparams.n_embd * n_rows * sizeof(float));
+    if (graph_compute(gctx.gf, n_rows > 1) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), cur);
+    if (!backend) {
+        return false;
+    }
+    ggml_backend_tensor_get_async(backend, cur, logits_out, 0, (size_t) llama_vocab_n_tokens(&model.vocab) * n_rows * sizeof(float));
+    ggml_backend_sched_synchronize(sched.get());
+    return true;
+}
+
 int llama_context::encode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
@@ -3737,6 +3787,14 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
 
 void llama_interp_set_request(llama_context * ctx, const llama_interp_request * request) {
     ctx->set_interp_request(request);
+}
+
+bool llama_interp_rwkv_final_readout(
+        llama_context * ctx,
+        const float * residuals,
+        uint32_t n_rows,
+        float * logits) {
+    return ctx && ctx->interp_rwkv_final_readout(residuals, n_rows, logits);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

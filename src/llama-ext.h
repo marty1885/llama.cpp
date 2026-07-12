@@ -132,8 +132,8 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 //
 
 struct llama_interp_rwkv_layer_state {
-    std::vector<ggml_fp16_t> r;
-    std::vector<ggml_fp16_t> s;
+    std::vector<float> r;
+    std::vector<float> s;
 };
 
 struct llama_interp_rwkv_state {
@@ -205,3 +205,11 @@ LLAMA_API bool llama_interp_rwkv_state_import(
 LLAMA_API void llama_interp_set_request(
         struct llama_context * ctx,
         const llama_interp_request * request);
+
+// Applies the native RWKV7 final control vector, output normalization, and output head to
+// F32 final-residual rows without evaluating any recurrent blocks.
+LLAMA_API bool llama_interp_rwkv_final_readout(
+        struct llama_context * ctx,
+        const float * residuals,
+        uint32_t n_rows,
+        float * logits);

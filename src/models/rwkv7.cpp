@@ -153,6 +153,7 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
                                                token_shift->nb[2], n_embd * ggml_element_size(token_shift));
 
         ggml_tensor * att_norm = build_norm(inpL, layer->attn_norm, layer->attn_norm_b, LLM_NORM, il);
+        att_norm = interp_rwkv_tap(att_norm, "att", "norm", il);
         cb(att_norm, "attn_norm", il);
 
         ggml_tensor * x_prev = ggml_concat(
@@ -162,9 +163,11 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
         cur = build_rwkv7_time_mix(rs_inp, att_norm, x_prev, v_first, ubatch, il);
 
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
+        ffn_inp = interp_rwkv_tap(ffn_inp, "resid", "time", il);
         cb(ffn_inp, "ffn_inp", il);
 
         ggml_tensor * ffn_norm = build_norm(ffn_inp, layer->attn_norm_2, layer->attn_norm_2_b, LLM_NORM, il);
+        ffn_norm = interp_rwkv_tap(ffn_norm, "ffn", "norm", il);
         cb(ffn_norm, "ffn_norm", il);
 
         x_prev = ggml_concat(
@@ -189,6 +192,7 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
             x_prev   = ggml_get_rows(ctx0, x_prev, inp_out_ids);
         }
         cur = build_rwkv7_channel_mix(layer, ffn_norm, x_prev, LLM_ARCH_RWKV7);
+        cur = interp_rwkv_tap(cur, "channel", "out", il);
         cur = ggml_add(ctx0, cur, ffn_inp);
         cur = interp_rwkv_tap(cur, "resid", "out", il);
 

@@ -32,6 +32,7 @@ struct average_result {
 struct operator_artifact {
     int source_layer = -1;
     int target_layer = -1;
+    std::string source_activation = "residual";
     size_t input_dimension = 0;
     size_t output_dimension = 0;
     size_t rank = 0;
@@ -52,6 +53,16 @@ static void usage(const char * argv0) {
 
 static std::string residual_name(int layer) {
     return "rwkv.layer." + std::to_string(layer) + ".resid.out";
+}
+
+static std::string source_name(int layer, const std::string & activation) {
+    if (activation == "residual") {
+        return residual_name(layer);
+    }
+    if (activation == "time-wkv") {
+        return "rwkv.layer." + std::to_string(layer) + ".time.wkv";
+    }
+    throw std::runtime_error("unknown source activation in operator: " + activation);
 }
 
 static std::string manifest_path(const std::string & prefix) {
@@ -89,6 +100,8 @@ static operator_artifact load_operator(const std::string & prefix) {
             out.source_layer = std::stoi(value);
         } else if (key == "target_layer") {
             out.target_layer = std::stoi(value);
+        } else if (key == "source_activation") {
+            out.source_activation = value;
         } else if (key == "input_dimension") {
             out.input_dimension = std::stoull(value);
         } else if (key == "output_dimension") {
@@ -270,16 +283,16 @@ static llama_interp::task<> capture_evaluation(
         llama_interp::runtime & rt,
         const llama_interp::rwkv_state & initial_state,
         const std::vector<llama_token> & tokens,
-        int source_layer,
+        const std::string & source,
+        int target_layer,
         evaluation_result & out) {
     using namespace llama_interp;
 
-    const std::string source = residual_name(source_layer);
-    const std::string final = residual_name((int) initial_state.n_layer - 1);
+    const std::string target = residual_name(target_layer);
     auto prefill = rt.prefill_tokens(initial_state, tokens);
     prefill.capture("^" + source + "$", out.captures);
-    if (source != final) {
-        prefill.capture("^" + final + "$", out.captures);
+    if (source != target) {
+        prefill.capture("^" + target + "$", out.captures);
     }
     prefill.discard_state();
     co_await prefill;
@@ -297,6 +310,7 @@ static llama_interp::task<> evaluate_head(
         llama_interp::runtime & rt,
         const llama_interp::rwkv_state & initial_state,
         llama_token token,
+        int target_layer,
         const std::vector<ggml_fp16_t> & final_residual) {
     using namespace llama_interp;
 
@@ -305,10 +319,10 @@ static llama_interp::task<> evaluate_head(
     replace.head = -1;
     replace.data = final_residual;
 
-    // The output head only depends on the residual replacing this carrier token's final residual.
+    // A replacement at an intermediate target is propagated through the remaining RWKV blocks.
     // Starting from a fresh state avoids coupling the readout to the evaluation prompt's next token.
     auto carrier = rt.prefill_tokens(initial_state, { token });
-    carrier.perturb("^" + residual_name((int) initial_state.n_layer - 1) + "$", std::move(replace));
+    carrier.perturb("^" + residual_name(target_layer) + "$", std::move(replace));
     carrier.discard_state();
     co_await carrier;
 }
@@ -843,9 +857,6 @@ int main(int argc, char ** argv) {
             throw std::runtime_error("--layer does not match the saved operator source layer");
         }
         source_layer = saved_operator.source_layer;
-        if (saved_operator.target_layer != (int) initial_state.n_layer - 1) {
-            throw std::runtime_error("saved operator does not target this model's final residual layer");
-        }
     } else if (source_layer < 0) {
         source_layer = (int) initial_state.n_layer / 2;
     }
@@ -856,14 +867,17 @@ int main(int argc, char ** argv) {
 
     evaluation_result evaluation;
     {
-        auto evaluation_task = capture_evaluation(rt, initial_state, evaluation_tokens, source_layer, evaluation);
+        const int target_layer = operator_prefix.empty() ? (int) initial_state.n_layer - 1 : saved_operator.target_layer;
+        const std::string operator_source = operator_prefix.empty() ? residual_name(source_layer) : source_name(source_layer, saved_operator.source_activation);
+        auto evaluation_task = capture_evaluation(rt, initial_state, evaluation_tokens, operator_source, target_layer, evaluation);
         rt.run();
         evaluation_task.rethrow_if_failed();
     }
     const std::vector<float> native_logits = copy_logits(ctx, llama_vocab_n_tokens(vocab));
 
-    const std::string source = residual_name(source_layer);
-    const std::string final = residual_name((int) initial_state.n_layer - 1);
+    const std::string source = operator_prefix.empty() ? residual_name(source_layer) : source_name(source_layer, saved_operator.source_activation);
+    const int target_layer = operator_prefix.empty() ? (int) initial_state.n_layer - 1 : saved_operator.target_layer;
+    const std::string final = residual_name(target_layer);
     const auto & query = require_capture_f32(evaluation.captures, source);
     const auto & clean_final = require_capture_f32(evaluation.captures, final);
     const double query_norm = l2_norm(query);
@@ -874,7 +888,7 @@ int main(int argc, char ** argv) {
         }
         const std::vector<float> action = apply_operator(saved_operator, query);
         {
-            auto lens_task = evaluate_head(rt, initial_state, evaluation_tokens.back(), as_fp16(action));
+            auto lens_task = evaluate_head(rt, initial_state, evaluation_tokens.back(), saved_operator.target_layer, as_fp16(action));
             rt.run();
             lens_task.rethrow_if_failed();
         }
@@ -889,6 +903,7 @@ int main(int argc, char ** argv) {
         manifest << "format=rwkv_jlens_applied_readout_v1\n";
         manifest << "operator_manifest=" << manifest_path(operator_prefix) << '\n';
         manifest << "source_layer=" << source_layer << '\n';
+        manifest << "source_activation=" << saved_operator.source_activation << '\n';
         manifest << "target_layer=" << saved_operator.target_layer << '\n';
         manifest << "dimension=" << action.size() << '\n';
         manifest << "rank=" << saved_operator.rank << '\n';
@@ -936,14 +951,14 @@ int main(int argc, char ** argv) {
 
     // Complete all stateful Jacobian measurements before carrier passes used solely for readout.
     {
-        auto round_trip_task = evaluate_head(rt, initial_state, evaluation_tokens.back(), as_fp16(clean_final));
+        auto round_trip_task = evaluate_head(rt, initial_state, evaluation_tokens.back(), target_layer, as_fp16(clean_final));
         rt.run();
         round_trip_task.rethrow_if_failed();
     }
     const std::vector<float> round_trip_logits = copy_logits(ctx, llama_vocab_n_tokens(vocab));
 
     {
-        auto lens_task = evaluate_head(rt, initial_state, evaluation_tokens.back(), as_fp16(primary.action));
+        auto lens_task = evaluate_head(rt, initial_state, evaluation_tokens.back(), target_layer, as_fp16(primary.action));
         rt.run();
         lens_task.rethrow_if_failed();
     }
@@ -952,7 +967,7 @@ int main(int argc, char ** argv) {
     std::vector<float> comparison_logits;
     if (compare_epsilon > 0.0f) {
         {
-            auto comparison_head = evaluate_head(rt, initial_state, evaluation_tokens.back(), as_fp16(comparison.action));
+            auto comparison_head = evaluate_head(rt, initial_state, evaluation_tokens.back(), target_layer, as_fp16(comparison.action));
             rt.run();
             comparison_head.rethrow_if_failed();
         }

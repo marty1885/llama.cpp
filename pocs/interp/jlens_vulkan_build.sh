@@ -16,8 +16,9 @@ layer=${JLEN_VK_BUILD_LAYER:-59}
 rank=${JLEN_VK_BUILD_RANK:-4}
 samples_per_direction=${JLEN_VK_BUILD_SAMPLES_PER_DIRECTION:-2}
 validation_samples=${JLEN_VK_BUILD_VALIDATION_SAMPLES:-2}
-min_future=${JLEN_VK_BUILD_MIN_FUTURE:-0}
+min_future=${JLEN_VK_BUILD_MIN_FUTURE:-1}
 future_window=${JLEN_VK_BUILD_FUTURE_WINDOW:-63}
+all_future=${JLEN_VK_BUILD_ALL_FUTURE:-1}
 visible_devices=${JLEN_VK_BUILD_VISIBLE_DEVICES:-}
 
 if [[ ! -x $binary ]]; then
@@ -34,7 +35,7 @@ ulimit -v "$vmem_kib"
 if [[ -n $visible_devices ]]; then
     export GGML_VK_VISIBLE_DEVICES=$visible_devices
 fi
-exec "$binary" \
+args=(
     -m "$model" \
     -ngl "$n_gpu_layers" \
     --layer "$layer" \
@@ -50,3 +51,8 @@ exec "$binary" \
     --epsilon 0.20 \
     --compare-epsilon 0.10 \
     --repeat-plus
+)
+if [[ $all_future != 0 ]]; then
+    args+=(--all-future)
+fi
+exec "$binary" "${args[@]}"

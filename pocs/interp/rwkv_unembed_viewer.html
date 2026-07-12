@@ -61,7 +61,9 @@
   const visibleSources = () => channelSources().length ? channelSources() : sortSources(trace.sources);
    const sourceReadout = (step, source) => step.readouts.find(readout => readout.source === source);
    const displayPiece = value => value === '' ? '[EOG]' : value.replace(/\n/g, '\\n').replace(/\t/g, '\\t');
-   const isPerturbation = () => trace.trace_kind === 'rwkv_perturbation';
+  const isPerturbation = () => trace.trace_kind === 'rwkv_perturbation';
+  const isTimeLens = () => trace.trace_kind === 'rwkv_time_lens';
+  const isRawProjection = () => trace.trace_kind === 'rwkv_raw_projection';
 
   function setStep(index) {
     const steps = trace.runs[runIndex].steps;
@@ -99,17 +101,22 @@
     chat.append(answer); transcript.append(chat); workspace.append(transcript);
 
     const inspector = document.createElement('section'); inspector.className = 'pane inspector';
-    inspector.append(makeHeader(isPerturbation() ? 'Raw-Source Token Derivatives' : `All-Layer ${sourceKind(sources[0])}`, `${sources.length} ${isPerturbation() ? 'signed readouts' : 'layers'} | top ${trace.top_k}`));
+    inspector.append(makeHeader(isPerturbation() ? 'Raw-Source Token Derivatives' : isTimeLens() ? 'All-Layer Time-Mix Lens' : isRawProjection() ? 'All Raw Vector Projections' : `All-Layer ${sourceKind(sources[0])}`, `${sources.length} ${isPerturbation() ? 'signed readouts' : 'sources'} | top ${trace.top_k}`));
     const selected = document.createElement('div'); selected.className = 'selected-summary';
     const line = document.createElement('strong'); line.textContent = `Step ${step.index}: ${displayPiece(step.input.piece)} -> ${displayPiece(step.next.piece)}`;
-    const note = document.createElement('p'); note.textContent = isPerturbation() ? 'Scores are signed central derivatives of final logits with respect to the native source perturbation. Positive and negative cards are sorted independently.' : `Readouts are from the carrier activation that produced the selected emitted token. Final-residual round-trip error: ${step.final_round_trip_error.toExponential(3)}.`;
+    const tracked = trace.tracked_token ? ` Card headers show cosine to the first measured vector and # rank for ${displayPiece(trace.tracked_token.piece)}.` : ' Card headers show cosine to the first measured vector and # rank for that step\'s emitted next token.';
+    const note = document.createElement('p'); note.textContent = isPerturbation() ? 'Scores are signed central derivatives of final logits with respect to the native source perturbation. Positive and negative cards are sorted independently.' : isTimeLens() ? `Each card perturbs ${sourceKind(sources[0])}, runs its native downstream time-mix closure and channel mix, then applies an output-head lens. These are local diagnostic readouts, not causal final logits.` : isRawProjection() ? `Each raw vector is independently passed through the native output normalization and output matrix. This is an intrinsic alignment screen, not a causal final-logit measurement.${tracked}` : `Readouts are from the carrier activation that produced the selected emitted token. Final-residual round-trip error: ${step.final_round_trip_error.toExponential(3)}.`;
     const nav = document.createElement('div'); nav.className = 'token-nav';
     [['Previous', stepIndex - 1], ['Next', stepIndex + 1]].forEach(([label, target]) => { const button = document.createElement('button'); button.textContent = label; button.disabled = target < 0 || target >= run.steps.length; button.onclick = () => setStep(target); nav.append(button); });
     selected.append(line, note, nav); inspector.append(selected);
     const grid = document.createElement('div'); grid.id = 'layers';
     sources.forEach(source => {
       const readout = sourceReadout(step, source); const card = document.createElement('article'); card.className = 'layer';
-      const label = document.createElement('header'); label.textContent = `Layer ${sourceLayer(source)}`; const kind = document.createElement('span'); kind.textContent = sourceKind(source); label.append(kind); card.append(label);
+      const label = document.createElement('header'); label.textContent = `Layer ${sourceLayer(source)}`; const kind = document.createElement('span');
+      const cosine = Number.isFinite(readout?.baseline_cosine) ? ` cos ${readout.baseline_cosine.toFixed(3)}` : '';
+      const target = Number.isInteger(readout?.target_rank) ? ` #${readout.target_rank}` : '';
+      const random = Number.isInteger(readout?.random_target_rank) ? ` rnd#${readout.random_target_rank}` : '';
+      kind.textContent = `${sourceKind(source)}${cosine}${target}${random}`; label.append(kind); card.append(label);
       const list = document.createElement('ol');
       (readout?.top_tokens || []).forEach(token => { const item = document.createElement('li'); const score = document.createElement('span'); score.className = 'score'; score.textContent = token.logit.toFixed(2); item.append(document.createTextNode(displayPiece(token.piece)), score); list.append(item); });
       if (!readout) list.textContent = 'No readout in trace.'; card.append(list); grid.append(card);

@@ -56,17 +56,19 @@ struct snapshot {
         std::vector<float> k;
         std::vector<float> v;
         std::vector<float> a;
+        std::vector<float> a_pre;
         std::vector<float> g;
         std::vector<float> k0;
         std::vector<float> kk;
         std::vector<float> wkv;
         std::vector<float> rkv;
+        std::vector<float> channel_out;
     };
     std::vector<raw_layer> raw;
     std::vector<float> logits;
 };
 
-enum class source_kind { r, w, k, v, a, g, wkv, rkv };
+enum class source_kind { r, w, k, v, a, a_pre, g, k0, kk, wkv, rkv, channel_out };
 
 enum class run_mode { project, local_lens };
 
@@ -77,16 +79,21 @@ static const char * source_name(source_kind source) {
         case source_kind::k:   return "k";
         case source_kind::v:   return "v";
         case source_kind::a:   return "a";
+        case source_kind::a_pre: return "a_pre";
         case source_kind::g:   return "g";
+        case source_kind::k0:  return "k0";
+        case source_kind::kk:  return "kk";
         case source_kind::wkv: return "wkv";
         case source_kind::rkv: return "rkv";
+        case source_kind::channel_out: return "channel.out";
     }
     GGML_ABORT("unknown source");
 }
 
 static source_kind parse_source(const std::string & value) {
     for (source_kind source : { source_kind::r, source_kind::w, source_kind::k, source_kind::v,
-                                source_kind::a, source_kind::g, source_kind::wkv, source_kind::rkv }) {
+                                source_kind::a, source_kind::a_pre, source_kind::g, source_kind::k0,
+                                source_kind::kk, source_kind::wkv, source_kind::rkv, source_kind::channel_out }) {
         if (value == source_name(source)) return source;
     }
     throw std::runtime_error("unknown --source: " + value);
@@ -94,7 +101,8 @@ static source_kind parse_source(const std::string & value) {
 
 static std::vector<source_kind> all_source_kinds() {
     return { source_kind::r, source_kind::w, source_kind::k, source_kind::v,
-             source_kind::a, source_kind::g, source_kind::wkv, source_kind::rkv };
+             source_kind::a, source_kind::a_pre, source_kind::g, source_kind::k0,
+             source_kind::kk, source_kind::wkv, source_kind::rkv, source_kind::channel_out };
 }
 
 static std::vector<source_kind> parse_project_sources(const std::string & value) {
@@ -126,9 +134,9 @@ struct direct_graph : llm_build_rwkv7_base {
 
 static void usage(const char * argv0) {
     std::fprintf(stderr,
-        "usage: %s -m MODEL [-p PROMPT] [-ngl N] [--mode project|local-lens] [--source r|w|k|v|a|g|wkv|rkv] [--project-sources all|k,v,a] [--random-baseline] [--capture-prompt-last] [--track-text TEXT] [--forced-text TEXT] [--steps N] [--epsilon E] [--top N] [--json FILE]\n"
+        "usage: %s -m MODEL [-p PROMPT] [-ngl N] [--mode project|local-lens] [--source r|w|k|v|a|a_pre|g|k0|kk|wkv|rkv|channel.out] [--project-sources all|k,v,a,a_pre,k0,kk,channel.out] [--random-baseline] [--capture-prompt-last] [--track-text TEXT] [--forced-text TEXT] [--steps N] [--epsilon E] [--top N] [--json FILE]\n"
         "\n"
-        "project (default) batches all 488 captured raw time-mix vectors through the native\n"
+        "project (default) batches all 732 captured vectors through the native\n"
         "output normalization and output matrix. local-lens perturbs one source and runs its\n"
         "local downstream closure as a diagnostic.\n",
         argv0);
@@ -216,6 +224,7 @@ struct raw_tensors {
     ggml_tensor * k;
     ggml_tensor * v;
     ggml_tensor * a;
+    ggml_tensor * a_pre;
     ggml_tensor * g;
     ggml_tensor * k0;
     ggml_tensor * kk;
@@ -276,8 +285,9 @@ static time_result build_time_mix(
     }
     ggml_tensor * g = has_gating ? ggml_mul_mat(graph.ctx0, layer.time_mix_g2,
         ggml_sigmoid(graph.ctx0, ggml_mul_mat(graph.ctx0, layer.time_mix_g1, xg))) : nullptr;
-    ggml_tensor * a = ggml_sigmoid(graph.ctx0, ggml_add(graph.ctx0,
-        ggml_mul_mat(graph.ctx0, layer.time_mix_a2, ggml_mul_mat(graph.ctx0, layer.time_mix_a1, xa)), layer.time_mix_a0));
+    ggml_tensor * a_pre = ggml_add(graph.ctx0,
+        ggml_mul_mat(graph.ctx0, layer.time_mix_a2, ggml_mul_mat(graph.ctx0, layer.time_mix_a1, xa)), layer.time_mix_a0);
+    ggml_tensor * a = ggml_sigmoid(graph.ctx0, a_pre);
 
     ggml_tensor * kk = ggml_reshape_3d(graph.ctx0, ggml_mul(graph.ctx0, k, layer.time_mix_k_k), head_size, head_count, 1);
     kk = ggml_l2_norm(graph.ctx0, kk, 1e-12);
@@ -307,7 +317,7 @@ static time_result build_time_mix(
     return {
         ggml_reshape_3d(graph.ctx0, cur, n_embd, 1, 1),
         next_state,
-        { r, w, k, v, a, g, k0, kk, wkv_value, rkv },
+        { r, w, k, v, a, a_pre, g, k0, kk, wkv_value, rkv },
     };
 }
 
@@ -345,6 +355,7 @@ static snapshot run_snapshot(llama_context * ctx, llama_token token, const rwkv_
     std::vector<raw_tensors> raw_outputs(n_layer);
     std::vector<ggml_tensor *> state_outputs(n_layer);
     std::vector<ggml_tensor *> shift_outputs(n_layer);
+    std::vector<ggml_tensor *> channel_outputs(n_layer);
     for (int il = 0; il < n_layer; ++il) {
         r_inputs[il] = input_f32_3d(graph, hparams.n_embd, hparams.token_shift_count, 1);
         s_inputs[il] = input_f32_2d(graph, hparams.n_embd_s(), 1);
@@ -369,18 +380,23 @@ static snapshot run_snapshot(llama_context * ctx, llama_token token, const rwkv_
         raw_outputs[il] = time.raw;
         state_outputs[il] = time.next_state;
         for (ggml_tensor * tensor : { time.raw.r, time.raw.w, time.raw.k, time.raw.v, time.raw.a,
-                                      time.raw.g, time.raw.k0, time.raw.kk, time.raw.wkv, time.raw.rkv }) {
+                                       time.raw.a_pre, time.raw.g, time.raw.k0, time.raw.kk,
+                                       time.raw.wkv, time.raw.rkv }) {
             add_output(graph, tensor);
         }
         auto & raw = out.raw[il];
         for (std::vector<float> * values : { &raw.r, &raw.w, &raw.k, &raw.v, &raw.a,
-                                             &raw.g, &raw.k0, &raw.kk, &raw.wkv, &raw.rkv }) {
+                                               &raw.a_pre, &raw.g, &raw.k0, &raw.kk,
+                                               &raw.wkv, &raw.rkv }) {
             values->resize(hparams.n_embd);
         }
+        raw.channel_out.resize(hparams.n_embd);
 
         ggml_tensor * ffn_inp = ggml_add(graph.ctx0, time.output, cur);
         ggml_tensor * ffn_norm = graph.build_norm(ffn_inp, layer.attn_norm_2, layer.attn_norm_2_b, LLM_NORM, il);
         ggml_tensor * channel = graph.build_rwkv7_channel_mix(&layer, ffn_norm, ffn_prev, LLM_ARCH_RWKV7);
+        add_output(graph, channel);
+        channel_outputs[il] = channel;
         cur = ggml_add(graph.ctx0, channel, ffn_inp);
         out.next_state.r[il].resize(hparams.n_embd_r());
         ggml_tensor * next_shift = ggml_concat(graph.ctx0, att_norm, ffn_norm, 1);
@@ -415,12 +431,15 @@ static snapshot run_snapshot(llama_context * ctx, llama_token token, const rwkv_
         const auto & tensors = raw_outputs[il];
         auto & raw = out.raw[il];
         const std::vector<ggml_tensor *> sources = { tensors.r, tensors.w, tensors.k, tensors.v, tensors.a,
-                                                      tensors.g, tensors.k0, tensors.kk, tensors.wkv, tensors.rkv };
+                                                       tensors.a_pre, tensors.g, tensors.k0, tensors.kk,
+                                                       tensors.wkv, tensors.rkv };
         const std::vector<std::vector<float> *> values = { &raw.r, &raw.w, &raw.k, &raw.v, &raw.a,
-                                                            &raw.g, &raw.k0, &raw.kk, &raw.wkv, &raw.rkv };
+                                                             &raw.a_pre, &raw.g, &raw.k0, &raw.kk,
+                                                             &raw.wkv, &raw.rkv };
         for (size_t source = 0; source < sources.size(); ++source) {
             ggml_backend_tensor_get(sources[source], values[source]->data(), 0, hparams.n_embd * sizeof(float));
         }
+        ggml_backend_tensor_get(channel_outputs[il], raw.channel_out.data(), 0, hparams.n_embd * sizeof(float));
     }
     out.logits.resize(llama_vocab_n_tokens(&model.vocab));
     ggml_backend_tensor_get(logits, out.logits.data(), 0, out.logits.size() * sizeof(float));
@@ -448,6 +467,11 @@ static std::vector<scored_token> lens_readout(
         case source_kind::k:   perturbed = &raw.k; break;
         case source_kind::v:   perturbed = &raw.v; break;
         case source_kind::a:   perturbed = &raw.a; break;
+        case source_kind::a_pre:
+        case source_kind::k0:
+        case source_kind::kk:
+        case source_kind::channel_out:
+            throw std::runtime_error("local-lens does not support derived source " + std::string(source_name(source)));
         case source_kind::g:   perturbed = &raw.g; break;
         case source_kind::wkv: perturbed = &raw.wkv; break;
         case source_kind::rkv: perturbed = &raw.rkv; break;
@@ -561,6 +585,9 @@ static std::vector<scored_token> lens_readout(
 }
 
 static std::string raw_source_name(int layer, source_kind source) {
+    if (source == source_kind::channel_out) {
+        return "rwkv.layer." + std::to_string(layer) + ".channel.out";
+    }
     return "rwkv.layer." + std::to_string(layer) + ".time." + source_name(source);
 }
 
@@ -571,9 +598,13 @@ static const std::vector<float> & raw_values(const snapshot::raw_layer & raw, so
         case source_kind::k:   return raw.k;
         case source_kind::v:   return raw.v;
         case source_kind::a:   return raw.a;
+        case source_kind::a_pre: return raw.a_pre;
         case source_kind::g:   return raw.g;
+        case source_kind::k0:  return raw.k0;
+        case source_kind::kk:  return raw.kk;
         case source_kind::wkv: return raw.wkv;
         case source_kind::rkv: return raw.rkv;
+        case source_kind::channel_out: return raw.channel_out;
     }
     GGML_ABORT("unknown source");
 }

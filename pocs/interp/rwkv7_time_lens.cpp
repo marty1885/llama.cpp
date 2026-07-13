@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -30,9 +31,17 @@ struct scored_token {
     float logit;
 };
 
+struct reported_token {
+    int id;
+    std::string piece;
+    int rank;
+    float logit;
+};
+
 struct source_readout {
     std::string source;
     std::vector<scored_token> top_tokens;
+    std::vector<reported_token> reported_tokens;
     float baseline_cosine;
     int target_rank;
     float target_logit;
@@ -44,6 +53,7 @@ struct step_result {
     llama_token input;
     llama_token next;
     std::vector<source_readout> readouts;
+    std::vector<reported_token> final_reported_tokens;
     std::vector<float> state_cosine;
 };
 
@@ -71,6 +81,22 @@ struct snapshot {
 enum class source_kind { r, w, k, v, a, a_pre, g, k0, kk, wkv, rkv, channel_out };
 
 enum class run_mode { project, local_lens };
+
+struct activation_patch {
+    int layer;
+    std::vector<float> k;
+    std::vector<float> kk;
+    std::vector<float> v;
+};
+
+enum class swap_source { k, v, kv };
+
+static swap_source parse_swap_source(const std::string & value) {
+    if (value == "k") return swap_source::k;
+    if (value == "v") return swap_source::v;
+    if (value == "kv") return swap_source::kv;
+    throw std::runtime_error("--swap-source must be k, v, or kv");
+}
 
 static const char * source_name(source_kind source) {
     switch (source) {
@@ -134,16 +160,31 @@ struct direct_graph : llm_build_rwkv7_base {
 
 static void usage(const char * argv0) {
     std::fprintf(stderr,
-        "usage: %s -m MODEL [-p PROMPT] [-ngl N] [--mode project|local-lens] [--source r|w|k|v|a|a_pre|g|k0|kk|wkv|rkv|channel.out] [--project-sources all|k,v,a,a_pre,k0,kk,channel.out] [--random-baseline] [--capture-prompt-last] [--track-text TEXT] [--forced-text TEXT] [--steps N] [--epsilon E] [--top N] [--json FILE]\n"
+        "usage: %s -m MODEL [-p PROMPT] [-ngl N] [--mode project|local-lens] [--source r|w|k|v|a|a_pre|g|k0|kk|wkv|rkv|channel.out] [--project-sources all|k,v,a,a_pre,k0,kk,channel.out] [--random-baseline] [--capture-prompt-last] [--track-text TEXT] [--report-text TEXT]... [--forced-text TEXT] [--steps N] [--epsilon E] [--top N] [--steer-source TEXT --steer-target TEXT...] [--swap-text TEXT [--swap-source k|v|kv] [--swap-step N]] [--json FILE]\n"
         "\n"
         "project (default) batches all 732 captured vectors through the native\n"
         "output normalization and output matrix. local-lens perturbs one source and runs its\n"
-        "local downstream closure as a diagnostic.\n",
+        "local downstream closure as a diagnostic. --steer-source/--steer-target applies\n"
+        "x - l2norm(l2norm(sum(source)) - l2norm(sum(target))) * max(dot(x, l2norm(sum(source))), 0) to K/V at every RWKV layer. --swap-text replaces\n"
+        "the strongest selected source whose tracked token is in its top-k raw projection.\n",
         argv0);
 }
 
 static llama_token greedy_token(const std::vector<float> & logits) {
     return (llama_token) std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
+}
+
+static std::vector<reported_token> report_logits(
+        const llama_vocab * vocab, const std::vector<float> & logits, const std::vector<llama_token> & tokens) {
+    std::vector<reported_token> reports;
+    reports.reserve(tokens.size());
+    for (llama_token token : tokens) {
+        const float logit = logits[token];
+        int rank = 1;
+        for (float value : logits) rank += value > logit;
+        reports.push_back({ token, common_token_to_piece(vocab, token, true), rank, logit });
+    }
+    return reports;
 }
 
 static std::vector<float> tensor_row_f32(ggml_tensor * tensor, uint32_t row, uint32_t width) {
@@ -218,6 +259,18 @@ static ggml_tensor * input_f32_3d(direct_graph & graph, int64_t n0, int64_t n1, 
     return tensor;
 }
 
+static ggml_tensor * steer_away_from_source(
+        direct_graph & graph,
+        ggml_tensor * values,
+        ggml_tensor * source_vector,
+        ggml_tensor * source_minus_target) {
+    if (!source_vector) return values;
+    ggml_tensor * alignment = ggml_sum_rows(graph.ctx0, ggml_mul(graph.ctx0, values, source_vector));
+    alignment = ggml_clamp(graph.ctx0, alignment, 0.0f, std::numeric_limits<float>::max());
+    return ggml_sub(graph.ctx0, values,
+        ggml_mul(graph.ctx0, source_minus_target, ggml_repeat(graph.ctx0, alignment, values)));
+}
+
 struct raw_tensors {
     ggml_tensor * r;
     ggml_tensor * w;
@@ -245,7 +298,12 @@ static time_result build_time_mix(
         ggml_tensor * x_prev,
         ggml_tensor *& first_layer_value,
         ggml_tensor * prior_state,
-        int il) {
+        int il,
+        ggml_tensor * k_override,
+        ggml_tensor * kk_override,
+        ggml_tensor * v_override,
+        ggml_tensor * source_vector,
+        ggml_tensor * source_minus_target) {
     const auto & hparams = model.hparams;
     const auto & layer = model.layers[il];
     const int64_t n_embd = hparams.n_embd;
@@ -272,9 +330,10 @@ static time_result build_time_mix(
     w = ggml_exp(graph.ctx0, ggml_scale(graph.ctx0, ggml_sigmoid(graph.ctx0, w), -0.606531));
 
     ggml_tensor * k0 = ggml_mul_mat(graph.ctx0, layer.time_mix_key, xk);
-    ggml_tensor * k = k0;
+    ggml_tensor * k = steer_away_from_source(graph, k0, source_vector, source_minus_target);
     ggml_tensor * v = ggml_mul_mat(graph.ctx0, layer.time_mix_value, xv);
     if (first_layer_value == nullptr) {
+        v = steer_away_from_source(graph, v, source_vector, source_minus_target);
         first_layer_value = v;
     } else {
         v = ggml_add(graph.ctx0, v,
@@ -282,6 +341,7 @@ static time_result build_time_mix(
                 ggml_sigmoid(graph.ctx0, ggml_add(graph.ctx0,
                     ggml_mul_mat(graph.ctx0, layer.time_mix_v2, ggml_mul_mat(graph.ctx0, layer.time_mix_v1, xv)),
                     layer.time_mix_v0))));
+        v = steer_away_from_source(graph, v, source_vector, source_minus_target);
     }
     ggml_tensor * g = has_gating ? ggml_mul_mat(graph.ctx0, layer.time_mix_g2,
         ggml_sigmoid(graph.ctx0, ggml_mul_mat(graph.ctx0, layer.time_mix_g1, xg))) : nullptr;
@@ -293,6 +353,9 @@ static time_result build_time_mix(
     kk = ggml_l2_norm(graph.ctx0, kk, 1e-12);
     ggml_tensor * ka = ggml_mul(graph.ctx0, k, layer.time_mix_k_a);
     k = ggml_add(graph.ctx0, k, ggml_sub(graph.ctx0, ggml_mul(graph.ctx0, a, ka), ka));
+    if (k_override) k = k_override;
+    if (kk_override) kk = ggml_reshape_3d(graph.ctx0, kk_override, head_size, head_count, 1);
+    if (v_override) v = v_override;
 
     r = ggml_reshape_3d(graph.ctx0, r, head_size, head_count, 1);
     w = ggml_reshape_3d(graph.ctx0, w, head_size, head_count, 1);
@@ -326,12 +389,22 @@ static void add_output(direct_graph & graph, ggml_tensor * tensor) {
     ggml_build_forward_expand(graph.gf, tensor);
 }
 
-static snapshot run_snapshot(llama_context * ctx, llama_token token, const rwkv_state & state) {
+static snapshot run_snapshot(
+        llama_context * ctx,
+        llama_token token,
+        const rwkv_state & state,
+        const std::vector<activation_patch> * patches = nullptr,
+        const std::vector<llama_token> * steer_sources = nullptr,
+        const std::vector<llama_token> * steer_targets = nullptr) {
     const auto & model = ctx->get_model();
     const auto & hparams = model.hparams;
     const int n_layer = hparams.n_layer();
     if ((int) state.r.size() != n_layer || (int) state.s.size() != n_layer) {
         throw std::runtime_error("invalid RWKV state for snapshot");
+    }
+    const bool steering_enabled = steer_sources && !steer_sources->empty() && steer_targets && !steer_targets->empty();
+    if ((steer_sources && !steer_sources->empty()) != (steer_targets && !steer_targets->empty())) {
+        throw std::runtime_error("semantic steering needs both token vectors");
     }
 
     ctx->synchronize();
@@ -340,6 +413,29 @@ static snapshot run_snapshot(llama_context * ctx, llama_token token, const rwkv_
     direct_graph graph(model, graph_params(ctx, &result));
     ggml_tensor * token_input = ggml_new_tensor_1d(graph.ctx0, GGML_TYPE_I32, 1);
     ggml_set_input(token_input);
+    ggml_tensor * steer_tokens = nullptr;
+    ggml_tensor * source_vector = nullptr;
+    ggml_tensor * source_minus_targets = nullptr;
+    if (steering_enabled) {
+        steer_tokens = ggml_new_tensor_1d(graph.ctx0, GGML_TYPE_I32, steer_sources->size() + steer_targets->size());
+        ggml_set_input(steer_tokens);
+        ggml_tensor * steer_vectors = ggml_get_rows(graph.ctx0, model.output, steer_tokens);
+        for (size_t i = 0; i < steer_sources->size(); ++i) {
+            ggml_tensor * source = ggml_view_2d(graph.ctx0, steer_vectors, hparams.n_embd, 1,
+                steer_vectors->nb[1], i * steer_vectors->nb[1]);
+            source_vector = source_vector ? ggml_add(graph.ctx0, source_vector, source) : source;
+        }
+        source_vector = ggml_l2_norm(graph.ctx0, source_vector, 1e-12f);
+        ggml_tensor * target_sum = nullptr;
+        for (size_t i = 0; i < steer_targets->size(); ++i) {
+            ggml_tensor * target = ggml_view_2d(graph.ctx0, steer_vectors, hparams.n_embd, 1,
+                steer_vectors->nb[1], (steer_sources->size() + i) * steer_vectors->nb[1]);
+            target_sum = target_sum ? ggml_add(graph.ctx0, target_sum, target) : target;
+        }
+        target_sum = ggml_l2_norm(graph.ctx0, target_sum, 1e-12f);
+        source_minus_targets = ggml_sub(graph.ctx0, source_vector, target_sum);
+        source_minus_targets = ggml_l2_norm(graph.ctx0, source_minus_targets, 1e-12f);
+    }
     ggml_tensor * cur = ggml_get_rows(graph.ctx0, model.tok_embd, token_input);
     cur = graph.build_norm(cur, model.tok_norm, model.tok_norm_b, LLM_NORM, 0);
     cur = ggml_reshape_3d(graph.ctx0, cur, hparams.n_embd, 1, 1);
@@ -356,8 +452,23 @@ static snapshot run_snapshot(llama_context * ctx, llama_token token, const rwkv_
     std::vector<ggml_tensor *> state_outputs(n_layer);
     std::vector<ggml_tensor *> shift_outputs(n_layer);
     std::vector<ggml_tensor *> channel_outputs(n_layer);
+    std::vector<const activation_patch *> patches_by_layer(n_layer);
+    if (patches) {
+        for (const activation_patch & patch : *patches) {
+            const bool has_k = !patch.k.empty() || !patch.kk.empty();
+            if (patch.layer < 0 || patch.layer >= n_layer || patches_by_layer[patch.layer] ||
+                (has_k && (patch.k.size() != (size_t) hparams.n_embd || patch.kk.size() != (size_t) hparams.n_embd)) ||
+                (!patch.v.empty() && patch.v.size() != (size_t) hparams.n_embd) || (!has_k && patch.v.empty())) {
+                throw std::runtime_error("invalid activation patch");
+            }
+            patches_by_layer[patch.layer] = &patch;
+        }
+    }
     for (int il = 0; il < n_layer; ++il) {
-        r_inputs[il] = input_f32_3d(graph, hparams.n_embd, hparams.token_shift_count, 1);
+        const activation_patch * patch = patches_by_layer[il];
+        const int n_override_values = patch ? ((!patch->k.empty() ? 2 : 0) + (!patch->v.empty() ? 1 : 0)) : 0;
+        const int n_shift_values = hparams.token_shift_count + n_override_values;
+        r_inputs[il] = input_f32_3d(graph, hparams.n_embd, n_shift_values, 1);
         s_inputs[il] = input_f32_2d(graph, hparams.n_embd_s(), 1);
     }
 
@@ -373,7 +484,23 @@ static snapshot run_snapshot(llama_context * ctx, llama_token token, const rwkv_
         ggml_tensor * ffn_prev = ggml_view_3d(graph.ctx0, r_inputs[il], hparams.n_embd, 1, 1,
             r_inputs[il]->nb[1], r_inputs[il]->nb[2], hparams.n_embd * sizeof(float));
         ggml_tensor * att_norm = graph.build_norm(cur, layer.attn_norm, layer.attn_norm_b, LLM_NORM, il);
-        time_result time = build_time_mix(graph, model, att_norm, att_prev, first_layer_value, s_inputs[il], il);
+        ggml_tensor * k_override = nullptr;
+        ggml_tensor * kk_override = nullptr;
+        ggml_tensor * v_override = nullptr;
+        if (patches_by_layer[il]) {
+            size_t override_offset = hparams.token_shift_count * hparams.n_embd * sizeof(float);
+            if (!patches_by_layer[il]->k.empty()) {
+                k_override = ggml_view_2d(graph.ctx0, r_inputs[il], hparams.n_embd, 1, r_inputs[il]->nb[1], override_offset);
+                override_offset += hparams.n_embd * sizeof(float);
+                kk_override = ggml_view_2d(graph.ctx0, r_inputs[il], hparams.n_embd, 1, r_inputs[il]->nb[1], override_offset);
+                override_offset += hparams.n_embd * sizeof(float);
+            }
+            if (!patches_by_layer[il]->v.empty()) {
+                v_override = ggml_view_2d(graph.ctx0, r_inputs[il], hparams.n_embd, 1, r_inputs[il]->nb[1], override_offset);
+            }
+        }
+        time_result time = build_time_mix(graph, model, att_norm, att_prev, first_layer_value, s_inputs[il], il,
+            k_override, kk_override, v_override, source_vector, source_minus_targets);
         out.next_state.s[il].resize(hparams.n_embd_s());
         add_output(graph, time.output);
         add_output(graph, time.next_state);
@@ -415,9 +542,27 @@ static snapshot run_snapshot(llama_context * ctx, llama_token token, const rwkv_
         throw std::runtime_error("failed to allocate GGML snapshot graph");
     }
     ggml_backend_tensor_set(token_input, &token, 0, sizeof(token));
+    if (steer_tokens) {
+        std::vector<llama_token> steer_token_ids = *steer_sources;
+        steer_token_ids.insert(steer_token_ids.end(), steer_targets->begin(), steer_targets->end());
+        ggml_backend_tensor_set(steer_tokens, steer_token_ids.data(), 0, steer_token_ids.size() * sizeof(llama_token));
+    }
     for (int il = 0; il < n_layer; ++il) {
         ggml_backend_tensor_set(r_inputs[il], state.r[il].data(), 0, state.r[il].size() * sizeof(float));
         ggml_backend_tensor_set(s_inputs[il], state.s[il].data(), 0, state.s[il].size() * sizeof(float));
+        if (patches_by_layer[il]) {
+            const activation_patch & patch = *patches_by_layer[il];
+            size_t override_offset = hparams.token_shift_count * hparams.n_embd * sizeof(float);
+            if (!patch.k.empty()) {
+                ggml_backend_tensor_set(r_inputs[il], patch.k.data(), override_offset, patch.k.size() * sizeof(float));
+                override_offset += hparams.n_embd * sizeof(float);
+                ggml_backend_tensor_set(r_inputs[il], patch.kk.data(), override_offset, patch.kk.size() * sizeof(float));
+                override_offset += hparams.n_embd * sizeof(float);
+            }
+            if (!patch.v.empty()) {
+                ggml_backend_tensor_set(r_inputs[il], patch.v.data(), override_offset, patch.v.size() * sizeof(float));
+            }
+        }
     }
     if (ctx->graph_compute(graph.gf, false) != GGML_STATUS_SUCCESS) {
         throw std::runtime_error("GGML snapshot graph failed");
@@ -624,7 +769,7 @@ static float cosine_similarity(const std::vector<float> & left, const std::vecto
 static std::vector<source_readout> project_raw_vectors(
         llama_context * ctx, const std::vector<snapshot::raw_layer> & raw,
         const std::vector<source_kind> & kinds, const std::vector<snapshot::raw_layer> * baseline,
-        llama_token target, bool random_baseline, int top) {
+        llama_token target, const std::vector<llama_token> & report_tokens, bool random_baseline, int top) {
     const auto & model = ctx->get_model();
     const auto & hparams = model.hparams;
     const size_t n_vectors = raw.size() * kinds.size();
@@ -645,7 +790,7 @@ static std::vector<source_readout> project_raw_vectors(
         uint32_t state = 0x6d2b79f5;
         for (size_t i = hparams.n_embd * n_vectors; i < values.size(); ++i) {
             state = state * 1664525u + 1013904223u;
-            values[i] = (state & 1) ? 1.0f : -1.0f;
+            values[i] = (state >> 31) ? 1.0f : -1.0f;
         }
     }
 
@@ -700,7 +845,14 @@ static std::vector<source_readout> project_raw_vectors(
             random_target_rank = 1;
             for (size_t id = 0; id < n_vocab; ++id) random_target_rank += random_values[id] > random_target_logit;
         }
-        source_readout readout = { sources[vector], {}, baseline_cosine, target_rank, target_logit, random_target_rank, random_target_logit };
+        source_readout readout = { sources[vector], {}, {}, baseline_cosine, target_rank, target_logit, random_target_rank, random_target_logit };
+        readout.reported_tokens.reserve(report_tokens.size());
+        for (llama_token report_token : report_tokens) {
+            const float report_logit = column_values[report_token];
+            int report_rank = 1;
+            for (size_t id = 0; id < n_vocab; ++id) report_rank += column_values[id] > report_logit;
+            readout.reported_tokens.push_back({ report_token, common_token_to_piece(&model.vocab, report_token, true), report_rank, report_logit });
+        }
         readout.top_tokens.reserve(top);
         for (int rank = 0; rank < top; ++rank) {
             const int id = ids[rank];
@@ -735,6 +887,8 @@ static void write_json_string(std::ostream & output, const std::string & value) 
 static void write_trace(const std::string & path, const std::string & model_path, const std::string & prompt,
                         int n_gpu_layers, int top, const std::string & trace_kind,
                         const std::vector<std::string> & sources, llama_token tracked_token,
+                        const std::vector<llama_token> & steer_sources, const std::vector<llama_token> & steer_targets,
+                        const std::vector<llama_token> & report_tokens,
                         const std::string & stopped, const llama_vocab * vocab, const std::vector<step_result> & steps) {
     std::ofstream output(path);
     if (!output) throw std::runtime_error("failed to open JSON output");
@@ -753,6 +907,33 @@ static void write_trace(const std::string & path, const std::string & model_path
         write_json_string(output, common_token_to_piece(vocab, tracked_token, true));
         output << "}";
     }
+    if (!report_tokens.empty()) {
+        output << ",\n  \"reported_tokens\": [";
+        for (size_t i = 0; i < report_tokens.size(); ++i) {
+            if (i) output << ",";
+            output << "{\"id\": " << report_tokens[i] << ", \"piece\": ";
+            write_json_string(output, common_token_to_piece(vocab, report_tokens[i], true));
+            output << "}";
+        }
+        output << "]";
+    }
+    if (!steer_sources.empty()) {
+        output << ",\n  \"static_steering\": {\"source_tokens\": [";
+        for (size_t i = 0; i < steer_sources.size(); ++i) {
+            if (i) output << ",";
+            output << "{\"id\": " << steer_sources[i] << ", \"piece\": ";
+            write_json_string(output, common_token_to_piece(vocab, steer_sources[i], true));
+            output << "}";
+        }
+        output << "], \"target_tokens\": [";
+        for (size_t i = 0; i < steer_targets.size(); ++i) {
+            if (i) output << ",";
+            output << "{\"id\": " << steer_targets[i] << ", \"piece\": ";
+            write_json_string(output, common_token_to_piece(vocab, steer_targets[i], true));
+            output << "}";
+        }
+        output << "], \"formula\": \"x - l2norm(l2norm(sum(source)) - l2norm(sum(target))) * max(dot(x, l2norm(sum(source))), 0)\"}";
+    }
     output << ",\n  \"runs\": [{\n    \"prompt\": ";
     write_json_string(output, prompt);
     output << ",\n    \"prompt_token_count\": 0,\n    \"stopped\": ";
@@ -770,6 +951,14 @@ static void write_trace(const std::string & path, const std::string & model_path
             if (il) output << ",";
             output << step.state_cosine[il];
         }
+        output << "], \"final_reported_tokens\": [";
+        for (size_t token_index = 0; token_index < step.final_reported_tokens.size(); ++token_index) {
+            if (token_index) output << ",";
+            const auto & token = step.final_reported_tokens[token_index];
+            output << "{\"id\": " << token.id << ", \"piece\": ";
+            write_json_string(output, token.piece);
+            output << ", \"rank\": " << token.rank << ", \"logit\": " << token.logit << "}";
+        }
         output << "], \"readouts\": [";
         for (size_t il = 0; il < step.readouts.size(); ++il) {
             if (il) output << ",";
@@ -784,6 +973,15 @@ static void write_trace(const std::string & path, const std::string & model_path
                 output << ", \"random_target_rank\": " << step.readouts[il].random_target_rank
                        << ", \"random_target_logit\": " << step.readouts[il].random_target_logit;
             }
+            output << ", \"reported_tokens\": [";
+            for (size_t token_index = 0; token_index < step.readouts[il].reported_tokens.size(); ++token_index) {
+                if (token_index) output << ",";
+                const auto & token = step.readouts[il].reported_tokens[token_index];
+                output << "{\"id\": " << token.id << ", \"piece\": ";
+                write_json_string(output, token.piece);
+                output << ", \"rank\": " << token.rank << ", \"logit\": " << token.logit << "}";
+            }
+            output << "]";
             output << ", \"top_tokens\": [";
             for (size_t rank = 0; rank < step.readouts[il].top_tokens.size(); ++rank) {
                 if (rank) output << ",";
@@ -808,11 +1006,17 @@ int main(int argc, char ** argv) {
     std::string json_path = "rwkv7-time-lens.json";
     std::string forced_text;
     std::string track_text;
+    std::vector<std::string> report_texts;
+    std::string swap_text;
+    std::vector<std::string> steer_source_texts;
+    std::vector<std::string> steer_target_texts;
     int n_gpu_layers = 0;
     int steps = 3;
     int top = 5;
+    int swap_step = 0;
     float epsilon = 0.1f;
     source_kind source = source_kind::r;
+    swap_source swap_kind = swap_source::v;
     run_mode mode = run_mode::project;
     std::vector<source_kind> project_sources = all_source_kinds();
     bool capture_prompt_last = false;
@@ -827,14 +1031,29 @@ int main(int argc, char ** argv) {
         else if (std::strcmp(argv[i], "--capture-prompt-last") == 0) capture_prompt_last = true;
         else if (std::strcmp(argv[i], "--random-baseline") == 0) random_baseline = true;
         else if (std::strcmp(argv[i], "--track-text") == 0 && i + 1 < argc) track_text = argv[++i];
+        else if (std::strcmp(argv[i], "--report-text") == 0 && i + 1 < argc) report_texts.push_back(argv[++i]);
         else if (std::strcmp(argv[i], "--forced-text") == 0 && i + 1 < argc) forced_text = argv[++i];
+        else if (std::strcmp(argv[i], "--swap-text") == 0 && i + 1 < argc) swap_text = argv[++i];
+        else if (std::strcmp(argv[i], "--swap-source") == 0 && i + 1 < argc) swap_kind = parse_swap_source(argv[++i]);
+        else if (std::strcmp(argv[i], "--swap-step") == 0 && i + 1 < argc) swap_step = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--steer-source") == 0 && i + 1 < argc) steer_source_texts.push_back(argv[++i]);
+        else if (std::strcmp(argv[i], "--steer-target") == 0 && i + 1 < argc) steer_target_texts.push_back(argv[++i]);
+        else if (std::strcmp(argv[i], "--steer-smiling") == 0 && i + 1 < argc) steer_source_texts.push_back(argv[++i]);
+        else if (std::strcmp(argv[i], "--steer-crying") == 0 && i + 1 < argc) steer_target_texts.push_back(argv[++i]);
         else if (std::strcmp(argv[i], "--steps") == 0 && i + 1 < argc) steps = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--epsilon") == 0 && i + 1 < argc) epsilon = std::strtof(argv[++i], nullptr);
         else if (std::strcmp(argv[i], "--top") == 0 && i + 1 < argc) top = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--json") == 0 && i + 1 < argc) json_path = argv[++i];
         else { usage(argv[0]); return 1; }
     }
-    if (model_path.empty() || steps <= 0 || top <= 0 || epsilon <= 0.0f) { usage(argv[0]); return 1; }
+    const bool swap_enabled = !swap_text.empty();
+    const bool steering_enabled = !steer_source_texts.empty() || !steer_target_texts.empty();
+    if (model_path.empty() || steps <= 0 || top <= 0 || epsilon <= 0.0f || swap_step < 0 ||
+        (swap_enabled && track_text.empty()) ||
+        (steering_enabled && (steer_source_texts.empty() || steer_target_texts.empty() || swap_enabled))) {
+        usage(argv[0]);
+        return 1;
+    }
 
     ggml_backend_load_all();
     llama_backend_init();
@@ -846,19 +1065,43 @@ int main(int argc, char ** argv) {
     const std::vector<llama_token> prompt_tokens = common_tokenize(vocab, prompt, false, true);
     const std::vector<llama_token> forced_tokens = forced_text.empty() ? std::vector<llama_token>() : common_tokenize(vocab, forced_text, false, true);
     const std::vector<llama_token> tracked_tokens = track_text.empty() ? std::vector<llama_token>() : common_tokenize(vocab, track_text, false, true);
+    std::vector<llama_token> report_tokens;
+    for (const std::string & report_text : report_texts) {
+        const std::vector<llama_token> tokens = common_tokenize(vocab, report_text, false, true);
+        if (tokens.size() != 1) throw std::runtime_error("--report-text must name one token");
+        if (std::find(report_tokens.begin(), report_tokens.end(), tokens[0]) == report_tokens.end()) report_tokens.push_back(tokens[0]);
+    }
+    const std::vector<llama_token> swap_tokens = swap_text.empty() ? std::vector<llama_token>() : common_tokenize(vocab, swap_text, false, true);
+    std::vector<llama_token> steer_source_tokens;
+    for (const std::string & steer_source_text : steer_source_texts) {
+        const std::vector<llama_token> tokens = common_tokenize(vocab, steer_source_text, false, true);
+        if (tokens.size() != 1) throw std::runtime_error("--steer-source must name one token");
+        if (std::find(steer_source_tokens.begin(), steer_source_tokens.end(), tokens[0]) == steer_source_tokens.end()) steer_source_tokens.push_back(tokens[0]);
+    }
+    std::vector<llama_token> steer_target_tokens;
+    for (const std::string & steer_target_text : steer_target_texts) {
+        const std::vector<llama_token> tokens = common_tokenize(vocab, steer_target_text, false, true);
+        if (tokens.size() != 1) throw std::runtime_error("--steer-target must name one token");
+        if (std::find(steer_target_tokens.begin(), steer_target_tokens.end(), tokens[0]) == steer_target_tokens.end()) steer_target_tokens.push_back(tokens[0]);
+    }
+    if (steering_enabled && steer_source_tokens.size() != steer_target_tokens.size()) {
+        throw std::runtime_error("--steer-source and --steer-target must name equally sized token sets");
+    }
     if (!forced_text.empty() && forced_tokens.empty()) throw std::runtime_error("--forced-text produced no tokens");
     if (capture_prompt_last && prompt_tokens.size() < 2) throw std::runtime_error("--capture-prompt-last needs at least two prompt tokens");
     if (!track_text.empty() && tracked_tokens.size() != 1) {
         throw std::runtime_error("--track-text must name one token; omit it to track the model's next token automatically");
     }
+    if (swap_enabled && swap_tokens.size() != 1) {
+        throw std::runtime_error("--swap-text must name one token");
+    }
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = std::max(128, (int) prompt_tokens.size() + steps + 8);
     cparams.n_batch = prompt_tokens.size();
-    cparams.n_ubatch = prompt_tokens.size();
+    cparams.n_ubatch = cparams.n_batch;
     cparams.n_seq_max = 1;
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) throw std::runtime_error("failed to create context");
-
     const size_t prompt_decode_tokens = capture_prompt_last ? prompt_tokens.size() - 1 : prompt_tokens.size();
     llama_batch batch = llama_batch_init((int32_t) prompt_decode_tokens, 0, 1);
     common_batch_clear(batch);
@@ -879,16 +1122,68 @@ int main(int argc, char ** argv) {
     if (!forced_tokens.empty()) carrier = forced_tokens[0];
     const llama_token fixed_tracked_token = !tracked_tokens.empty() ? tracked_tokens[0] : forced_tokens.empty() ? LLAMA_TOKEN_NULL : forced_tokens[0];
     llama_token tracked_token = fixed_tracked_token;
-    const int run_steps = forced_tokens.empty() ? steps : std::min(steps, (int) forced_tokens.size());
+    const int run_steps = steps;
+    if (swap_enabled && swap_step >= run_steps) throw std::runtime_error("--swap-step is outside this run");
     std::vector<step_result> trace;
     trace.reserve(run_steps);
     std::vector<std::string> trace_sources;
     std::vector<snapshot::raw_layer> baseline_raw;
     std::vector<std::vector<float>> baseline_state;
+    if (steering_enabled) {
+        std::printf("static K/V steering at every layer:");
+        for (llama_token source : steer_source_tokens) std::printf(" %s", common_token_to_piece(vocab, source, true).c_str());
+        std::printf(" ->");
+        for (llama_token target : steer_target_tokens) std::printf(" %s", common_token_to_piece(vocab, target, true).c_str());
+        std::printf("\n");
+    }
     for (int step = 0; step < run_steps; ++step) {
-        snapshot clean = run_snapshot(ctx, carrier, state);
-        const llama_token next = !forced_tokens.empty() && step + 1 < (int) forced_tokens.size() ? forced_tokens[step + 1] : greedy_token(clean.logits);
-        step_result result = { carrier, next, {}, {} };
+        snapshot clean;
+        step_result result;
+        result.input = carrier;
+        if (swap_enabled && step == swap_step) {
+            snapshot base = run_snapshot(ctx, carrier, state);
+            snapshot replacement = run_snapshot(ctx, swap_tokens[0], state);
+            const std::vector<source_readout> readouts = project_raw_vectors(ctx, base.raw, { source_kind::k, source_kind::v }, nullptr, tracked_tokens[0], {}, false, top);
+            std::vector<activation_patch> patches;
+            int best_layer = -1;
+            for (int layer = 0; layer < (int) base.raw.size(); ++layer) {
+                const source_readout & k_readout = readouts[layer * 2];
+                const source_readout & v_readout = readouts[layer * 2 + 1];
+                const bool has_k = k_readout.target_rank >= 1 && k_readout.target_rank <= top;
+                const bool has_v = v_readout.target_rank >= 1 && v_readout.target_rank <= top;
+                const bool eligible = swap_kind == swap_source::k ? has_k : swap_kind == swap_source::v ? has_v : has_k && has_v;
+                const int rank = swap_kind == swap_source::k ? k_readout.target_rank : swap_kind == swap_source::v ? v_readout.target_rank : k_readout.target_rank + v_readout.target_rank;
+                const float score = swap_kind == swap_source::k ? k_readout.target_logit : swap_kind == swap_source::v ? v_readout.target_logit : k_readout.target_logit + v_readout.target_logit;
+                const int best_rank = best_layer < 0 ? 0 : swap_kind == swap_source::k ? readouts[best_layer * 2].target_rank : swap_kind == swap_source::v ? readouts[best_layer * 2 + 1].target_rank : readouts[best_layer * 2].target_rank + readouts[best_layer * 2 + 1].target_rank;
+                const float best_score = best_layer < 0 ? 0.0f : swap_kind == swap_source::k ? readouts[best_layer * 2].target_logit : swap_kind == swap_source::v ? readouts[best_layer * 2 + 1].target_logit : readouts[best_layer * 2].target_logit + readouts[best_layer * 2 + 1].target_logit;
+                if (eligible && (best_layer < 0 || rank < best_rank || (rank == best_rank && score > best_score))) {
+                    best_layer = layer;
+                }
+            }
+            if (best_layer >= 0) {
+                const bool swap_k = swap_kind == swap_source::k || swap_kind == swap_source::kv;
+                const bool swap_v = swap_kind == swap_source::v || swap_kind == swap_source::kv;
+                patches.push_back({ best_layer,
+                    swap_k ? replacement.raw[best_layer].k : std::vector<float>(),
+                    swap_k ? replacement.raw[best_layer].kk : std::vector<float>(),
+                    swap_v ? replacement.raw[best_layer].v : std::vector<float>() });
+                const char * kind = swap_kind == swap_source::k ? "k" : swap_kind == swap_source::v ? "v" : "k+v";
+                std::printf("swap step %d: layer %d %s replaced from %s\n", step, best_layer, kind,
+                    common_token_to_piece(vocab, swap_tokens[0], true).c_str());
+                clean = run_snapshot(ctx, carrier, state, &patches);
+                if (swap_k) std::printf("swap k cosine to replacement: %.6f\n", cosine_similarity(clean.raw[best_layer].k, replacement.raw[best_layer].k));
+                if (swap_v) std::printf("swap v cosine to replacement: %.6f\n", cosine_similarity(clean.raw[best_layer].v, replacement.raw[best_layer].v));
+            } else {
+                std::printf("swap step %d: no v source ranked %d or better for %s\n", step, top,
+                    common_token_to_piece(vocab, tracked_tokens[0], true).c_str());
+                clean = std::move(base);
+            }
+        } else {
+            clean = run_snapshot(ctx, carrier, state, nullptr,
+                steering_enabled ? &steer_source_tokens : nullptr, steering_enabled ? &steer_target_tokens : nullptr);
+        }
+        result.next = !forced_tokens.empty() && step + 1 < (int) forced_tokens.size() ? forced_tokens[step + 1] : greedy_token(clean.logits);
+        result.final_reported_tokens = report_logits(vocab, clean.logits, report_tokens);
         if (baseline_raw.empty()) {
             baseline_raw = clean.raw;
             baseline_state = clean.next_state.s;
@@ -899,12 +1194,12 @@ int main(int argc, char ** argv) {
         }
         const llama_token step_target = fixed_tracked_token != LLAMA_TOKEN_NULL ? fixed_tracked_token : greedy_token(clean.logits);
         if (mode == run_mode::project) {
-            result.readouts = project_raw_vectors(ctx, clean.raw, project_sources, &baseline_raw, step_target, random_baseline, top);
+            result.readouts = project_raw_vectors(ctx, clean.raw, project_sources, &baseline_raw, step_target, report_tokens, random_baseline, top);
         } else {
             result.readouts.reserve(clean.raw.size());
             for (int il = 0; il < (int) clean.raw.size(); ++il) {
                 result.readouts.push_back({ raw_source_name(il, source),
-                    lens_readout(ctx, il, clean.resid_in[il], clean.raw[il], state.r[il], state.s[il], source, epsilon, top), 1.0f, -1, 0.0f, -1, 0.0f });
+                    lens_readout(ctx, il, clean.resid_in[il], clean.raw[il], state.r[il], state.s[il], source, epsilon, top), {}, 1.0f, -1, 0.0f, -1, 0.0f });
             }
         }
         if (trace_sources.empty()) {
@@ -920,8 +1215,8 @@ int main(int argc, char ** argv) {
         trace.push_back(std::move(result));
     }
     write_trace(json_path, model_path, prompt, n_gpu_layers, top,
-        mode == run_mode::project ? "rwkv_raw_projection" : "rwkv_time_lens", trace_sources, tracked_token,
-        forced_tokens.empty() ? "steps" : "forced", vocab, trace);
+        steering_enabled ? "rwkv_kv_static_steer" : swap_enabled ? "rwkv_kv_swap" : mode == run_mode::project ? "rwkv_raw_projection" : "rwkv_time_lens", trace_sources, tracked_token,
+        steer_source_tokens, steer_target_tokens, report_tokens, forced_tokens.empty() ? "steps" : "forced_prefix", vocab, trace);
     std::printf("trace=%s\nviewer=pocs/interp/rwkv_unembed_viewer.html\n", json_path.c_str());
     llama_free(ctx);
     llama_model_free(model);

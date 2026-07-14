@@ -16655,17 +16655,22 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         return node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
     };
 
-    auto const &is_src_of = [](const ggml_tensor *dst, const ggml_tensor *src) -> bool {
+    auto const &view_root = [](const ggml_tensor * tensor) -> const ggml_tensor * {
+        while (tensor->view_src) {
+            tensor = tensor->view_src;
+        }
+        return tensor;
+    };
+
+    auto const &is_src_of = [&view_root](const ggml_tensor *dst, const ggml_tensor *src) -> bool {
         for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
             if (dst->src[s] == src) {
                 return true;
             }
-        }
-        // implicit dependency if they view the same tensor
-        const ggml_tensor *dst2 = dst->view_src ? dst->view_src : dst;
-        const ggml_tensor *src2 = src->view_src ? src->view_src : src;
-        if (dst2 == src2) {
-            return true;
+            // Sibling views can share externally-backed storage through more than one view.
+            if (dst->src[s] && view_root(dst->src[s]) == view_root(src)) {
+                return true;
+            }
         }
         return false;
     };

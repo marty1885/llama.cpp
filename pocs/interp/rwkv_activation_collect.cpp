@@ -51,6 +51,19 @@ llama_interp::task<> capture_step(
     out = co_await path;
 }
 
+llama_interp::task<> capture_generated_step(
+        llama_interp::runtime & rt,
+        const llama_interp::rwkv_state & before,
+        const std::vector<std::string> & names,
+        llama_interp::decode_result & out,
+        llama_interp::activation_set & captures) {
+    auto path = rt.decode(before, 1);
+    for (const auto & name : names) {
+        path.capture_f16("^" + name + "$", captures);
+    }
+    out = co_await path;
+}
+
 struct pending_capture {
     llama_interp::rwkv_state before;
     llama_token token;
@@ -59,11 +72,12 @@ struct pending_capture {
 
 void usage(const char * argv0) {
     std::fprintf(stderr,
-        "usage: %s -m MODEL --corpus FILE --output FILE [--max-samples N] [--capture-batch N] [--seed N] [-ngl N]\n"
+        "usage: %s -m MODEL --corpus FILE --output FILE [--max-samples N] [--positions-per-line N] [--generation-steps N] [--all-layers] [--prompt-stride N] [--capture-batch N] [--seed N] [-ngl N]\n"
         "\n"
-        "Streams one deterministic, context-bearing token position from each corpus line into\n"
-        "a ROOT RNTuple. All 488 raw RWKV time-mix sources and the final residual are stored\n"
-        "as native FP16; no corpus-sized activation buffer is retained in memory.\n",
+        "Streams deterministic, context-bearing token positions from each corpus line into\n"
+        "a ROOT RNTuple. --generation-steps records greedy trajectories using only layer-60\n"
+        "time.k and resid.out by default, or those pairs at every layer with --all-layers.\n"
+        "--prompt-stride selects evenly spaced corpus prompts.\n",
         argv0);
 }
 
@@ -77,6 +91,10 @@ int main(int argc, char ** argv) {
     std::string output_path;
     int n_gpu_layers = 0;
     uint64_t max_samples = 1500;
+    uint32_t positions_per_line = 1;
+    uint32_t generation_steps = 0;
+    uint32_t prompt_stride = 1;
+    bool all_layers = false;
     uint32_t capture_batch = 4;
     uint64_t seed = 17;
     for (int i = 1; i < argc; ++i) {
@@ -88,6 +106,14 @@ int main(int argc, char ** argv) {
             output_path = argv[++i];
         } else if (std::strcmp(argv[i], "--max-samples") == 0 && i + 1 < argc) {
             max_samples = std::strtoull(argv[++i], nullptr, 10);
+        } else if (std::strcmp(argv[i], "--positions-per-line") == 0 && i + 1 < argc) {
+            positions_per_line = std::strtoul(argv[++i], nullptr, 10);
+        } else if (std::strcmp(argv[i], "--generation-steps") == 0 && i + 1 < argc) {
+            generation_steps = std::strtoul(argv[++i], nullptr, 10);
+        } else if (std::strcmp(argv[i], "--all-layers") == 0) {
+            all_layers = true;
+        } else if (std::strcmp(argv[i], "--prompt-stride") == 0 && i + 1 < argc) {
+            prompt_stride = std::strtoul(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--capture-batch") == 0 && i + 1 < argc) {
             capture_batch = std::strtoul(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
@@ -99,7 +125,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
-    if (model_path.empty() || corpus_path.empty() || output_path.empty() || max_samples == 0 || capture_batch == 0) {
+    if (model_path.empty() || corpus_path.empty() || output_path.empty() || max_samples == 0 || positions_per_line == 0 || prompt_stride == 0 || capture_batch == 0 || (all_layers && !generation_steps)) {
         usage(argv[0]);
         return 1;
     }
@@ -137,17 +163,25 @@ int main(int argc, char ** argv) {
     if (initial.n_embd_r / 2 != rwkv_activation_store::k_default_dimension) {
         throw std::runtime_error("collector currently requires 4096-dimensional RWKV activations");
     }
-    const std::vector<const char *> time_mix = {
-        "time.r", "time.w", "time.k", "time.v", "time.a", "time.g", "time.wkv", "time.rkv",
+    const std::vector<const char *> known_taps = {
+        "resid.in", "att.norm",
+        "time.r", "time.w", "time.k", "time.v", "time.a", "time.a_pre", "time.g", "time.k0", "time.kk", "time.wkv", "time.rkv", "time.out",
+        "resid.time", "ffn.norm", "channel.out", "resid.out",
     };
     std::vector<std::string> names;
-    for (int layer = 0; layer < (int) initial.n_layer; ++layer) {
-        for (const char * activation : time_mix) {
-            names.push_back(activation_name(layer, activation));
+    if (generation_steps) {
+        const int first_layer = all_layers ? 0 : (int) initial.n_layer - 1;
+        for (int layer = first_layer; layer < (int) initial.n_layer; ++layer) {
+            names.push_back(activation_name(layer, "time.k"));
+            names.push_back(activation_name(layer, "resid.out"));
+        }
+    } else {
+        for (int layer = 0; layer < (int) initial.n_layer; ++layer) {
+            for (const char * activation : known_taps) {
+                names.push_back(activation_name(layer, activation));
+            }
         }
     }
-    const std::string final_residual = activation_name((int) initial.n_layer - 1, "resid.out");
-    names.push_back(final_residual);
 
     auto writer = rwkv_activation_store::activation_dataset_writer::create(output_path, names);
     const auto started = std::chrono::steady_clock::now();
@@ -222,27 +256,76 @@ int main(int argc, char ** argv) {
         if (prompt.empty()) {
             continue;
         }
+        if (corpus_line % prompt_stride != 1 % prompt_stride) {
+            continue;
+        }
         const auto tokens = common_tokenize(vocab, prompt, false, true);
         if (tokens.empty()) {
             continue;
         }
+        if (generation_steps) {
+            llama_interp::rwkv_state state = initial;
+            auto prefill = prefill_state(rt, initial, tokens, state);
+            rt.run();
+            prefill.rethrow_if_failed();
+            for (uint32_t step = 0; step < generation_steps && sample_id < max_samples; ++step) {
+                llama_interp::activation_set captures;
+                llama_interp::decode_result decoded;
+                auto capture = capture_generated_step(rt, state, names, decoded, captures);
+                rt.run();
+                capture.rethrow_if_failed();
+                if (decoded.tokens.size() != 1) {
+                    throw std::runtime_error("generated capture did not produce one token");
+                }
+                std::unordered_map<std::string, const llama_interp_activation *> by_name;
+                for (const auto & item : captures) {
+                    if (!item.data.empty()) by_name[item.name] = &item;
+                }
+                std::vector<std::span<const ggml_fp16_t>> activations;
+                activations.reserve(names.size());
+                for (const auto & name : names) {
+                    const auto found = by_name.find(name);
+                    if (found == by_name.end() || found->second->data.size() != rwkv_activation_store::k_default_dimension) {
+                        throw std::runtime_error("missing generated activation capture: " + name);
+                    }
+                    activations.emplace_back(found->second->data.data(), rwkv_activation_store::k_default_dimension);
+                }
+                writer.append({ sample_id, corpus_line, (int32_t) step, decoded.tokens[0], (int32_t) tokens.size() }, activations);
+                ++sample_id;
+                state = std::move(decoded.state);
+            }
+            if (sample_id % 16 == 0 || sample_id == max_samples) {
+                writer.commit();
+                const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+                const double rate = sample_id / std::max(elapsed, 1e-9);
+                const double remaining = (max_samples - sample_id) / rate;
+                std::printf("progress=%llu/%llu %.1f%% corpus_line=%llu rate=%.3f samples/s elapsed=%.0fs eta=%.0fs\n",
+                    (unsigned long long) sample_id, (unsigned long long) max_samples, 100.0 * sample_id / max_samples,
+                    (unsigned long long) corpus_line, rate, elapsed, remaining);
+                std::fflush(stdout);
+            }
+            continue;
+        }
         const size_t first_context_position = std::min<size_t>(8, tokens.size() - 1);
         const size_t range = tokens.size() - first_context_position;
-        const size_t position = first_context_position + splitmix64(seed ^ corpus_line) % range;
-
-        llama_interp::rwkv_state before = initial;
-        if (position > 0) {
-            auto prefix = prefill_state(rt, initial, std::vector<llama_token>(tokens.begin(), tokens.begin() + position), before);
-            rt.run();
-            prefix.rethrow_if_failed();
-        }
-        pending.push_back({
-            std::move(before),
-            tokens[position],
-            { sample_id + pending.size(), corpus_line, (int32_t) position, tokens[position], (int32_t) tokens.size() },
-        });
-        if (pending.size() == capture_batch) {
-            flush_pending();
+        const size_t positions = std::min<size_t>(positions_per_line, range);
+        const size_t first_offset = splitmix64(seed ^ corpus_line) % range;
+        for (size_t offset = 0; offset < positions && sample_id + pending.size() < max_samples; ++offset) {
+            const size_t position = first_context_position + (first_offset + offset) % range;
+            llama_interp::rwkv_state before = initial;
+            if (position > 0) {
+                auto prefix = prefill_state(rt, initial, std::vector<llama_token>(tokens.begin(), tokens.begin() + position), before);
+                rt.run();
+                prefix.rethrow_if_failed();
+            }
+            pending.push_back({
+                std::move(before),
+                tokens[position],
+                { sample_id + pending.size(), corpus_line, (int32_t) position, tokens[position], (int32_t) tokens.size() },
+            });
+            if (pending.size() == capture_batch) {
+                flush_pending();
+            }
         }
     }
     flush_pending();

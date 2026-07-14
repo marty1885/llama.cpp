@@ -62,6 +62,8 @@ struct snapshot {
     rwkv_state next_state;
     std::vector<std::vector<float>> resid_in;
     struct raw_layer {
+        std::vector<float> resid_in;
+        std::vector<float> att_norm;
         std::vector<float> r;
         std::vector<float> w;
         std::vector<float> k;
@@ -73,7 +75,11 @@ struct snapshot {
         std::vector<float> kk;
         std::vector<float> wkv;
         std::vector<float> rkv;
+        std::vector<float> time_out;
+        std::vector<float> resid_time;
+        std::vector<float> ffn_norm;
         std::vector<float> channel_out;
+        std::vector<float> resid_out;
     };
     std::vector<raw_layer> raw;
     std::vector<float> logits;
@@ -87,9 +93,63 @@ struct projection_workspace {
     size_t n_columns = 0;
 };
 
-enum class source_kind { r, w, k, v, a, a_pre, g, k0, kk, wkv, rkv, channel_out };
+struct linear_readout_map {
+    size_t dimension = 0;
+    size_t rows = 0;
+    std::vector<float> source_mean;
+    std::vector<float> target_mean;
+    std::vector<float> centered_sources;
+    std::vector<float> coefficients;
 
-static constexpr size_t projection_source_count = 12;
+    static linear_readout_map load(const std::string & path) {
+        std::ifstream input(path, std::ios::binary);
+        if (!input) throw std::runtime_error("failed to open linear readout map: " + path);
+        char magic[8];
+        uint64_t stored_dimension = 0;
+        uint64_t stored_rows = 0;
+        input.read(magic, sizeof(magic));
+        input.read(reinterpret_cast<char *>(&stored_dimension), sizeof(stored_dimension));
+        input.read(reinterpret_cast<char *>(&stored_rows), sizeof(stored_rows));
+        const char expected[8] = { 'R', 'W', 'K', 'V', 'L', 'R', 'M', '1' };
+        if (!input || std::memcmp(magic, expected, sizeof(magic)) != 0 || stored_dimension == 0 || stored_rows == 0) {
+            throw std::runtime_error("invalid linear readout map: " + path);
+        }
+        linear_readout_map result;
+        result.dimension = stored_dimension;
+        result.rows = stored_rows;
+        result.source_mean.resize(result.dimension);
+        result.target_mean.resize(result.dimension);
+        result.centered_sources.resize(result.rows * result.dimension);
+        result.coefficients.resize(result.rows * result.dimension);
+        input.read(reinterpret_cast<char *>(result.source_mean.data()), result.source_mean.size() * sizeof(float));
+        input.read(reinterpret_cast<char *>(result.target_mean.data()), result.target_mean.size() * sizeof(float));
+        input.read(reinterpret_cast<char *>(result.centered_sources.data()), result.centered_sources.size() * sizeof(float));
+        input.read(reinterpret_cast<char *>(result.coefficients.data()), result.coefficients.size() * sizeof(float));
+        if (!input) throw std::runtime_error("truncated linear readout map: " + path);
+        return result;
+    }
+
+    std::vector<float> apply(const std::vector<float> & values) const {
+        if (values.size() != dimension) throw std::runtime_error("linear readout map dimension mismatch");
+        std::vector<double> weights(rows);
+        for (size_t row = 0; row < rows; ++row) {
+            double value = 0.0;
+            const float * source = centered_sources.data() + row * dimension;
+            for (size_t i = 0; i < dimension; ++i) value += ((double) values[i] - source_mean[i]) * source[i];
+            weights[row] = value;
+        }
+        std::vector<float> result = target_mean;
+        for (size_t row = 0; row < rows; ++row) {
+            const float * coefficient = coefficients.data() + row * dimension;
+            for (size_t i = 0; i < dimension; ++i) result[i] += (float) (weights[row] * coefficient[i]);
+        }
+        return result;
+    }
+};
+
+enum class source_kind { resid_in, att_norm, r, w, k, v, a, a_pre, g, k0, kk, wkv, rkv, time_out, resid_time, ffn_norm, channel_out, resid_out };
+
+static constexpr size_t projection_source_count = 18;
 
 enum class run_mode { project, local_lens };
 
@@ -172,6 +232,8 @@ static swap_source parse_swap_source(const std::string & value) {
 
 static const char * source_name(source_kind source) {
     switch (source) {
+        case source_kind::resid_in: return "resid.in";
+        case source_kind::att_norm: return "att.norm";
         case source_kind::r:   return "r";
         case source_kind::w:   return "w";
         case source_kind::k:   return "k";
@@ -183,24 +245,34 @@ static const char * source_name(source_kind source) {
         case source_kind::kk:  return "kk";
         case source_kind::wkv: return "wkv";
         case source_kind::rkv: return "rkv";
+        case source_kind::time_out: return "time.out";
+        case source_kind::resid_time: return "resid.time";
+        case source_kind::ffn_norm: return "ffn.norm";
         case source_kind::channel_out: return "channel.out";
+        case source_kind::resid_out: return "resid.out";
     }
     GGML_ABORT("unknown source");
 }
 
 static source_kind parse_source(const std::string & value) {
-    for (source_kind source : { source_kind::r, source_kind::w, source_kind::k, source_kind::v,
+    for (source_kind source : { source_kind::resid_in, source_kind::att_norm,
+                                source_kind::r, source_kind::w, source_kind::k, source_kind::v,
                                 source_kind::a, source_kind::a_pre, source_kind::g, source_kind::k0,
-                                source_kind::kk, source_kind::wkv, source_kind::rkv, source_kind::channel_out }) {
+                                source_kind::kk, source_kind::wkv, source_kind::rkv, source_kind::time_out,
+                                source_kind::resid_time, source_kind::ffn_norm, source_kind::channel_out,
+                                source_kind::resid_out }) {
         if (value == source_name(source)) return source;
     }
     throw std::runtime_error("unknown --source: " + value);
 }
 
 static std::vector<source_kind> all_source_kinds() {
-    return { source_kind::r, source_kind::w, source_kind::k, source_kind::v,
-             source_kind::a, source_kind::a_pre, source_kind::g, source_kind::k0,
-             source_kind::kk, source_kind::wkv, source_kind::rkv, source_kind::channel_out };
+    return { source_kind::resid_in, source_kind::att_norm,
+              source_kind::r, source_kind::w, source_kind::k, source_kind::v,
+              source_kind::a, source_kind::a_pre, source_kind::g, source_kind::k0,
+              source_kind::kk, source_kind::wkv, source_kind::rkv,
+              source_kind::time_out, source_kind::resid_time, source_kind::ffn_norm,
+              source_kind::channel_out, source_kind::resid_out };
 }
 
 static std::vector<source_kind> parse_project_sources(const std::string & value) {
@@ -232,13 +304,13 @@ struct direct_graph : llm_build_rwkv7_base {
 
 static void usage(const char * argv0) {
     std::fprintf(stderr,
-        "usage: %s -m MODEL [-p PROMPT] [-ngl N] [--mode project|local-lens] [--source r|w|k|v|a|a_pre|g|k0|kk|wkv|rkv|channel.out] [--project-sources all|k,v,a,a_pre,k0,kk,channel.out] [--no-in-graph-unembed] [--random-baseline] [--capture-prompt-last] [--track-text TEXT] [--report-text TEXT]... [--forced-text TEXT] [--steps N] [--epsilon E] [--top N] [--steer-source TEXT --steer-target TEXT [--steer-edit r,w,k,v,a|--steer-sweep r,w,k,v,a] [--steer-start N] [--steer-steps N]] [--swap-text TEXT [--swap-source k|v|kv] [--swap-step N]] [--json FILE]\n"
+        "usage: %s -m MODEL [-p PROMPT] [-ngl N] [--mode project|local-lens] [--source resid.in|att.norm|r|w|k|v|a|a_pre|g|k0|kk|wkv|rkv|time.out|resid.time|ffn.norm|channel.out|resid.out] [--project-sources all|k,v,a,a_pre,k0,kk,channel.out] [--linear-readout-map FILE [--linear-readout-layer N]|--linear-readout-map-prefix PREFIX] [--no-in-graph-unembed] [--random-baseline] [--capture-prompt-last] [--track-text TEXT] [--report-text TEXT]... [--forced-text TEXT] [--steps N] [--until-eog] [--epsilon E] [--top N] [--steer-source TEXT --steer-target TEXT [--steer-edit r,w,k,v,a|--steer-sweep r,w,k,v,a] [--steer-start N] [--steer-steps N]] [--swap-text TEXT [--swap-source k|v|kv] [--swap-step N]] [--json FILE]\n"
         "\n"
         "project (default) batches all 732 captured vectors through the native\n"
         "output normalization and output matrix. local-lens perturbs one source and runs its\n"
         "local downstream closure as a diagnostic. --steer-source/--steer-target applies\n"
         "x - l2norm(l2norm(sum(source)) - l2norm(sum(target))) * max(dot(x, l2norm(sum(source))), 0) to selected components at every RWKV layer. --steer-edit selects r,w,k,v,a (default: k,v); --steer-sweep writes every subset while reusing the loaded model. Raw projections are fused into the decode graph unless --no-in-graph-unembed is set. W and A are clamped after steering. --steer-start and --steer-steps limit it to generation steps (default: all). --swap-text replaces\n"
-        "the strongest selected source whose tracked token is in its top-k raw projection.\n",
+        "the strongest selected source whose tracked token is in its top-k raw projection. --linear-readout-map replaces one selected layer's projected time.k; --linear-readout-map-prefix loads PREFIX0.rwkv-lrm through PREFIXN.rwkv-lrm for every layer.\n",
         argv0);
 }
 
@@ -568,10 +640,15 @@ static snapshot run_snapshot(
     std::vector<ggml_tensor *> r_inputs(n_layer);
     std::vector<ggml_tensor *> s_inputs(n_layer);
     std::vector<ggml_tensor *> resid_outputs(n_layer);
+    std::vector<ggml_tensor *> att_norm_outputs(n_layer);
     std::vector<raw_tensors> raw_outputs(n_layer);
+    std::vector<ggml_tensor *> time_outputs(n_layer);
+    std::vector<ggml_tensor *> resid_time_outputs(n_layer);
+    std::vector<ggml_tensor *> ffn_norm_outputs(n_layer);
     std::vector<ggml_tensor *> state_outputs(n_layer);
     std::vector<ggml_tensor *> shift_outputs(n_layer);
     std::vector<ggml_tensor *> channel_outputs(n_layer);
+    std::vector<ggml_tensor *> resid_final_outputs(n_layer);
     std::vector<ggml_tensor *> in_graph_projection_vectors;
     if (in_graph_project_sources) {
         in_graph_projection_vectors.reserve(n_layer * in_graph_project_sources->size());
@@ -609,6 +686,9 @@ static snapshot run_snapshot(
         ggml_tensor * ffn_prev = ggml_view_3d(graph.ctx0, r_inputs[il], hparams.n_embd, 1, 1,
             r_inputs[il]->nb[1], r_inputs[il]->nb[2], hparams.n_embd * sizeof(float));
         ggml_tensor * att_norm = graph.build_norm(cur, layer.attn_norm, layer.attn_norm_b, LLM_NORM, il);
+        if (capture_raw) {
+            att_norm_outputs[il] = materialize_output(graph, att_norm);
+        }
         ggml_tensor * k_override = nullptr;
         ggml_tensor * kk_override = nullptr;
         ggml_tensor * v_override = nullptr;
@@ -628,6 +708,9 @@ static snapshot run_snapshot(
             k_override, kk_override, v_override, steer_components, source_vector, source_minus_targets);
         out.next_state.s[il].resize(hparams.n_embd_s());
         add_output(graph, time.output);
+        if (capture_raw) {
+            time_outputs[il] = materialize_output(graph, time.output);
+        }
         state_outputs[il] = materialize_output(graph, time.next_state);
         if (capture_raw) {
             raw_outputs[il] = {
@@ -649,20 +732,35 @@ static snapshot run_snapshot(
                                                    &raw.wkv, &raw.rkv }) {
                 values->resize(hparams.n_embd);
             }
-            raw.channel_out.resize(hparams.n_embd);
+            for (std::vector<float> * values : { &raw.resid_in, &raw.att_norm, &raw.time_out, &raw.resid_time,
+                                                   &raw.ffn_norm, &raw.channel_out, &raw.resid_out }) {
+                values->resize(hparams.n_embd);
+            }
         }
 
         ggml_tensor * ffn_inp = ggml_add(graph.ctx0, time.output, cur);
+        if (capture_raw) {
+            resid_time_outputs[il] = materialize_output(graph, ffn_inp);
+        }
         ggml_tensor * ffn_norm = graph.build_norm(ffn_inp, layer.attn_norm_2, layer.attn_norm_2_b, LLM_NORM, il);
+        if (capture_raw) {
+            ffn_norm_outputs[il] = materialize_output(graph, ffn_norm);
+        }
         ggml_tensor * channel = graph.build_rwkv7_channel_mix(&layer, ffn_norm, ffn_prev, LLM_ARCH_RWKV7);
         if (capture_raw) {
             channel_outputs[il] = materialize_output(graph, channel);
+        }
+        ggml_tensor * resid_out = ggml_add(graph.ctx0, channel, ffn_inp);
+        if (capture_raw) {
+            resid_final_outputs[il] = materialize_output(graph, resid_out);
         }
         if (in_graph_project_sources) {
             const raw_tensors & raw = raw_outputs[il];
             for (source_kind kind : *in_graph_project_sources) {
                 ggml_tensor * vector = nullptr;
                 switch (kind) {
+                    case source_kind::resid_in: vector = resid_outputs[il]; break;
+                    case source_kind::att_norm: vector = att_norm_outputs[il]; break;
                     case source_kind::r: vector = raw.r; break;
                     case source_kind::w: vector = raw.w; break;
                     case source_kind::k: vector = raw.k; break;
@@ -674,13 +772,17 @@ static snapshot run_snapshot(
                     case source_kind::kk: vector = raw.kk; break;
                     case source_kind::wkv: vector = raw.wkv; break;
                     case source_kind::rkv: vector = raw.rkv; break;
+                    case source_kind::time_out: vector = time_outputs[il]; break;
+                    case source_kind::resid_time: vector = resid_time_outputs[il]; break;
+                    case source_kind::ffn_norm: vector = ffn_norm_outputs[il]; break;
                     case source_kind::channel_out: vector = channel_outputs[il]; break;
+                    case source_kind::resid_out: vector = resid_final_outputs[il]; break;
                 }
                 if (!vector) throw std::runtime_error("in-graph projection source is unavailable");
                 in_graph_projection_vectors.push_back(vector);
             }
         }
-        cur = ggml_add(graph.ctx0, channel, ffn_inp);
+        cur = resid_out;
         out.next_state.r[il].resize(hparams.n_embd_r());
         ggml_tensor * next_shift = ggml_concat(graph.ctx0, att_norm, ffn_norm, 1);
         add_output(graph, next_shift);
@@ -746,7 +848,9 @@ static snapshot run_snapshot(
     ctx->synchronize();
 
     for (int il = 0; il < n_layer; ++il) {
-        if (capture_raw) ggml_backend_tensor_get(resid_outputs[il], out.resid_in[il].data(), 0, hparams.n_embd * sizeof(float));
+        if (capture_raw) {
+            ggml_backend_tensor_get(resid_outputs[il], out.resid_in[il].data(), 0, hparams.n_embd * sizeof(float));
+        }
         ggml_backend_tensor_get(state_outputs[il], out.next_state.s[il].data(), 0, hparams.n_embd_s() * sizeof(float));
         ggml_backend_tensor_get(shift_outputs[il], out.next_state.r[il].data(), 0, hparams.n_embd_r() * sizeof(float));
         if (!capture_raw) continue;
@@ -761,7 +865,13 @@ static snapshot run_snapshot(
         for (size_t source = 0; source < sources.size(); ++source) {
             ggml_backend_tensor_get(sources[source], values[source]->data(), 0, hparams.n_embd * sizeof(float));
         }
+        ggml_backend_tensor_get(resid_outputs[il], raw.resid_in.data(), 0, hparams.n_embd * sizeof(float));
+        ggml_backend_tensor_get(att_norm_outputs[il], raw.att_norm.data(), 0, hparams.n_embd * sizeof(float));
+        ggml_backend_tensor_get(time_outputs[il], raw.time_out.data(), 0, hparams.n_embd * sizeof(float));
+        ggml_backend_tensor_get(resid_time_outputs[il], raw.resid_time.data(), 0, hparams.n_embd * sizeof(float));
+        ggml_backend_tensor_get(ffn_norm_outputs[il], raw.ffn_norm.data(), 0, hparams.n_embd * sizeof(float));
         ggml_backend_tensor_get(channel_outputs[il], raw.channel_out.data(), 0, hparams.n_embd * sizeof(float));
+        ggml_backend_tensor_get(resid_final_outputs[il], raw.resid_out.data(), 0, hparams.n_embd * sizeof(float));
     }
     out.logits.resize(llama_vocab_n_tokens(&model.vocab));
     ggml_backend_tensor_get(logits, out.logits.data(), 0, out.logits.size() * sizeof(float));
@@ -788,16 +898,22 @@ static std::vector<scored_token> lens_readout(
     snapshot::raw_layer raw = clean;
     std::vector<float> * perturbed = nullptr;
     switch (source) {
+        case source_kind::resid_in:
+        case source_kind::att_norm:
+        case source_kind::a_pre:
+        case source_kind::k0:
+        case source_kind::kk:
+        case source_kind::time_out:
+        case source_kind::resid_time:
+        case source_kind::ffn_norm:
+        case source_kind::channel_out:
+        case source_kind::resid_out:
+            throw std::runtime_error("local-lens does not support derived source " + std::string(source_name(source)));
         case source_kind::r:   perturbed = &raw.r; break;
         case source_kind::w:   perturbed = &raw.w; break;
         case source_kind::k:   perturbed = &raw.k; break;
         case source_kind::v:   perturbed = &raw.v; break;
         case source_kind::a:   perturbed = &raw.a; break;
-        case source_kind::a_pre:
-        case source_kind::k0:
-        case source_kind::kk:
-        case source_kind::channel_out:
-            throw std::runtime_error("local-lens does not support derived source " + std::string(source_name(source)));
         case source_kind::g:   perturbed = &raw.g; break;
         case source_kind::wkv: perturbed = &raw.wkv; break;
         case source_kind::rkv: perturbed = &raw.rkv; break;
@@ -911,14 +1027,24 @@ static std::vector<scored_token> lens_readout(
 }
 
 static std::string raw_source_name(int layer, source_kind source) {
-    if (source == source_kind::channel_out) {
-        return "rwkv.layer." + std::to_string(layer) + ".channel.out";
+    switch (source) {
+        case source_kind::resid_in:
+        case source_kind::att_norm:
+        case source_kind::time_out:
+        case source_kind::resid_time:
+        case source_kind::ffn_norm:
+        case source_kind::channel_out:
+        case source_kind::resid_out:
+            return "rwkv.layer." + std::to_string(layer) + "." + source_name(source);
+        default:
+            return "rwkv.layer." + std::to_string(layer) + ".time." + source_name(source);
     }
-    return "rwkv.layer." + std::to_string(layer) + ".time." + source_name(source);
 }
 
 static const std::vector<float> & raw_values(const snapshot::raw_layer & raw, source_kind source) {
     switch (source) {
+        case source_kind::resid_in: return raw.resid_in;
+        case source_kind::att_norm: return raw.att_norm;
         case source_kind::r:   return raw.r;
         case source_kind::w:   return raw.w;
         case source_kind::k:   return raw.k;
@@ -930,7 +1056,11 @@ static const std::vector<float> & raw_values(const snapshot::raw_layer & raw, so
         case source_kind::kk:  return raw.kk;
         case source_kind::wkv: return raw.wkv;
         case source_kind::rkv: return raw.rkv;
+        case source_kind::time_out: return raw.time_out;
+        case source_kind::resid_time: return raw.resid_time;
+        case source_kind::ffn_norm: return raw.ffn_norm;
         case source_kind::channel_out: return raw.channel_out;
+        case source_kind::resid_out: return raw.resid_out;
     }
     GGML_ABORT("unknown source");
 }
@@ -994,7 +1124,8 @@ static std::vector<source_readout> summarize_projected_logits(
 static std::vector<source_readout> project_raw_vectors(
         llama_context * ctx, const std::vector<snapshot::raw_layer> & raw,
         const std::vector<source_kind> & kinds, const std::vector<snapshot::raw_layer> * baseline,
-        llama_token target, const std::vector<llama_token> & report_tokens, bool random_baseline, int top) {
+        llama_token target, const std::vector<llama_token> & report_tokens, bool random_baseline, int top,
+        const std::vector<linear_readout_map> * mapped_k = nullptr) {
     const auto & model = ctx->get_model();
     const auto & hparams = model.hparams;
     const size_t n_vectors = raw.size() * kinds.size();
@@ -1002,11 +1133,19 @@ static std::vector<source_readout> project_raw_vectors(
     std::vector<float> values(hparams.n_embd * n_columns);
     std::vector<std::string> sources;
     sources.reserve(n_vectors);
+    std::vector<float> mapped_residual_cosines(n_vectors, std::numeric_limits<float>::quiet_NaN());
     size_t column = 0;
     for (int layer = 0; layer < (int) raw.size(); ++layer) {
         for (source_kind kind : kinds) {
-            const auto & vector = raw_values(raw[layer], kind);
-            std::copy(vector.begin(), vector.end(), values.begin() + column * hparams.n_embd);
+            const auto & raw_vector = raw_values(raw[layer], kind);
+            std::vector<float> decoded;
+            const std::vector<float> * vector = &raw_vector;
+            if (mapped_k && kind == source_kind::k && layer < (int) mapped_k->size() && (*mapped_k)[layer].rows) {
+                decoded = (*mapped_k)[layer].apply(raw_vector);
+                vector = &decoded;
+                mapped_residual_cosines[column] = cosine_similarity(decoded, raw[layer].resid_out);
+            }
+            std::copy(vector->begin(), vector->end(), values.begin() + column * hparams.n_embd);
             sources.push_back(raw_source_name(layer, kind));
             ++column;
         }
@@ -1054,7 +1193,8 @@ static std::vector<source_readout> project_raw_vectors(
         });
         const size_t layer = vector / kinds.size();
         const source_kind kind = kinds[vector % kinds.size()];
-        const float baseline_cosine = baseline ? cosine_similarity(raw_values(raw[layer], kind), raw_values((*baseline)[layer], kind)) : 1.0f;
+        const float baseline_cosine = std::isfinite(mapped_residual_cosines[vector]) ? mapped_residual_cosines[vector] :
+            baseline ? cosine_similarity(raw_values(raw[layer], kind), raw_values((*baseline)[layer], kind)) : 1.0f;
         int target_rank = -1;
         float target_logit = 0.0f;
         if (target >= 0 && (size_t) target < n_vocab) {
@@ -1245,6 +1385,8 @@ int main(int argc, char ** argv) {
     std::string track_text;
     std::vector<std::string> report_texts;
     std::string swap_text;
+    std::string linear_readout_map_path;
+    std::string linear_readout_map_prefix;
     std::vector<std::string> steer_source_texts;
     std::vector<std::string> steer_target_texts;
     int n_gpu_layers = 0;
@@ -1253,6 +1395,7 @@ int main(int argc, char ** argv) {
     int swap_step = 0;
     int steer_start = 0;
     int steer_steps = -1;
+    int linear_readout_layer = 60;
     uint32_t steer_components = steer_default_components;
     uint32_t steer_sweep_components = 0;
     float epsilon = 0.1f;
@@ -1263,6 +1406,7 @@ int main(int argc, char ** argv) {
     bool capture_prompt_last = false;
     bool random_baseline = false;
     bool in_graph_unembed = true;
+    bool until_eog = false;
     bool steer_edit_set = false;
     bool steer_sweep_set = false;
     for (int i = 1; i < argc; ++i) {
@@ -1272,9 +1416,13 @@ int main(int argc, char ** argv) {
         else if (std::strcmp(argv[i], "--mode") == 0 && i + 1 < argc) mode = parse_mode(argv[++i]);
         else if (std::strcmp(argv[i], "--source") == 0 && i + 1 < argc) source = parse_source(argv[++i]);
         else if (std::strcmp(argv[i], "--project-sources") == 0 && i + 1 < argc) project_sources = parse_project_sources(argv[++i]);
+        else if (std::strcmp(argv[i], "--linear-readout-map") == 0 && i + 1 < argc) linear_readout_map_path = argv[++i];
+        else if (std::strcmp(argv[i], "--linear-readout-layer") == 0 && i + 1 < argc) linear_readout_layer = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--linear-readout-map-prefix") == 0 && i + 1 < argc) linear_readout_map_prefix = argv[++i];
         else if (std::strcmp(argv[i], "--no-in-graph-unembed") == 0) in_graph_unembed = false;
         else if (std::strcmp(argv[i], "--capture-prompt-last") == 0) capture_prompt_last = true;
         else if (std::strcmp(argv[i], "--random-baseline") == 0) random_baseline = true;
+        else if (std::strcmp(argv[i], "--until-eog") == 0) until_eog = true;
         else if (std::strcmp(argv[i], "--track-text") == 0 && i + 1 < argc) track_text = argv[++i];
         else if (std::strcmp(argv[i], "--report-text") == 0 && i + 1 < argc) report_texts.push_back(argv[++i]);
         else if (std::strcmp(argv[i], "--forced-text") == 0 && i + 1 < argc) forced_text = argv[++i];
@@ -1297,8 +1445,9 @@ int main(int argc, char ** argv) {
     }
     const bool swap_enabled = !swap_text.empty();
     const bool steering_enabled = !steer_source_texts.empty() || !steer_target_texts.empty();
-    const bool fused_projection = mode == run_mode::project && in_graph_unembed && !random_baseline && !swap_enabled;
-    if (model_path.empty() || steps <= 0 || top <= 0 || epsilon <= 0.0f || swap_step < 0 || steer_start < 0 || steer_steps == 0 || steer_steps < -1 ||
+    const bool fused_projection = mode == run_mode::project && in_graph_unembed && !random_baseline && !swap_enabled && linear_readout_map_path.empty() && linear_readout_map_prefix.empty();
+    if (model_path.empty() || steps <= 0 || top <= 0 || epsilon <= 0.0f || swap_step < 0 || steer_start < 0 || steer_steps == 0 || steer_steps < -1 || linear_readout_layer < 0 ||
+        (!linear_readout_map_path.empty() && !linear_readout_map_prefix.empty()) ||
         (swap_enabled && track_text.empty()) ||
         (steering_enabled && (steer_source_texts.empty() || steer_target_texts.empty() || swap_enabled || (steer_edit_set && steer_sweep_set))) ||
         (!steering_enabled && (steer_edit_set || steer_sweep_set || steer_start != 0 || steer_steps >= 0))) {
@@ -1353,6 +1502,25 @@ int main(int argc, char ** argv) {
     cparams.n_seq_max = 1;
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) throw std::runtime_error("failed to create context");
+    std::vector<linear_readout_map> linear_readouts;
+    if (!linear_readout_map_path.empty()) {
+        if (linear_readout_layer >= (int) ctx->get_model().hparams.n_layer()) {
+            throw std::runtime_error("linear readout layer does not match the loaded model");
+        }
+        linear_readouts.resize(ctx->get_model().hparams.n_layer());
+        linear_readouts[linear_readout_layer] = linear_readout_map::load(linear_readout_map_path);
+        if (linear_readouts[linear_readout_layer].dimension != ctx->get_model().hparams.n_embd) {
+            throw std::runtime_error("linear readout map or layer does not match the loaded model");
+        }
+    } else if (!linear_readout_map_prefix.empty()) {
+        linear_readouts.resize(ctx->get_model().hparams.n_layer());
+        for (int layer = 0; layer < (int) linear_readouts.size(); ++layer) {
+            linear_readouts[layer] = linear_readout_map::load(linear_readout_map_prefix + std::to_string(layer) + ".rwkv-lrm");
+            if (linear_readouts[layer].dimension != ctx->get_model().hparams.n_embd) {
+                throw std::runtime_error("linear readout map does not match the loaded model");
+            }
+        }
+    }
     projection_workspace workspace;
     if (fused_projection) workspace = make_projection_workspace(ctx->get_model());
     const size_t prompt_decode_tokens = capture_prompt_last ? prompt_tokens.size() - 1 : prompt_tokens.size();
@@ -1404,23 +1572,8 @@ int main(int argc, char ** argv) {
         std::vector<std::string> trace_sources;
         std::vector<snapshot::raw_layer> baseline_raw;
         std::vector<std::vector<float>> baseline_state;
+        bool stopped_eog = false;
     const bool steering_this_run = steering_enabled && active_components != 0;
-    if (steering_this_run) {
-        std::printf("semantic steering (");
-        bool first_component = true;
-        for (steer_component component : { steer_r, steer_w, steer_k, steer_v, steer_a }) {
-            if (!(active_components & component)) continue;
-            std::printf("%s%s", first_component ? "" : ",", steer_component_name(component));
-            first_component = false;
-        }
-        std::printf(") at every layer for generation steps %d", steer_start);
-        if (steer_steps < 0) std::printf(" onward:");
-        else std::printf(" through %d:", steer_start + steer_steps - 1);
-        for (llama_token source : steer_source_tokens) std::printf(" %s", common_token_to_piece(vocab, source, true).c_str());
-        std::printf(" ->");
-        for (llama_token target : steer_target_tokens) std::printf(" %s", common_token_to_piece(vocab, target, true).c_str());
-        std::printf("\n");
-    }
     for (int step = 0; step < run_steps; ++step) {
         snapshot clean;
         step_result result;
@@ -1453,15 +1606,8 @@ int main(int argc, char ** argv) {
                     swap_k ? replacement.raw[best_layer].k : std::vector<float>(),
                     swap_k ? replacement.raw[best_layer].kk : std::vector<float>(),
                     swap_v ? replacement.raw[best_layer].v : std::vector<float>() });
-                const char * kind = swap_kind == swap_source::k ? "k" : swap_kind == swap_source::v ? "v" : "k+v";
-                std::printf("swap step %d: layer %d %s replaced from %s\n", step, best_layer, kind,
-                    common_token_to_piece(vocab, swap_tokens[0], true).c_str());
                 clean = run_snapshot(ctx, carrier, state, &patches);
-                if (swap_k) std::printf("swap k cosine to replacement: %.6f\n", cosine_similarity(clean.raw[best_layer].k, replacement.raw[best_layer].k));
-                if (swap_v) std::printf("swap v cosine to replacement: %.6f\n", cosine_similarity(clean.raw[best_layer].v, replacement.raw[best_layer].v));
             } else {
-                std::printf("swap step %d: no v source ranked %d or better for %s\n", step, top,
-                    common_token_to_piece(vocab, tracked_tokens[0], true).c_str());
                 clean = std::move(base);
             }
         } else {
@@ -1482,7 +1628,8 @@ int main(int argc, char ** argv) {
         const llama_token step_target = fixed_tracked_token != LLAMA_TOKEN_NULL ? fixed_tracked_token : greedy_token(clean.logits);
         if (mode == run_mode::project) {
             result.readouts = fused_projection ? summarize_projected_logits(ctx->get_model(), clean.projected_logits, project_sources, step_target, report_tokens, top) :
-                project_raw_vectors(ctx, clean.raw, project_sources, &baseline_raw, step_target, report_tokens, random_baseline, top);
+                project_raw_vectors(ctx, clean.raw, project_sources, &baseline_raw, step_target, report_tokens, random_baseline, top,
+                    linear_readouts.empty() ? nullptr : &linear_readouts);
         } else {
             result.readouts.reserve(clean.raw.size());
             for (int il = 0; il < (int) clean.raw.size(); ++il) {
@@ -1496,22 +1643,23 @@ int main(int argc, char ** argv) {
                 trace_sources.push_back(readout.source);
             }
         }
-        std::printf("step %d: %s -> %s\n", step,
-            common_token_to_piece(vocab, result.input, true).c_str(), common_token_to_piece(vocab, result.next, true).c_str());
         carrier = result.next;
         state = std::move(clean.next_state);
         trace.push_back(std::move(result));
+        if (until_eog && llama_vocab_is_eog(vocab, carrier)) {
+            stopped_eog = true;
+            break;
+        }
     }
     const std::string output_path = steer_sweep_set ? sweep_json_path(json_path, active_components) : json_path;
     const std::string trace_kind = steer_sweep_set ? (steering_this_run ? "rwkv_component_sweep" : "rwkv_raw_projection") :
         steering_enabled ? (steer_components == steer_default_components && steer_start == 0 && steer_steps < 0 ? "rwkv_kv_static_steer" : "rwkv_component_steer") :
-        swap_enabled ? "rwkv_kv_swap" : mode == run_mode::project ? "rwkv_raw_projection" : "rwkv_time_lens";
+        swap_enabled ? "rwkv_kv_swap" : !linear_readouts.empty() ? "rwkv_mapped_k_projection" : mode == run_mode::project ? "rwkv_raw_projection" : "rwkv_time_lens";
     write_trace(output_path, model_path, prompt, n_gpu_layers, top, trace_kind, trace_sources, tracked_token,
         steering_this_run ? steer_source_tokens : no_steer_tokens, steering_this_run ? steer_target_tokens : no_steer_tokens,
-        active_components, steer_start, steer_steps, report_tokens, forced_tokens.empty() ? "steps" : "forced_prefix", vocab, trace);
-    std::printf("trace=%s\n", output_path.c_str());
+        active_components, steer_start, steer_steps, report_tokens,
+        stopped_eog ? "eog" : forced_tokens.empty() ? "steps" : "forced_prefix", vocab, trace);
     }
-    std::printf("viewer=pocs/interp/rwkv_unembed_viewer.html\n");
     llama_free(ctx);
     llama_model_free(model);
     llama_backend_free();

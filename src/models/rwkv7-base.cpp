@@ -71,6 +71,7 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix(llm_graph_input_rs * in
     w = interp_rwkv_tap(w, "time", "w", il);
 
     ggml_tensor * k = build_lora_mm(layer.time_mix_key, xk);
+    k               = interp_rwkv_tap(k, "time", "k0", il);
     ggml_tensor * v = build_lora_mm(layer.time_mix_value, xv);
     if (first_layer_value == nullptr) {
         first_layer_value = v;
@@ -88,13 +89,15 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix(llm_graph_input_rs * in
         g = ggml_mul_mat(ctx0, layer.time_mix_g2, ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, layer.time_mix_g1, xg)));
         g = interp_rwkv_tap(g, "time", "g", il);
     }
-    ggml_tensor * a = ggml_sigmoid(
-        ctx0, ggml_add(ctx0, ggml_mul_mat(ctx0, layer.time_mix_a2, ggml_mul_mat(ctx0, layer.time_mix_a1, xa)),
-                       layer.time_mix_a0));
+    ggml_tensor * a_pre = ggml_add(
+        ctx0, ggml_mul_mat(ctx0, layer.time_mix_a2, ggml_mul_mat(ctx0, layer.time_mix_a1, xa)), layer.time_mix_a0);
+    a_pre = interp_rwkv_tap(a_pre, "time", "a_pre", il);
+    ggml_tensor * a = ggml_sigmoid(ctx0, a_pre);
     a = interp_rwkv_tap(a, "time", "a", il);
 
     ggml_tensor * kk = ggml_reshape_3d(ctx0, ggml_mul(ctx0, k, layer.time_mix_k_k), head_size, head_count, n_tokens);
     kk               = ggml_l2_norm(ctx0, kk, 1e-12);
+    kk               = interp_rwkv_tap(kk, "time", "kk", il);
 
     ggml_tensor * ka = ggml_mul(ctx0, k, layer.time_mix_k_a);
     k                = ggml_add(ctx0, k, ggml_sub(ctx0, ggml_mul(ctx0, a, ka), ka));

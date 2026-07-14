@@ -64,14 +64,22 @@
    const visibleSources = () => sortSources(trace.sources);
    const sourceReadout = (step, source) => step.readouts.find(readout => readout.source === source);
    const displayPiece = value => value === '' ? '[EOG]' : value.replace(/\n/g, '\\n').replace(/\t/g, '\\t');
-  const isPerturbation = () => trace.trace_kind === 'rwkv_perturbation';
-  const isTimeLens = () => trace.trace_kind === 'rwkv_time_lens';
-  const isRawProjection = () => trace.trace_kind === 'rwkv_raw_projection';
+   const isControlPiece = value => /^<[^>\n]+>$/.test(value);
+   const needsSentenceSpace = (previous, next) => previous && next && !/\s$/.test(previous) && !/^\s/.test(next) && /[.!?]$/.test(previous) && /^[A-Za-z0-9]/.test(next);
+   const visibleSteps = run => {
+     const controlIndex = run.steps.findIndex(step => isControlPiece(step.next.piece));
+     return controlIndex < 0 ? run.steps : run.steps.slice(0, controlIndex);
+   };
+   const isPerturbation = () => trace.trace_kind === 'rwkv_perturbation';
+   const isTimeLens = () => trace.trace_kind === 'rwkv_time_lens';
+   const isRawProjection = () => trace.trace_kind === 'rwkv_raw_projection';
+   const isLinearReadout = () => trace.trace_kind === 'rwkv_linear_readout';
+   const isMappedKProjection = () => trace.trace_kind === 'rwkv_mapped_k_projection';
 
-  function setStep(index) {
-    const steps = trace.runs[runIndex].steps;
-    layerScrollTop = document.querySelector('#layers')?.scrollTop ?? layerScrollTop;
-    stepIndex = Math.max(0, Math.min(index, steps.length - 1));
+   function setStep(index) {
+     const steps = visibleSteps(trace.runs[runIndex]);
+     layerScrollTop = document.querySelector('#layers')?.scrollTop ?? layerScrollTop;
+     stepIndex = Math.max(0, Math.min(index, steps.length - 1));
     render();
   }
 
@@ -82,35 +90,50 @@
     header.append(heading, details); return header;
   }
 
-  function render() {
-    const run = trace.runs[runIndex];
-    const step = run.steps[stepIndex];
-    const sources = visibleSources();
-    const workspace = document.createElement('div'); workspace.className = 'workspace';
+   function render() {
+     const run = trace.runs[runIndex];
+     const steps = visibleSteps(run);
+     const step = steps[stepIndex];
+     const sources = visibleSources();
+     const workspace = document.createElement('div'); workspace.className = 'workspace';
 
-    const transcript = document.createElement('section'); transcript.className = 'pane';
-    transcript.append(makeHeader(isPerturbation() ? 'Perturbation' : 'Generation', `${run.steps.length} ${isPerturbation() ? 'measurement' : 'tokens'} | ${run.stopped}`));
+     const transcript = document.createElement('section'); transcript.className = 'pane';
+      const transcriptTitle = isPerturbation() ? 'Perturbation' : isLinearReadout() ? 'Held-Out Activation' : 'Generation';
+      const transcriptMeta = isPerturbation() ? `${steps.length} measurement | ${run.stopped}` :
+        isLinearReadout() ? `${steps.length} independent samples | ${run.stopped}` : `${steps.length} tokens | ${run.stopped}`;
+      transcript.append(makeHeader(transcriptTitle, transcriptMeta));
     const chat = document.createElement('div'); chat.className = 'chat';
     const prompt = document.createElement('article'); prompt.className = 'bubble prompt'; prompt.innerHTML = '<span class="role">Prompt</span><div class="prompt-text"></div>';
     prompt.querySelector('.prompt-text').textContent = run.prompt; chat.append(prompt);
-    const answer = document.createElement('article'); answer.className = 'bubble answer'; answer.innerHTML = isPerturbation() ? '<span class="role">Clean continuation</span><div class="completion"></div><p class="hint">Inspect the signed final-logit derivatives for the selected raw source.</p>' : '<span class="role">Generated completion</span><div class="completion"></div><p class="hint">Click an emitted token to inspect the prior carrier token and all layer readouts.</p>';
-    const completion = answer.querySelector('.completion');
-    run.steps.forEach((item, index) => {
-      const token = document.createElement('button'); token.className = `emitted${index === stepIndex ? ' selected' : ''}`;
-      token.textContent = item.next.piece || '[EOG]'; token.title = `step ${index}: ${displayPiece(item.input.piece)} -> ${displayPiece(item.next.piece)}`;
-      token.onclick = () => setStep(index); completion.append(token);
-    });
-    if (run.stopped === 'eog') { const eog = document.createElement('span'); eog.className = 'eog'; eog.textContent = '[EOG]'; completion.append(eog); }
+     const answer = document.createElement('article'); answer.className = 'bubble answer'; answer.innerHTML = isPerturbation() ? '<span class="role">Clean continuation</span><div class="completion"></div><p class="hint">Inspect the signed final-logit derivatives for the selected raw source.</p>' : isLinearReadout() ? '<span class="role">Measured next token</span><div class="completion"></div><p class="hint">This is one independent held-out activation, not a generated continuation. Use sample navigation to compare its captured residual with its decoded K readout.</p>' : '<span class="role">Generated completion</span><div class="completion"></div><p class="hint">Click an emitted token to inspect the prior carrier token and all layer readouts.</p>';
+     const completion = answer.querySelector('.completion');
+     if (isLinearReadout()) {
+       const token = document.createElement('button'); token.className = 'emitted selected';
+       token.textContent = step.next.piece || '[EOG]'; token.title = `sample ${step.index}: ${displayPiece(step.input.piece)} -> ${displayPiece(step.next.piece)}`;
+       completion.append(token);
+     } else {
+       let previousPiece = '', stoppedAtControl = false;
+       steps.forEach((item, index) => {
+         if (stoppedAtControl) return;
+         if (needsSentenceSpace(previousPiece, item.next.piece)) completion.append(document.createTextNode(' '));
+         const token = document.createElement('button'); token.className = `emitted${index === stepIndex ? ' selected' : ''}`;
+         token.textContent = item.next.piece || '[EOG]'; token.title = `step ${index}: ${displayPiece(item.input.piece)} -> ${displayPiece(item.next.piece)}`;
+         token.onclick = () => setStep(index); completion.append(token);
+         previousPiece = item.next.piece;
+       });
+       if (steps.length < run.steps.length) { const control = document.createElement('span'); control.className = 'eog'; control.textContent = `[${run.steps[steps.length].next.piece}]`; control.title = 'Generation control token'; completion.append(control); stoppedAtControl = true; }
+       if (run.stopped === 'eog' && !stoppedAtControl) { const eog = document.createElement('span'); eog.textContent = '[EOG]'; completion.append(eog); }
+     }
     chat.append(answer); transcript.append(chat); workspace.append(transcript);
 
     const inspector = document.createElement('section'); inspector.className = 'pane inspector';
-    inspector.append(makeHeader(isPerturbation() ? 'Raw-Source Token Derivatives' : isTimeLens() ? 'All-Layer Time-Mix Lens' : isRawProjection() ? 'All Raw Vector Projections' : `All-Layer ${sourceKind(sources[0])}`, `${sources.length} ${isPerturbation() ? 'signed readouts' : 'sources'} | top ${trace.top_k}`));
+    inspector.append(makeHeader(isPerturbation() ? 'Raw-Source Token Derivatives' : isTimeLens() ? 'All-Layer Time-Mix Lens' : isMappedKProjection() ? 'Mapped K And Residual Projections' : isRawProjection() ? 'All Raw Vector Projections' : `All-Layer ${sourceKind(sources[0])}`, `${sources.length} ${isPerturbation() ? 'signed readouts' : 'sources'} | top ${trace.top_k}`));
     const selected = document.createElement('div'); selected.className = 'selected-summary';
-    const line = document.createElement('strong'); line.textContent = `Step ${step.index}: ${displayPiece(step.input.piece)} -> ${displayPiece(step.next.piece)}`;
+     const line = document.createElement('strong'); line.textContent = `${isLinearReadout() ? 'Sample' : 'Step'} ${step.index}: ${displayPiece(step.input.piece)} -> ${displayPiece(step.next.piece)}`;
     const tracked = trace.tracked_token ? ` Card headers show cosine to the first measured vector and # rank for ${displayPiece(trace.tracked_token.piece)}.` : ' Card headers show cosine to the first measured vector and # rank for that step\'s emitted next token.';
-    const note = document.createElement('p'); note.textContent = isPerturbation() ? 'Scores are signed central derivatives of final logits with respect to the native source perturbation. Positive and negative cards are sorted independently.' : isTimeLens() ? `Each card perturbs ${sourceKind(sources[0])}, runs its native downstream time-mix closure and channel mix, then applies an output-head lens. These are local diagnostic readouts, not causal final logits.` : isRawProjection() ? `Each raw vector is independently passed through the native output normalization and output matrix. This is an intrinsic alignment screen, not a causal final-logit measurement.${tracked}` : `Readouts are from the carrier activation that produced the selected emitted token. Final-residual round-trip error: ${step.final_round_trip_error.toExponential(3)}.`;
+     const note = document.createElement('p'); note.textContent = isPerturbation() ? 'Scores are signed central derivatives of final logits with respect to the native source perturbation. Positive and negative cards are sorted independently.' : isLinearReadout() ? 'The first card at each layer is the captured residual and the second is the learned K decode for this one held-out state. Each card rank is against that layer residual\'s own top token. This is not part of a text sequence.' : isMappedKProjection() ? `At every layer, time.k is replaced only for this projection by its learned residual-space decode; resid.out is the captured same-step residual. K-card cosine is mapped residual versus captured resid.out. Generation is unmodified.${tracked}` : isTimeLens() ? `Each card perturbs ${sourceKind(sources[0])}, runs its native downstream time-mix closure and channel mix, then applies an output-head lens. These are local diagnostic readouts, not causal final logits.` : isRawProjection() ? `Each raw vector is independently passed through the native output normalization and output matrix. This is an intrinsic alignment screen, not a causal final-logit measurement.${tracked}` : `Readouts are from the carrier activation that produced the selected emitted token. Final-residual round-trip error: ${step.final_round_trip_error.toExponential(3)}.`;
     const nav = document.createElement('div'); nav.className = 'token-nav';
-    [['Previous', stepIndex - 1], ['Next', stepIndex + 1]].forEach(([label, target]) => { const button = document.createElement('button'); button.textContent = label; button.disabled = target < 0 || target >= run.steps.length; button.onclick = () => setStep(target); nav.append(button); });
+     [[isLinearReadout() ? 'Previous sample' : 'Previous', stepIndex - 1], [isLinearReadout() ? 'Next sample' : 'Next', stepIndex + 1]].forEach(([label, target]) => { const button = document.createElement('button'); button.textContent = label; button.disabled = target < 0 || target >= steps.length; button.onclick = () => setStep(target); nav.append(button); });
     selected.append(line, note, nav); inspector.append(selected);
     const grid = document.createElement('div'); grid.id = 'layers';
     const sourcesByLayer = new Map();
@@ -125,7 +148,7 @@
       layerSources.forEach(source => {
         const readout = sourceReadout(step, source); const row = document.createElement('div'); row.className = 'source-row';
         const sourceLabel = document.createElement('div'); sourceLabel.className = 'source-label';
-        const kind = document.createElement('strong'); kind.textContent = sourceKind(source); sourceLabel.append(kind);
+         const kind = document.createElement('strong'); kind.textContent = isMappedKProjection() && source.endsWith('.time.k') ? 'time.k -> resid.out' : sourceKind(source); sourceLabel.append(kind);
         const cosine = Number.isFinite(readout?.baseline_cosine) ? `  cos ${readout.baseline_cosine.toFixed(3)}` : '';
         const target = Number.isInteger(readout?.target_rank) ? `  #${readout.target_rank}` : '';
         const random = Number.isInteger(readout?.random_target_rank) ? `  rnd#${readout.random_target_rank}` : '';

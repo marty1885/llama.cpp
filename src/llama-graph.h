@@ -861,6 +861,8 @@ public:
         ggml_tensor * tensor;
         llama_interp_activation_set * dst;
         bool f32;
+        // Host readback is allowed only from an explicit graph-owned duplicate.
+        bool is_snapshot;
     };
 
     std::vector<interp_capture> interp_captures;

@@ -1282,6 +1282,11 @@ static void interp_collect_captures(ggml_backend_sched_t sched, const llm_graph_
         if (!cap.dst || !cap.tensor) {
             continue;
         }
+        // GGML may reuse intermediate buffers after their consumers run. Never read back a
+        // live intermediate: capture registration must provide an explicit ggml_dup output.
+        if (!cap.is_snapshot || cap.tensor->op != GGML_OP_DUP) {
+            GGML_ABORT("interp capture is not a materialized snapshot");
+        }
 
         llama_interp_activation out;
         out.name = cap.name;

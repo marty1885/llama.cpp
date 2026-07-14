@@ -9,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -16,9 +17,7 @@
 
 namespace {
 
-std::string activation_name(int layer, const char * name) {
-    return "rwkv.layer." + std::to_string(layer) + "." + name;
-}
+void quiet_llama_logs(ggml_log_level, const char *, void *) {}
 
 uint64_t splitmix64(uint64_t value) {
     value += 0x9e3779b97f4a7c15ULL;
@@ -27,57 +26,42 @@ uint64_t splitmix64(uint64_t value) {
     return value ^ (value >> 31);
 }
 
-llama_interp::task<> prefill_state(
-        llama_interp::runtime & rt,
-        const llama_interp::rwkv_state & initial,
-        const std::vector<llama_token> & tokens,
-        llama_interp::rwkv_state & out) {
-    out = co_await rt.prefill_tokens(initial, tokens);
-}
-
-llama_interp::task<> capture_step(
-        llama_interp::runtime & rt,
+llama_interp::task<> capture_token(
+        llama_interp::runtime & runtime,
         const llama_interp::rwkv_state & before,
         llama_token token,
-        const std::vector<std::string> * names,
-        llama_interp::rwkv_state & out,
+        const std::vector<std::string> & taps,
+        bool request_captures,
+        llama_interp::rwkv_state & after,
         llama_interp::activation_set & captures) {
-    auto path = rt.prefill_tokens(before, { token });
-    if (names) {
-        for (const auto & name : *names) {
-            path.capture_f16("^" + name + "$", captures);
-        }
+    auto call = runtime.prefill_tokens(before, { token });
+    if (request_captures) {
+        for (const std::string & tap : taps) call.capture_f16("^" + tap + "$", captures);
     }
-    out = co_await path;
+    after = co_await call;
 }
 
-llama_interp::task<> capture_generated_step(
-        llama_interp::runtime & rt,
-        const llama_interp::rwkv_state & before,
-        const std::vector<std::string> & names,
-        llama_interp::decode_result & out,
-        llama_interp::activation_set & captures) {
-    auto path = rt.decode(before, 1);
-    for (const auto & name : names) {
-        path.capture_f16("^" + name + "$", captures);
-    }
-    out = co_await path;
+llama_interp::task<> prefill_state(
+        llama_interp::runtime & runtime,
+        const llama_interp::rwkv_state & initial,
+        const std::vector<llama_token> & tokens,
+        llama_interp::rwkv_state & output) {
+    output = co_await runtime.prefill_tokens(initial, tokens);
 }
 
-struct pending_capture {
-    llama_interp::rwkv_state before;
+struct pending_sample {
+    llama_interp::rwkv_state state;
     llama_token token;
     rwkv_activation_store::sample_metadata metadata;
 };
 
 void usage(const char * argv0) {
     std::fprintf(stderr,
-        "usage: %s -m MODEL --corpus FILE --output FILE [--max-samples N] [--positions-per-line N] [--generation-steps N] [--all-layers] [--prompt-stride N] [--capture-batch N] [--seed N] [-ngl N]\n"
+        "usage: %s -m MODEL --corpus FILE --output FILE --tap FULL_NAME [--tap FULL_NAME ...] [--max-samples N] [--positions-per-line N] [--prompt-stride N] [--capture-batch N] [--commit-rows N] [--seed N] [-ngl N]\n"
         "\n"
-        "Streams deterministic, context-bearing token positions from each corpus line into\n"
-        "a ROOT RNTuple. --generation-steps records greedy trajectories using only layer-60\n"
-        "time.k and resid.out by default, or those pairs at every layer with --all-layers.\n"
-        "--prompt-stride selects evenly spaced corpus prompts.\n",
+        "Captures named, same-width RWKV graph taps at context-bearing corpus positions into a\n"
+        "ROOT RNTuple. Taps must be exact names such as rwkv.layer.60.resid.out. Captures are\n"
+        "materialized snapshots in the production GGML graph before host readback.\n",
         argv0);
 }
 
@@ -85,67 +69,55 @@ void usage(const char * argv0) {
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
+    llama_log_set(quiet_llama_logs, nullptr);
 
     std::string model_path;
     std::string corpus_path;
     std::string output_path;
+    std::vector<std::string> taps;
     int n_gpu_layers = 0;
     uint64_t max_samples = 1500;
     uint32_t positions_per_line = 1;
-    uint32_t generation_steps = 0;
     uint32_t prompt_stride = 1;
-    bool all_layers = false;
     uint32_t capture_batch = 4;
+    uint64_t commit_rows = 16;
     uint64_t seed = 17;
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
-            model_path = argv[++i];
-        } else if (std::strcmp(argv[i], "--corpus") == 0 && i + 1 < argc) {
-            corpus_path = argv[++i];
-        } else if (std::strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
-            output_path = argv[++i];
-        } else if (std::strcmp(argv[i], "--max-samples") == 0 && i + 1 < argc) {
-            max_samples = std::strtoull(argv[++i], nullptr, 10);
-        } else if (std::strcmp(argv[i], "--positions-per-line") == 0 && i + 1 < argc) {
-            positions_per_line = std::strtoul(argv[++i], nullptr, 10);
-        } else if (std::strcmp(argv[i], "--generation-steps") == 0 && i + 1 < argc) {
-            generation_steps = std::strtoul(argv[++i], nullptr, 10);
-        } else if (std::strcmp(argv[i], "--all-layers") == 0) {
-            all_layers = true;
-        } else if (std::strcmp(argv[i], "--prompt-stride") == 0 && i + 1 < argc) {
-            prompt_stride = std::strtoul(argv[++i], nullptr, 10);
-        } else if (std::strcmp(argv[i], "--capture-batch") == 0 && i + 1 < argc) {
-            capture_batch = std::strtoul(argv[++i], nullptr, 10);
-        } else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
-            seed = std::strtoull(argv[++i], nullptr, 10);
-        } else if (std::strcmp(argv[i], "-ngl") == 0 && i + 1 < argc) {
-            n_gpu_layers = std::atoi(argv[++i]);
-        } else {
+        if (std::strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
+        else if (std::strcmp(argv[i], "--corpus") == 0 && i + 1 < argc) corpus_path = argv[++i];
+        else if (std::strcmp(argv[i], "--output") == 0 && i + 1 < argc) output_path = argv[++i];
+        else if (std::strcmp(argv[i], "--tap") == 0 && i + 1 < argc) taps.emplace_back(argv[++i]);
+        else if (std::strcmp(argv[i], "--max-samples") == 0 && i + 1 < argc) max_samples = std::strtoull(argv[++i], nullptr, 10);
+        else if (std::strcmp(argv[i], "--positions-per-line") == 0 && i + 1 < argc) positions_per_line = std::strtoul(argv[++i], nullptr, 10);
+        else if (std::strcmp(argv[i], "--prompt-stride") == 0 && i + 1 < argc) prompt_stride = std::strtoul(argv[++i], nullptr, 10);
+        else if (std::strcmp(argv[i], "--capture-batch") == 0 && i + 1 < argc) capture_batch = std::strtoul(argv[++i], nullptr, 10);
+        else if (std::strcmp(argv[i], "--commit-rows") == 0 && i + 1 < argc) commit_rows = std::strtoull(argv[++i], nullptr, 10);
+        else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) seed = std::strtoull(argv[++i], nullptr, 10);
+        else if (std::strcmp(argv[i], "-ngl") == 0 && i + 1 < argc) n_gpu_layers = std::atoi(argv[++i]);
+        else {
             usage(argv[0]);
             return 1;
         }
     }
-    if (model_path.empty() || corpus_path.empty() || output_path.empty() || max_samples == 0 || positions_per_line == 0 || prompt_stride == 0 || capture_batch == 0 || (all_layers && !generation_steps)) {
+    std::sort(taps.begin(), taps.end());
+    const bool duplicate_taps = std::adjacent_find(taps.begin(), taps.end()) != taps.end();
+    if (model_path.empty() || corpus_path.empty() || output_path.empty() || taps.empty() || duplicate_taps ||
+        max_samples == 0 || positions_per_line == 0 || prompt_stride == 0 || capture_batch == 0 || commit_rows == 0) {
         usage(argv[0]);
         return 1;
     }
+
     std::ifstream corpus(corpus_path);
-    if (!corpus) {
-        throw std::runtime_error("failed to open corpus: " + corpus_path);
-    }
+    if (!corpus) throw std::runtime_error("failed to open corpus: " + corpus_path);
     const std::filesystem::path output(output_path);
-    if (!output.parent_path().empty()) {
-        std::filesystem::create_directories(output.parent_path());
-    }
+    if (!output.parent_path().empty()) std::filesystem::create_directories(output.parent_path());
 
     ggml_backend_load_all();
     llama_backend_init();
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = n_gpu_layers;
     llama_model * model = llama_model_load_from_file(model_path.c_str(), model_params);
-    if (!model) {
-        throw std::runtime_error("failed to load model");
-    }
+    if (!model) throw std::runtime_error("failed to load model");
     const llama_vocab * vocab = llama_model_get_vocab(model);
     llama_context_params context_params = llama_context_default_params();
     context_params.n_ctx = 512;
@@ -153,183 +125,106 @@ int main(int argc, char ** argv) {
     context_params.n_ubatch = 512;
     context_params.n_seq_max = capture_batch;
     llama_context * ctx = llama_init_from_model(model, context_params);
-    if (!ctx) {
-        llama_model_free(model);
-        throw std::runtime_error("failed to create context");
-    }
+    if (!ctx) throw std::runtime_error("failed to create context");
 
-    llama_interp::runtime rt(ctx, capture_batch);
-    const auto initial = rt.make_state();
-    if (initial.n_embd_r / 2 != rwkv_activation_store::k_default_dimension) {
-        throw std::runtime_error("collector currently requires 4096-dimensional RWKV activations");
-    }
-    const std::vector<const char *> known_taps = {
-        "resid.in", "att.norm",
-        "time.r", "time.w", "time.k", "time.v", "time.a", "time.a_pre", "time.g", "time.k0", "time.kk", "time.wkv", "time.rkv", "time.out",
-        "resid.time", "ffn.norm", "channel.out", "resid.out",
-    };
-    std::vector<std::string> names;
-    if (generation_steps) {
-        const int first_layer = all_layers ? 0 : (int) initial.n_layer - 1;
-        for (int layer = first_layer; layer < (int) initial.n_layer; ++layer) {
-            names.push_back(activation_name(layer, "time.k"));
-            names.push_back(activation_name(layer, "resid.out"));
-        }
-    } else {
-        for (int layer = 0; layer < (int) initial.n_layer; ++layer) {
-            for (const char * activation : known_taps) {
-                names.push_back(activation_name(layer, activation));
-            }
-        }
-    }
-
-    auto writer = rwkv_activation_store::activation_dataset_writer::create(output_path, names);
+    llama_interp::runtime runtime(ctx, capture_batch);
+    const llama_interp::rwkv_state initial = runtime.make_state();
+    std::unique_ptr<rwkv_activation_store::activation_dataset_writer> writer;
+    std::vector<pending_sample> pending;
+    pending.reserve(capture_batch);
     const auto started = std::chrono::steady_clock::now();
     uint64_t corpus_line = 0;
     uint64_t sample_id = 0;
-    std::vector<pending_capture> pending;
-    pending.reserve(capture_batch);
-    std::string prompt;
-    auto flush_pending = [&] {
-        if (pending.empty()) {
-            return;
-        }
+    uint64_t since_commit = 0;
+
+    const auto flush = [&] {
+        if (pending.empty()) return;
         llama_interp::activation_set captures;
         std::vector<llama_interp::rwkv_state> after(pending.size());
-        std::vector<llama_interp::task<>> tasks;
-        tasks.reserve(pending.size());
+        std::vector<llama_interp::task<>> calls;
+        calls.reserve(pending.size());
         for (size_t i = 0; i < pending.size(); ++i) {
-            tasks.emplace_back(capture_step(rt, pending[i].before, pending[i].token, i == 0 ? &names : nullptr, after[i], captures));
+            calls.emplace_back(capture_token(runtime, pending[i].state, pending[i].token, taps, i == 0, after[i], captures));
         }
-        rt.run();
-        for (const auto & task : tasks) {
-            task.rethrow_if_failed();
-        }
+        runtime.run();
+        for (const auto & call : calls) call.rethrow_if_failed();
 
         std::unordered_map<std::string, const llama_interp_activation *> by_name;
-        by_name.reserve(captures.size());
-        for (const auto & item : captures) {
-            if (!item.data.empty()) {
-                by_name[item.name] = &item;
+        for (const auto & capture : captures) {
+            if (!capture.data.empty() && !by_name.emplace(capture.name, &capture).second) {
+                throw std::runtime_error("duplicate capture: " + capture.name);
             }
         }
+        size_t dimension = 0;
+        for (const std::string & tap : taps) {
+            const auto found = by_name.find(tap);
+            if (found == by_name.end() || found->second->data.size() % pending.size() != 0) {
+                throw std::runtime_error("missing or malformed capture: " + tap);
+            }
+            const size_t tap_dimension = found->second->data.size() / pending.size();
+            if (tap_dimension == 0 || (dimension != 0 && tap_dimension != dimension)) {
+                throw std::runtime_error("selected taps do not have one shared vector width");
+            }
+            dimension = tap_dimension;
+        }
+        if (!writer) writer = std::make_unique<rwkv_activation_store::activation_dataset_writer>(
+            rwkv_activation_store::activation_dataset_writer::create(output_path, taps, dimension));
+
         for (size_t sample = 0; sample < pending.size(); ++sample) {
             std::vector<std::span<const ggml_fp16_t>> activations;
-            activations.reserve(names.size());
-            for (const auto & name : names) {
-                const auto found = by_name.find(name);
-                if (found == by_name.end()) {
-                    throw std::runtime_error("missing batched activation capture: " + name);
-                }
-                const auto & captured = *found->second;
-                if (captured.data.size() != pending.size() * rwkv_activation_store::k_default_dimension) {
-                    throw std::runtime_error("malformed batched activation capture: " + name +
-                        " shape=" + std::to_string(captured.shape[0]) + "x" + std::to_string(captured.shape[1]) +
-                        " values=" + std::to_string(captured.data.size()));
-                }
-                const auto & data = captured.data;
-                activations.emplace_back(data.data() + sample * rwkv_activation_store::k_default_dimension,
-                    rwkv_activation_store::k_default_dimension);
+            activations.reserve(taps.size());
+            for (const std::string & tap : taps) {
+                const auto & values = by_name.at(tap)->data;
+                activations.emplace_back(values.data() + sample * dimension, dimension);
             }
-            writer.append(pending[sample].metadata, activations);
+            writer->append(pending[sample].metadata, activations);
             ++sample_id;
+            ++since_commit;
         }
         pending.clear();
-        if (sample_id % 16 == 0 || sample_id == max_samples) {
-            writer.commit();
+        if (since_commit >= commit_rows || sample_id == max_samples) {
+            writer->commit();
+            since_commit = 0;
             const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             const double rate = sample_id / std::max(elapsed, 1e-9);
-            const double remaining = (max_samples - sample_id) / rate;
-            std::printf("progress=%llu/%llu %.1f%% corpus_line=%llu rate=%.3f samples/s elapsed=%.0fs eta=%.0fs\n",
-                (unsigned long long) sample_id,
-                (unsigned long long) max_samples,
-                100.0 * sample_id / max_samples,
-                (unsigned long long) corpus_line,
-                rate,
-                elapsed,
-                remaining);
+            std::printf("progress=%llu/%llu %.1f%% corpus_line=%llu rate=%.3f samples/s\n",
+                (unsigned long long) sample_id, (unsigned long long) max_samples, 100.0 * sample_id / max_samples,
+                (unsigned long long) corpus_line, rate);
             std::fflush(stdout);
         }
     };
+
+    std::string prompt;
     while (sample_id + pending.size() < max_samples && std::getline(corpus, prompt)) {
         ++corpus_line;
-        if (prompt.empty()) {
-            continue;
-        }
-        if (corpus_line % prompt_stride != 1 % prompt_stride) {
-            continue;
-        }
-        const auto tokens = common_tokenize(vocab, prompt, false, true);
-        if (tokens.empty()) {
-            continue;
-        }
-        if (generation_steps) {
-            llama_interp::rwkv_state state = initial;
-            auto prefill = prefill_state(rt, initial, tokens, state);
-            rt.run();
-            prefill.rethrow_if_failed();
-            for (uint32_t step = 0; step < generation_steps && sample_id < max_samples; ++step) {
-                llama_interp::activation_set captures;
-                llama_interp::decode_result decoded;
-                auto capture = capture_generated_step(rt, state, names, decoded, captures);
-                rt.run();
-                capture.rethrow_if_failed();
-                if (decoded.tokens.size() != 1) {
-                    throw std::runtime_error("generated capture did not produce one token");
-                }
-                std::unordered_map<std::string, const llama_interp_activation *> by_name;
-                for (const auto & item : captures) {
-                    if (!item.data.empty()) by_name[item.name] = &item;
-                }
-                std::vector<std::span<const ggml_fp16_t>> activations;
-                activations.reserve(names.size());
-                for (const auto & name : names) {
-                    const auto found = by_name.find(name);
-                    if (found == by_name.end() || found->second->data.size() != rwkv_activation_store::k_default_dimension) {
-                        throw std::runtime_error("missing generated activation capture: " + name);
-                    }
-                    activations.emplace_back(found->second->data.data(), rwkv_activation_store::k_default_dimension);
-                }
-                writer.append({ sample_id, corpus_line, (int32_t) step, decoded.tokens[0], (int32_t) tokens.size() }, activations);
-                ++sample_id;
-                state = std::move(decoded.state);
-            }
-            if (sample_id % 16 == 0 || sample_id == max_samples) {
-                writer.commit();
-                const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-                const double rate = sample_id / std::max(elapsed, 1e-9);
-                const double remaining = (max_samples - sample_id) / rate;
-                std::printf("progress=%llu/%llu %.1f%% corpus_line=%llu rate=%.3f samples/s elapsed=%.0fs eta=%.0fs\n",
-                    (unsigned long long) sample_id, (unsigned long long) max_samples, 100.0 * sample_id / max_samples,
-                    (unsigned long long) corpus_line, rate, elapsed, remaining);
-                std::fflush(stdout);
-            }
-            continue;
-        }
-        const size_t first_context_position = std::min<size_t>(8, tokens.size() - 1);
-        const size_t range = tokens.size() - first_context_position;
+        if (prompt.empty() || corpus_line % prompt_stride != 1 % prompt_stride) continue;
+        const std::vector<llama_token> tokens = common_tokenize(vocab, prompt, false, true);
+        if (tokens.empty()) continue;
+        const size_t first_position = std::min<size_t>(8, tokens.size() - 1);
+        const size_t range = tokens.size() - first_position;
         const size_t positions = std::min<size_t>(positions_per_line, range);
         const size_t first_offset = splitmix64(seed ^ corpus_line) % range;
         for (size_t offset = 0; offset < positions && sample_id + pending.size() < max_samples; ++offset) {
-            const size_t position = first_context_position + (first_offset + offset) % range;
-            llama_interp::rwkv_state before = initial;
+            const size_t position = first_position + (first_offset + offset) % range;
+            llama_interp::rwkv_state state = initial;
             if (position > 0) {
-                auto prefix = prefill_state(rt, initial, std::vector<llama_token>(tokens.begin(), tokens.begin() + position), before);
-                rt.run();
+                auto prefix = prefill_state(runtime, initial, std::vector<llama_token>(tokens.begin(), tokens.begin() + position), state);
+                runtime.run();
                 prefix.rethrow_if_failed();
             }
-            pending.push_back({
-                std::move(before),
-                tokens[position],
-                { sample_id + pending.size(), corpus_line, (int32_t) position, tokens[position], (int32_t) tokens.size() },
-            });
-            if (pending.size() == capture_batch) {
-                flush_pending();
-            }
+            pending.push_back({ std::move(state), tokens[position],
+                { sample_id + pending.size(), corpus_line, (int32_t) position, tokens[position], (int32_t) tokens.size() } });
+            if (pending.size() == capture_batch) flush();
         }
     }
-    flush_pending();
-    writer.commit();
+    flush();
+    if (!writer) throw std::runtime_error("corpus produced no capture samples");
+    writer->commit();
+    writer.reset();
+    const auto saved = rwkv_activation_store::activation_dataset_reader::open(output_path);
+    if (saved.entries() != sample_id || saved.sources() != taps || saved.dimension() == 0) {
+        throw std::runtime_error("ROOT capture verification failed");
+    }
     std::printf("wrote=%s samples=%llu\n", output_path.c_str(), (unsigned long long) sample_id);
     llama_free(ctx);
     llama_model_free(model);

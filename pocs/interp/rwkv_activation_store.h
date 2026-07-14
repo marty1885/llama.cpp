@@ -12,8 +12,6 @@
 
 namespace rwkv_activation_store {
 
-constexpr size_t k_default_dimension = 4096;
-
 struct sample_metadata {
     uint64_t sample_id;
     uint64_t corpus_line;
@@ -28,20 +26,12 @@ struct source_batch {
     size_t dimension;
 };
 
-struct centroid {
-    uint32_t source_index;
-    uint32_t k;
-    uint32_t cluster;
-    uint64_t count;
-    std::vector<float> values;
-};
-
 class activation_dataset_writer {
 public:
     static activation_dataset_writer create(
             const std::string & path,
             std::vector<std::string> sources,
-            size_t dimension = k_default_dimension);
+            size_t dimension);
 
     activation_dataset_writer(activation_dataset_writer &&) noexcept;
     activation_dataset_writer & operator=(activation_dataset_writer &&) noexcept;
@@ -61,7 +51,7 @@ private:
 
 class activation_dataset_reader {
 public:
-    static activation_dataset_reader open(const std::string & path, std::vector<std::string> sources);
+    static activation_dataset_reader open(const std::string & path);
 
     activation_dataset_reader(activation_dataset_reader &&) noexcept;
     activation_dataset_reader & operator=(activation_dataset_reader &&) noexcept;
@@ -72,6 +62,7 @@ public:
 
     uint64_t entries() const;
     size_t dimension() const;
+    const std::vector<std::string> & sources() const;
     void for_each_source_batch(
             size_t source_index,
             size_t max_rows,
@@ -80,27 +71,6 @@ public:
 private:
     struct impl;
     explicit activation_dataset_reader(std::unique_ptr<impl> impl);
-    std::unique_ptr<impl> impl_;
-};
-
-void write_centroids(const std::string & path, const std::vector<centroid> & centroids, size_t dimension);
-
-class centroid_store_reader {
-public:
-    static centroid_store_reader open(const std::string & path);
-
-    centroid_store_reader(centroid_store_reader &&) noexcept;
-    centroid_store_reader & operator=(centroid_store_reader &&) noexcept;
-    ~centroid_store_reader();
-
-    centroid_store_reader(const centroid_store_reader &) = delete;
-    centroid_store_reader & operator=(const centroid_store_reader &) = delete;
-
-    std::vector<centroid> read_source(uint32_t source_index, uint32_t k) const;
-
-private:
-    struct impl;
-    explicit centroid_store_reader(std::unique_ptr<impl> impl);
     std::unique_ptr<impl> impl_;
 };
 

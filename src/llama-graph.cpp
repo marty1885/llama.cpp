@@ -1485,6 +1485,7 @@ ggml_tensor * llm_graph_context::interp_rwkv_tap(
                     snapshot,
                     spec.dst,
                     spec.f32,
+                    true,
                 });
             }
         }
@@ -1530,6 +1531,7 @@ ggml_tensor * llm_graph_context::interp_rwkv_tap(
                     snapshot,
                     spec.dst,
                     spec.f32,
+                    true,
                 });
             }
         }

@@ -1540,6 +1540,17 @@ ggml_tensor * llm_graph_context::interp_rwkv_tap(
     return cur;
 }
 
+void llm_graph_context::interp_rwkv_record_k0(ggml_tensor * cur, int il) const {
+    const llama_interp_request * req = cparams.interp_request;
+    if (req == nullptr || req->layerwise_readouts.empty()) {
+        return;
+    }
+    if ((size_t) il >= interp_rwkv_k0.size()) {
+        interp_rwkv_k0.resize(il + 1, nullptr);
+    }
+    interp_rwkv_k0[il] = cur;
+}
+
 ggml_tensor * llm_graph_context::build_cvec(
          ggml_tensor * cur,
                  int   il) const {

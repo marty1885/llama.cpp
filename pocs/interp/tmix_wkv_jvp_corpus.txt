@@ -1,0 +1,18 @@
+# Small hand-audited context set for the normalized-WKV local logit lens.
+# Each line is independently prefixed from an empty RWKV state.
+The capital of France is
+The capital of Germany is
+The capital of Japan is
+The capital of Italy is
+The largest planet in our solar system is
+The first month of the year is
+The author of Hamlet was
+The chemical symbol for water is
+Two plus two equals
+The opposite of hot is
+A triangle has
+The quick brown fox jumps over the
+Once upon a time there was a
+In the morning, I drink
+If it rains, the ground becomes
+A cat is an animal that

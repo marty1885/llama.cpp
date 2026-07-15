@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RWKV Generation Lens Viewer</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --page: #121619;
+    --panel: #1a2024;
+    --panel-raised: #20282d;
+    --ink: #edf0e9;
+    --muted: #9ba8a5;
+    --rule: #39444a;
+    --accent: #d7a842;
+    --accent-ink: #1b1710;
+    --prompt: #b9cad0;
+    --danger: #f1a096;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--page); color: var(--ink); font: 15px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  button { font: inherit; }
+  .masthead { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 18px clamp(18px, 4vw, 48px); border-bottom: 1px solid var(--rule); }
+  h1 { margin: 0; font: 700 19px/1.15 Georgia, serif; letter-spacing: .02em; }
+  .subtitle, .status { color: var(--muted); font-size: 12px; }
+  .file-button { cursor: pointer; border: 0; border-radius: 3px; padding: 10px 14px; background: var(--accent); color: var(--accent-ink); font-weight: 800; white-space: nowrap; }
+  .file-button:hover, .file-button:focus-visible { outline: 2px solid #fff3c9; outline-offset: 2px; background: #ecc05d; }
+  #file-input { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; }
+  .empty { min-height: calc(100vh - 84px); display: grid; place-items: center; padding: 28px; }
+  .empty-card { max-width: 620px; padding: 34px; border: 1px dashed #57666c; background: var(--panel); }
+  .empty-card h2 { font: 600 28px/1.15 Georgia, serif; margin: 0 0 14px; }
+  .empty-card p { color: var(--muted); margin: 0 0 20px; }
+  .empty-card .file-button { display: inline-block; }
+  .workbench { display: grid; grid-template-columns: minmax(320px, 43%) minmax(420px, 1fr); height: calc(100vh - 84px); min-height: 0; overflow: hidden; }
+  .transcript-pane { min-height: 0; padding: clamp(20px, 3vw, 42px); overflow: auto; border-right: 1px solid var(--rule); }
+  .results-pane { min-height: 0; padding: clamp(20px, 3vw, 42px); overflow: auto; }
+  .eyebrow { color: var(--accent); font-size: 11px; font-weight: 800; letter-spacing: .13em; text-transform: uppercase; }
+  .document-title { margin: 6px 0 4px; font: 600 24px/1.2 Georgia, serif; overflow-wrap: anywhere; }
+  .source { margin: 0 0 24px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+  .message { border-left: 3px solid var(--rule); padding: 13px 16px; margin: 16px 0; background: #171d21; }
+  .message.generated { border-left-color: var(--accent); background: #1c2225; }
+  .message-label { display: block; margin-bottom: 8px; color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: .11em; text-transform: uppercase; }
+  .prompt-text { color: var(--prompt); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .token-stream { white-space: normal; overflow-wrap: anywhere; }
+  .token { cursor: pointer; display: inline; border: 0; border-radius: 2px; padding: 2px 0; background: transparent; color: inherit; font: inherit; white-space: pre-wrap; }
+  .token:hover, .token:focus-visible { background: #394145; outline: none; }
+  .token.selected { background: var(--accent); color: var(--accent-ink); box-shadow: 0 0 0 2px var(--accent); }
+  .alignment { margin: 16px 0 0; padding: 10px 12px; border: 1px solid var(--rule); color: var(--muted); font-size: 12px; }
+  .alignment.warning { border-color: #8e7050; color: #e3c49a; }
+  .result-header { border-bottom: 1px solid var(--rule); padding-bottom: 16px; margin-bottom: 20px; }
+  .result-header h2 { margin: 4px 0; font: 600 23px/1.2 Georgia, serif; }
+  .selected-token { display: inline-block; max-width: 100%; padding: 3px 6px; background: #354045; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .layer { margin: 0 0 18px; border: 1px solid var(--rule); background: var(--panel); }
+  .layer-title { margin: 0; padding: 9px 13px; border-bottom: 1px solid var(--rule); background: var(--panel-raised); color: var(--accent); font-size: 13px; }
+  .lens-row { display: flex; gap: 1px; overflow-x: auto; background: #303a3f; }
+  .lens { flex: 1 0 290px; padding: 13px; background: var(--panel); }
+  .lens-name { margin: 0 0 10px; font-size: 13px; overflow-wrap: anywhere; }
+  .logit-grid { display: flex; flex-wrap: wrap; gap: 6px; }
+  .logit-chip { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: baseline; gap: 6px; max-width: 100%; padding: 5px 7px; border: 1px solid #3b474d; background: #192024; font-size: 12px; }
+  .rank, .value { white-space: nowrap; color: var(--muted); }
+  .value { color: #d9e0db; }
+  .logit-token { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .notice { padding: 16px; border-left: 3px solid var(--danger); background: #2a1e20; color: #f5d4cf; }
+  .hidden { display: none !important; }
+  @media (max-width: 760px) {
+    .masthead { align-items: flex-start; padding: 16px 18px; }
+    .subtitle { display: none; }
+    .workbench { grid-template-columns: 1fr; height: auto; overflow: visible; }
+    .transcript-pane, .results-pane { overflow: visible; }
+    .transcript-pane { border-right: 0; border-bottom: 1px solid var(--rule); }
+    .results-pane { min-height: 45vh; }
+  }
+</style>
+</head>
+<body>
+<header class="masthead">
+  <div><h1>RWKV Generation Lens</h1><div class="subtitle">Local schema v2 artifact reader</div></div>
+  <label class="file-button" for="file-input">Open JSON artifact</label>
+  <input id="file-input" type="file" accept="application/json,.json">
+</header>
+
+<main id="empty-state" class="empty">
+  <section class="empty-card" aria-labelledby="welcome-title">
+    <div class="eyebrow">No server required</div>
+    <h2 id="welcome-title">Inspect a generation lens locally.</h2>
+    <p>Choose a schema v2 RWKV lens JSON. The file is parsed only in this browser; generated tokens select their captured input position and expose its layer lenses.</p>
+    <label class="file-button" for="file-input">Choose JSON file</label>
+  </section>
+</main>
+
+<main id="viewer" class="workbench hidden">
+  <section class="transcript-pane" aria-labelledby="transcript-title">
+    <div class="eyebrow">Generation trace</div>
+    <h2 id="transcript-title" class="document-title"></h2>
+    <p id="source" class="source"></p>
+    <article class="message"><span class="message-label">Prompt</span><div id="prompt" class="prompt-text"></div></article>
+    <article class="message generated"><span class="message-label">Generated continuation</span><div id="generated" class="token-stream"></div></article>
+    <p id="alignment" class="alignment" role="status"></p>
+  </section>
+  <section class="results-pane" aria-live="polite" aria-labelledby="results-title">
+    <div id="results"></div>
+  </section>
+</main>
+
+<script>
+(() => {
+  'use strict';
+  const fileInput = document.getElementById('file-input');
+  const emptyState = document.getElementById('empty-state');
+  const viewer = document.getElementById('viewer');
+  const generatedEl = document.getElementById('generated');
+  const promptEl = document.getElementById('prompt');
+  const resultsEl = document.getElementById('results');
+  const alignmentEl = document.getElementById('alignment');
+  let state = null;
+
+  function text(value) { return typeof value === 'string' ? value : ''; }
+  function inputText(input) { return text(input && input.input_token && input.input_token.text); }
+  function clear(node) { node.replaceChildren(); }
+  function element(name, className, content) {
+    const node = document.createElement(name);
+    if (className) node.className = className;
+    if (content !== undefined) node.textContent = content;
+    return node;
+  }
+  function showError(message) {
+    emptyState.classList.remove('hidden');
+    viewer.classList.add('hidden');
+    clear(emptyState);
+    const card = element('section', 'empty-card');
+    card.append(element('div', 'eyebrow', 'Cannot open artifact'), element('h2', '', 'Unsupported lens file'), element('p', '', message));
+    const picker = element('label', 'file-button', 'Choose another JSON file');
+    picker.htmlFor = 'file-input';
+    card.append(picker);
+    emptyState.append(card);
+  }
+
+  // Return a generated suffix only when its character boundaries match input tokens exactly.
+  function locateGeneratedText(inputs, generatedText) {
+    if (!generatedText) return null;
+    const matches = [];
+    for (let start = 0; start < inputs.length; start++) {
+      let joined = '';
+      for (let end = start; end < inputs.length && joined.length <= generatedText.length; end++) {
+        joined += inputText(inputs[end]);
+        if (joined === generatedText) matches.push({ start, end: end + 1 });
+      }
+    }
+    return matches.find(match => match.end === inputs.length) || matches[0] || null;
+  }
+
+  function deriveTranscript(document, inputs) {
+    const metadata = document.metadata && typeof document.metadata === 'object' ? document.metadata : {};
+    const generatedText = text(metadata.generated_text);
+    const exact = locateGeneratedText(inputs, generatedText);
+    if (exact) return {
+      start: exact.start, end: exact.end,
+      message: 'Generated-token mapping verified from metadata.generated_text and captured input_token.text values.', warning: false
+    };
+
+    if (metadata.generated_prefix !== undefined) {
+      const prefix = Number(metadata.generated_prefix);
+      const direct = inputs.findIndex(input => Number(input.position) === prefix);
+      if (direct !== -1) return {
+        start: direct, end: direct + 1,
+        message: 'Showing the single captured generated token selected by metadata.generated_prefix (' + metadata.generated_prefix + ').', warning: false
+      };
+      if (inputs.length === 1) return {
+        start: 0, end: 1,
+        message: 'Showing the sole captured token for metadata.generated_prefix (' + metadata.generated_prefix + ').', warning: false
+      };
+    }
+    return {
+      start: 0, end: inputs.length,
+      message: 'Exact prompt/generated alignment is unavailable. Captured input tokens are shown as selectable continuation tokens.', warning: true
+    };
+  }
+
+  function formatLogit(value) {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric.toLocaleString(undefined, { maximumFractionDigits: 6 }) : String(value ?? '');
+  }
+  function renderResults() {
+    clear(resultsEl);
+    const input = state.inputs[state.selected];
+    const token = inputText(input) || '(token text unavailable)';
+    const header = element('header', 'result-header');
+    header.append(element('div', 'eyebrow', 'Captured input position ' + input.position));
+    const title = element('h2', '', 'Lens results for ');
+    title.append(element('span', 'selected-token', token));
+    header.append(title);
+    resultsEl.append(header);
+    const layers = Array.isArray(input.layers) ? input.layers.slice().sort((a, b) => Number(a.layer) - Number(b.layer)) : [];
+    if (!layers.length) {
+      resultsEl.append(element('div', 'notice', 'This selected input has no layers/lenses to display.'));
+      return;
+    }
+      for (const layer of layers) {
+        const layerEl = element('section', 'layer');
+        layerEl.append(element('h3', 'layer-title', 'Layer ' + (layer.layer ?? '?')));
+        const lenses = Array.isArray(layer.lenses) ? layer.lenses : [];
+        if (!lenses.length) layerEl.append(element('p', 'lens', 'No lenses recorded.'));
+        const lensRow = element('div', 'lens-row');
+        for (const lens of lenses) {
+        const lensEl = element('section', 'lens');
+        lensEl.append(element('h4', 'lens-name', text(lens.lens) || 'Unnamed lens'));
+        const rows = lens && lens.result && Array.isArray(lens.result.top_logits) ? lens.result.top_logits : null;
+          if (!rows) {
+            lensEl.append(element('p', 'status', 'No result.top_logits rows were recorded.'));
+            lensRow.append(lensEl);
+            continue;
+          }
+          const grid = element('div', 'logit-grid');
+          rows.forEach((row, index) => {
+            const chip = element('div', 'logit-chip');
+            chip.append(element('span', 'rank', '#' + (index + 1)));
+            chip.append(element('span', 'logit-token', text(row && row.token) || '(token text unavailable)'));
+            chip.append(element('span', 'value', formatLogit(row && row.logit)));
+            grid.append(chip);
+          });
+          lensEl.append(grid);
+          lensRow.append(lensEl);
+        }
+        if (lenses.length) layerEl.append(lensRow);
+        resultsEl.append(layerEl);
+    }
+  }
+  function selectInput(index) {
+    state.selected = index;
+    [...generatedEl.querySelectorAll('.token')].forEach(button => {
+      button.classList.toggle('selected', Number(button.dataset.index) === index);
+    });
+    renderResults();
+  }
+  function renderDocument(artifact, filename) {
+    if (!artifact || artifact.schema_version !== 2 || !Array.isArray(artifact.inputs)) {
+      showError('Expected a schema_version: 2 document containing an inputs array with layers and lenses.');
+      return;
+    }
+    const inputs = artifact.inputs.filter(input => input && input.input_token && Number.isFinite(Number(input.position)))
+      .sort((a, b) => Number(a.position) - Number(b.position));
+    if (!inputs.length) {
+      showError('The artifact has no valid input records with position and input_token values.');
+      return;
+    }
+    const transcript = deriveTranscript(artifact, inputs);
+    state = { inputs, selected: transcript.start };
+    emptyState.classList.add('hidden');
+    viewer.classList.remove('hidden');
+    document.getElementById('transcript-title').textContent = text(artifact.experiment) || 'RWKV lens artifact';
+    document.getElementById('source').textContent = filename + (text(artifact.model) ? '  |  ' + artifact.model : '');
+    promptEl.textContent = text(artifact.prompt) || '(Prompt text was not recorded.)';
+    clear(generatedEl);
+    for (let index = transcript.start; index < transcript.end; index++) {
+      const input = inputs[index];
+      const button = element('button', 'token', inputText(input) || '(token text unavailable)');
+      button.type = 'button';
+      button.dataset.index = String(index);
+      button.title = 'Captured input position ' + input.position;
+      button.setAttribute('aria-label', 'Select generated token at input position ' + input.position + ': ' + inputText(input));
+      button.addEventListener('click', () => selectInput(index));
+      generatedEl.append(button);
+    }
+    alignmentEl.textContent = transcript.message;
+    alignmentEl.classList.toggle('warning', transcript.warning);
+    selectInput(transcript.start);
+  }
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onerror = () => showError('The selected file could not be read.');
+    reader.onload = () => {
+      try { renderDocument(JSON.parse(reader.result), file.name); }
+      catch (error) { showError('Invalid JSON: ' + error.message); }
+    };
+    reader.readAsText(file);
+    fileInput.value = '';
+  });
+})();
+</script>
+</body>
+</html>

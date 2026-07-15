@@ -157,6 +157,11 @@ public:
             return *this;
         }
 
+        prefill_op & layerwise_readout(llama_interp_layerwise_readout_spec spec) {
+            request.layerwise_readouts.push_back(std::move(spec));
+            return *this;
+        }
+
         rwkv_state await_resume() {
             if (error) std::rethrow_exception(error);
             return output;
@@ -241,6 +246,8 @@ private:
             if (capture) {
                 req.captures.insert(req.captures.end(), op->request.captures.begin(), op->request.captures.end());
             }
+            req.layerwise_readouts.insert(req.layerwise_readouts.end(),
+                                          op->request.layerwise_readouts.begin(), op->request.layerwise_readouts.end());
         }
         return req;
     }

@@ -179,6 +179,15 @@ struct llama_interp_perturb_spec {
     std::vector<ggml_fp16_t> data;
 };
 
+// Persistent GGML tensors for a batched layerwise linear readout. `projection` has
+// GGML shape [input, output, layer, 1] and `aggregate` has [input, batch, layer, 1].
+// Both must remain allocated for every decode using this request.
+struct llama_interp_layerwise_readout_spec {
+    std::string name;
+    struct ggml_tensor * projection = nullptr;
+    struct ggml_tensor * aggregate = nullptr;
+};
+
 struct llama_interp_request {
     uint64_t id = 0;
     bool enable_captures = false;
@@ -186,6 +195,7 @@ struct llama_interp_request {
 
     std::vector<llama_interp_capture_spec> captures;
     std::vector<llama_interp_perturb_spec> perturbations;
+    std::vector<llama_interp_layerwise_readout_spec> layerwise_readouts;
 };
 
 LLAMA_API bool llama_interp_rwkv_state_init(

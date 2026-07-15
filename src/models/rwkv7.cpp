@@ -191,7 +191,7 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
             ffn_norm = ggml_get_rows(ctx0, ffn_norm, inp_out_ids);
             x_prev   = ggml_get_rows(ctx0, x_prev, inp_out_ids);
         }
-        cur = build_rwkv7_channel_mix(layer, ffn_norm, x_prev, LLM_ARCH_RWKV7);
+        cur = build_rwkv7_channel_mix(layer, ffn_norm, x_prev, LLM_ARCH_RWKV7, il);
         cur = interp_rwkv_tap(cur, "channel", "out", il);
         cur = ggml_add(ctx0, cur, ffn_inp);
         cur = interp_rwkv_tap(cur, "resid", "out", il);
@@ -212,6 +212,32 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+
+    if (cparams.interp_request != nullptr) {
+        for (const auto & spec : cparams.interp_request->layerwise_readouts) {
+            GGML_ASSERT(spec.projection != nullptr && spec.aggregate != nullptr);
+            GGML_ASSERT(spec.projection->ne[0] == n_embd && spec.projection->ne[1] == n_embd);
+            GGML_ASSERT(spec.projection->ne[2] == n_layer && spec.projection->ne[3] == 1);
+            GGML_ASSERT(spec.aggregate->ne[0] == n_embd && spec.aggregate->ne[1] == n_tokens);
+            GGML_ASSERT(spec.aggregate->ne[2] == n_layer && spec.aggregate->ne[3] == 1);
+            GGML_ASSERT((int64_t) interp_rwkv_k0.size() == n_layer);
+
+            // Chain in-place writes so the final aggregate node depends on every time.k0
+            // producer before the layer-batched matmul reads it.
+            ggml_tensor * keys = spec.aggregate;
+            for (int il = 0; il < n_layer; ++il) {
+                GGML_ASSERT(interp_rwkv_k0[il] != nullptr);
+                keys = ggml_set_2d_inplace(ctx0, keys, interp_rwkv_k0[il], keys->nb[1], il * keys->nb[2]);
+            }
+
+            ggml_tensor * lens = ggml_mul_mat(ctx0, spec.projection, keys);
+            lens = build_cvec(lens, n_layer - 1);
+            lens = build_norm(lens, model.output_norm, model.output_norm_b, LLM_NORM, -1);
+            lens = build_lora_mm(model.output, lens, model.output_s);
+            lens = interp_rwkv_tap(lens, "layerwise", spec.name.c_str(), -1);
+            ggml_build_forward_expand(gf, lens);
+        }
+    }
 
     ggml_build_forward_expand(gf, cur);
 }

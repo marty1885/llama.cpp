@@ -7,16 +7,21 @@ llm_build_rwkv7_base::llm_build_rwkv7_base(const llama_model & model, const llm_
     model(model) {}
 
 ggml_tensor * llm_build_rwkv7_base::build_rwkv7_channel_mix(const llama_layer * layer,
-                                                            ggml_tensor *       cur,
-                                                            ggml_tensor *       x_prev,
-                                                            llm_arch            arch) const {
+                                                             ggml_tensor *       cur,
+                                                             ggml_tensor *       x_prev,
+                                                             llm_arch            arch,
+                                                             int                 il) const {
     ggml_tensor * sx = ggml_sub(ctx0, x_prev, cur);
     switch (arch) {
         case LLM_ARCH_RWKV7:
             {
                 ggml_tensor * xk = ggml_add(ctx0, ggml_mul(ctx0, sx, layer->channel_mix_lerp_k), cur);
+                xk = interp_rwkv_tap(xk, "channel", "xk", il);
 
-                ggml_tensor * k = ggml_sqr(ctx0, ggml_relu(ctx0, build_lora_mm(layer->channel_mix_key, xk)));
+                ggml_tensor * k = build_lora_mm(layer->channel_mix_key, xk);
+                k = interp_rwkv_tap(k, "channel", "key_preact", il);
+                k = ggml_sqr(ctx0, ggml_relu(ctx0, k));
+                k = interp_rwkv_tap(k, "channel", "key_relu_sq", il);
 
                 cur = build_lora_mm(layer->channel_mix_value, k);
             }
@@ -62,6 +67,8 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix(llm_graph_input_rs * in
     ggml_tensor * xg =
         has_gating ? ggml_view_2d(ctx0, xxx, n_embd, n_tokens, xxx->nb[1], n_embd * n_tokens * 5 * sizeof(float)) :
                      nullptr;
+    xk = interp_rwkv_tap(xk, "time", "xk", il);
+    xv = interp_rwkv_tap(xv, "time", "xv", il);
 
     ggml_tensor * r = build_lora_mm(layer.time_mix_receptance, xr);
     ggml_tensor * w = ggml_add(
@@ -72,6 +79,7 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix(llm_graph_input_rs * in
 
     ggml_tensor * k = build_lora_mm(layer.time_mix_key, xk);
     k               = interp_rwkv_tap(k, "time", "k0", il);
+    interp_rwkv_record_k0(k, il);
     ggml_tensor * v = build_lora_mm(layer.time_mix_value, xv);
     if (first_layer_value == nullptr) {
         first_layer_value = v;
@@ -132,10 +140,11 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix(llm_graph_input_rs * in
         // Convert back to regular vectors.
         cur = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
         cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.time_mix_ln), layer.time_mix_ln_b);
-    } else {
-        cur = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
-    }
-    ggml_tensor * rk = ggml_sum_rows(
+        } else {
+            cur = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
+        }
+        cur = interp_rwkv_tap(cur, "time", "wkv_norm", il);
+        ggml_tensor * rk = ggml_sum_rows(
         ctx0, ggml_mul(ctx0, ggml_mul(ctx0, k, r), ggml_reshape_2d(ctx0, layer.time_mix_r_k, head_size, head_count)));
     cur = ggml_add(ctx0, cur, ggml_reshape_2d(ctx0, ggml_mul(ctx0, v, rk), n_embd, n_tokens));
     cur = interp_rwkv_tap(cur, "time", "rkv", il);
@@ -143,6 +152,7 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix(llm_graph_input_rs * in
     if (has_gating) {
         cur = ggml_mul(ctx0, cur, g);
     }
+    cur = interp_rwkv_tap(cur, "time", "pre_output", il);
     cur = build_lora_mm(layer.time_mix_output, cur);
     cur = interp_rwkv_tap(cur, "time", "out", il);
 

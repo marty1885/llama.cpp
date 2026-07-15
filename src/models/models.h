@@ -119,9 +119,10 @@ struct llm_build_rwkv7_base : public llm_graph_context {
 
     // RWKV7-specific graph building methods
     ggml_tensor * build_rwkv7_channel_mix(const llama_layer * layer,
-                                          ggml_tensor *       cur,
-                                          ggml_tensor *       x_prev,
-                                          llm_arch            arch) const;
+                                           ggml_tensor *       cur,
+                                           ggml_tensor *       x_prev,
+                                           llm_arch            arch,
+                                           int                 il) const;
     ggml_tensor * build_rwkv7_time_mix(llm_graph_input_rs * inp,
                                        ggml_tensor *        cur,
                                        ggml_tensor *        x_prev,

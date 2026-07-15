@@ -970,6 +970,7 @@ struct llm_graph_context {
     void cb(ggml_tensor * cur, const char * name, int il) const;
 
     ggml_tensor * interp_rwkv_tap(ggml_tensor * cur, const char * group, const char * name, int il) const;
+    void interp_rwkv_record_k0(ggml_tensor * cur, int il) const;
 
     //
     // common
@@ -1009,6 +1010,8 @@ struct llm_graph_context {
                   int64_t   n_head,
                   int64_t   n_head_kv,
                       int   il) const;
+
+    mutable std::vector<ggml_tensor *> interp_rwkv_k0;
 
     ggml_tensor * build_ffn(
              ggml_tensor * cur,

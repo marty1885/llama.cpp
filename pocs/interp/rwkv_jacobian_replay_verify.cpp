@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -54,6 +55,71 @@ float cosine(const std::vector<float> & left, const std::vector<float> & right) 
     return denom == 0.0f ? 0.0f : (float) (dot / denom);
 }
 
+std::vector<float> make_direction(const std::vector<float> & source, uint64_t seed, bool layer_norm_tangent) {
+    std::mt19937_64 generator(seed);
+    std::uniform_int_distribution<int> sign(0, 1);
+    std::vector<float> direction(source.size());
+    const float component = 1.0f / std::sqrt((float) direction.size());
+    for (float & value : direction) value = sign(generator) ? component : -component;
+    if (!layer_norm_tangent) return direction;
+
+    float source_mean = 0.0f, direction_mean = 0.0f;
+    for (size_t i = 0; i < source.size(); ++i) {
+        source_mean += source[i] / source.size();
+        direction_mean += direction[i] / direction.size();
+    }
+    float radial_norm_sq = 0.0f, radial_dot = 0.0f;
+    for (size_t i = 0; i < source.size(); ++i) {
+        direction[i] -= direction_mean;
+        const float radial = source[i] - source_mean;
+        radial_norm_sq += radial * radial;
+        radial_dot += direction[i] * radial;
+    }
+    if (radial_norm_sq == 0.0f) throw std::runtime_error("cannot construct LayerNorm tangent at constant source activation");
+    for (size_t i = 0; i < source.size(); ++i) direction[i] -= radial_dot / radial_norm_sq * (source[i] - source_mean);
+    const float direction_norm = l2_norm(direction);
+    if (direction_norm == 0.0f) throw std::runtime_error("LayerNorm tangent projection produced a zero direction");
+    for (float & value : direction) value /= direction_norm;
+    return direction;
+}
+
+std::vector<float> project_layer_norm_tangent(const std::vector<float> & source, std::vector<float> direction) {
+    if (source.size() != direction.size()) throw std::runtime_error("rotor basis dimension differs from source");
+    float source_mean = 0.0f, direction_mean = 0.0f;
+    for (size_t i = 0; i < source.size(); ++i) {
+        source_mean += source[i] / source.size();
+        direction_mean += direction[i] / direction.size();
+    }
+    float radial_norm_sq = 0.0f, radial_dot = 0.0f;
+    for (size_t i = 0; i < source.size(); ++i) {
+        direction[i] -= direction_mean;
+        const float radial = source[i] - source_mean;
+        radial_norm_sq += radial * radial;
+        radial_dot += direction[i] * radial;
+    }
+    if (radial_norm_sq == 0.0f) throw std::runtime_error("cannot construct LayerNorm tangent at constant source activation");
+    for (size_t i = 0; i < source.size(); ++i) direction[i] -= radial_dot / radial_norm_sq * (source[i] - source_mean);
+    const float direction_norm = l2_norm(direction);
+    if (direction_norm == 0.0f) throw std::runtime_error("LayerNorm tangent projection produced a zero direction");
+    for (float & value : direction) value /= direction_norm;
+    return direction;
+}
+
+std::vector<ggml_fp16_t> rotor_perturbation(const std::vector<float> & source, const std::vector<float> & tangent, float theta) {
+    if (source.size() != tangent.size()) throw std::runtime_error("rotor tangent dimension differs from source");
+    float mean = 0.0f, radius_sq = 0.0f;
+    for (const float value : source) mean += value / source.size();
+    for (const float value : source) radius_sq += (value - mean) * (value - mean);
+    const float radius = std::sqrt(radius_sq);
+    std::vector<ggml_fp16_t> result(source.size());
+    for (size_t i = 0; i < source.size(); ++i) {
+        const float radial_unit = (source[i] - mean) / radius;
+        const float delta = radius * ((std::cos(theta) - 1.0f) * radial_unit + std::sin(theta) * tangent[i]);
+        result[i] = ggml_fp32_to_fp16(delta);
+    }
+    return result;
+}
+
 float agreement_cosine(const std::vector<float> & left, const std::vector<float> & right) {
     const float left_norm = l2_norm(left);
     const float right_norm = l2_norm(right);
@@ -65,6 +131,17 @@ float agreement_cosine(const std::vector<float> & left, const std::vector<float>
 float safe_ratio(float numerator, float denominator) {
     if (denominator != 0.0f) return numerator / denominator;
     return numerator == 0.0f ? 0.0f : std::numeric_limits<float>::max();
+}
+
+std::vector<int32_t> top_indices(const std::vector<float> & values, int32_t count, bool positive) {
+    std::vector<int32_t> indices(values.size());
+    std::iota(indices.begin(), indices.end(), 0);
+    count = std::min<int32_t>(count, (int32_t) indices.size());
+    std::partial_sort(indices.begin(), indices.begin() + count, indices.end(), [&values, positive](int32_t left, int32_t right) {
+        return positive ? values[left] > values[right] : values[left] < values[right];
+    });
+    indices.resize(count);
+    return indices;
 }
 
 float state_max_abs_difference(const llama_interp::rwkv_state & left, const llama_interp::rwkv_state & right) {
@@ -90,9 +167,15 @@ llama_interp::task<> run_branch(
         const std::vector<llama_token> & suffix,
         const rwkv_jacobian_lens::lens_spec & spec,
         const std::vector<ggml_fp16_t> * perturbation,
+        const std::vector<std::string> * basis_taps,
         branch_result & output) {
     auto source = runtime.prefill_tokens(before_source, { source_token });
     source.capture_f32(rwkv_jacobian_lens::exact_regex(spec.source_tap), output.source_capture);
+    if (basis_taps) {
+        for (const std::string & basis_tap : *basis_taps) {
+            if (basis_tap != spec.source_tap) source.capture_f32(rwkv_jacobian_lens::exact_regex(basis_tap), output.source_capture);
+        }
+    }
     if (std::find(spec.offsets.begin(), spec.offsets.end(), 0) != spec.offsets.end()) {
         source.capture_f32(rwkv_jacobian_lens::exact_regex(spec.target_tap), output.target_captures[0]);
     }
@@ -122,9 +205,12 @@ void usage(const char * argv0) {
     std::fprintf(stderr,
         "usage: %s -m MODEL -p PROMPT --source-tap FULL_NAME [--target-tap FULL_NAME]\n"
         "       [--source-position N] [--offset N ...] [--seed N] [--relative-epsilon E]\n"
+        "       [--direction rademacher|ln-tangent|ln-rotor] [--rotor-basis-tap FULL_NAME]\n"
+        "       [--rotor-basis-difference FROM_TAP TO_TAP]\n"
         "       [--epsilon-scale S ...]\n"
         "       [--min-scale-cosine C] [--max-scale-norm-spread R]\n"
         "       [--max-center-error-ratio R] [--min-repeat-cosine C]\n"
+        "       [--top-logits N]\n"
         "       --output FILE [--tolerance E] [-ngl N]\n"
         "\n"
         "Validates a pluggable named-source, strict-future RWKV finite-difference response.\n"
@@ -149,6 +235,11 @@ int main(int argc, char ** argv) {
     float max_scale_norm_spread = 0.05f;
     float max_center_error_ratio = 0.05f;
     float min_repeat_cosine = 0.999f;
+    int32_t top_logit_count = 0;
+    bool layer_norm_tangent = false;
+    bool layer_norm_rotor = false;
+    std::string rotor_basis_tap;
+    std::string rotor_basis_from_tap, rotor_basis_to_tap;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
         else if (std::strcmp(argv[i], "-p") == 0 && i + 1 < argc) prompt = argv[++i];
@@ -157,12 +248,33 @@ int main(int argc, char ** argv) {
         else if (std::strcmp(argv[i], "--source-position") == 0 && i + 1 < argc) source_position = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--offset") == 0 && i + 1 < argc) spec.offsets.push_back(std::atoi(argv[++i]));
         else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) spec.direction_seed = std::strtoull(argv[++i], nullptr, 10);
+        else if (std::strcmp(argv[i], "--direction") == 0 && i + 1 < argc) {
+            const std::string value = argv[++i];
+            if (value == "rademacher") {
+                layer_norm_tangent = false;
+                spec.direction = "seeded_unit_l2_rademacher";
+            } else if (value == "ln-tangent") {
+                layer_norm_tangent = true;
+                spec.direction = "seeded_unit_l2_rademacher_projected_to_layernorm_input_tangent";
+            } else if (value == "ln-rotor") {
+                layer_norm_rotor = true;
+                spec.direction = "layernorm_sphere_rotor";
+            } else {
+                throw std::runtime_error("--direction must be rademacher, ln-tangent, or ln-rotor");
+            }
+        }
+        else if (std::strcmp(argv[i], "--rotor-basis-tap") == 0 && i + 1 < argc) rotor_basis_tap = argv[++i];
+        else if (std::strcmp(argv[i], "--rotor-basis-difference") == 0 && i + 2 < argc) {
+            rotor_basis_from_tap = argv[++i];
+            rotor_basis_to_tap = argv[++i];
+        }
         else if (std::strcmp(argv[i], "--relative-epsilon") == 0 && i + 1 < argc) spec.relative_epsilon = std::strtof(argv[++i], nullptr);
         else if (std::strcmp(argv[i], "--epsilon-scale") == 0 && i + 1 < argc) epsilon_scales.push_back(std::strtof(argv[++i], nullptr));
         else if (std::strcmp(argv[i], "--min-scale-cosine") == 0 && i + 1 < argc) min_scale_cosine = std::strtof(argv[++i], nullptr);
         else if (std::strcmp(argv[i], "--max-scale-norm-spread") == 0 && i + 1 < argc) max_scale_norm_spread = std::strtof(argv[++i], nullptr);
         else if (std::strcmp(argv[i], "--max-center-error-ratio") == 0 && i + 1 < argc) max_center_error_ratio = std::strtof(argv[++i], nullptr);
         else if (std::strcmp(argv[i], "--min-repeat-cosine") == 0 && i + 1 < argc) min_repeat_cosine = std::strtof(argv[++i], nullptr);
+        else if (std::strcmp(argv[i], "--top-logits") == 0 && i + 1 < argc) top_logit_count = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--output") == 0 && i + 1 < argc) output_path = argv[++i];
         else if (std::strcmp(argv[i], "--tolerance") == 0 && i + 1 < argc) tolerance = std::strtof(argv[++i], nullptr);
         else if (std::strcmp(argv[i], "-ngl") == 0 && i + 1 < argc) n_gpu_layers = std::atoi(argv[++i]);
@@ -172,6 +284,7 @@ int main(int argc, char ** argv) {
         usage(argv[0]);
         return 1;
     }
+    if (top_logit_count < 0) throw std::runtime_error("top-logits must be non-negative");
 
     ggml_backend_load_all();
     llama_backend_init();
@@ -183,6 +296,12 @@ int main(int argc, char ** argv) {
     if (spec.offsets.empty()) spec.offsets = { 0, 1, 2, 4 };
     rwkv_jacobian_lens::normalize_offsets(spec);
     rwkv_jacobian_lens::validate(spec);
+    if (layer_norm_rotor && rotor_basis_tap.empty() && (rotor_basis_from_tap.empty() || rotor_basis_to_tap.empty())) {
+        throw std::runtime_error("ln-rotor requires --rotor-basis-tap or --rotor-basis-difference FROM_TAP TO_TAP");
+    }
+    if (!rotor_basis_tap.empty() && (!rotor_basis_from_tap.empty() || !rotor_basis_to_tap.empty())) {
+        throw std::runtime_error("use either --rotor-basis-tap or --rotor-basis-difference, not both");
+    }
     if (epsilon_scales.empty()) epsilon_scales = { 0.5f, 1.0f, 2.0f };
     if (std::find(epsilon_scales.begin(), epsilon_scales.end(), 1.0f) == epsilon_scales.end()) epsilon_scales.push_back(1.0f);
     std::sort(epsilon_scales.begin(), epsilon_scales.end());
@@ -227,59 +346,79 @@ int main(int argc, char ** argv) {
     branch_result native, zero;
     native.target_captures.resize(max_offset + 1);
     zero.target_captures.resize(max_offset + 1);
-    auto native_run = run_branch(runtime, before_source, source_token, suffix, spec, nullptr, native);
+    std::vector<std::string> basis_taps;
+    if (layer_norm_rotor) {
+        if (!rotor_basis_tap.empty()) basis_taps = { rotor_basis_tap };
+        else basis_taps = { rotor_basis_from_tap, rotor_basis_to_tap };
+    }
+    const std::vector<std::string> * captured_basis_taps = layer_norm_rotor ? &basis_taps : nullptr;
+    auto native_run = run_branch(runtime, before_source, source_token, suffix, spec, nullptr, captured_basis_taps, native);
     runtime.run();
     native_run.rethrow_if_failed();
 
     const std::vector<float> native_source = capture(native.source_capture, spec.source_tap).data_f32;
     const float source_norm = l2_norm(native_source);
     if (source_norm == 0.0f) throw std::runtime_error("source activation has zero L2 norm");
-    std::mt19937_64 generator(spec.direction_seed);
-    std::uniform_int_distribution<int> sign(0, 1);
-    std::vector<float> direction(native_source.size());
-    const float scale = 1.0f / std::sqrt((float) direction.size());
-    for (float & value : direction) value = sign(generator) ? scale : -scale;
+    std::vector<float> direction;
+    if (layer_norm_rotor) {
+        if (!rotor_basis_tap.empty()) {
+            direction = project_layer_norm_tangent(native_source, capture(native.source_capture, rotor_basis_tap).data_f32);
+            spec.direction += "_basis_" + rotor_basis_tap;
+        } else {
+            const std::vector<float> & from = capture(native.source_capture, rotor_basis_from_tap).data_f32;
+            const std::vector<float> & to = capture(native.source_capture, rotor_basis_to_tap).data_f32;
+            if (from.size() != to.size()) throw std::runtime_error("rotor basis difference dimensions differ");
+            std::vector<float> update(from.size());
+            for (size_t i = 0; i < update.size(); ++i) update[i] = to[i] - from[i];
+            direction = project_layer_norm_tangent(native_source, std::move(update));
+            spec.direction += "_basis_difference_" + rotor_basis_to_tap + "_minus_" + rotor_basis_from_tap;
+        }
+    } else {
+        direction = make_direction(native_source, spec.direction_seed, layer_norm_tangent);
+    }
     const std::vector<ggml_fp16_t> zero_perturbation(direction.size(), ggml_fp32_to_fp16(0.0f));
 
-    auto zero_run = run_branch(runtime, before_source, source_token, suffix, spec, &zero_perturbation, zero);
+    auto zero_run = run_branch(runtime, before_source, source_token, suffix, spec, &zero_perturbation, nullptr, zero);
     runtime.run();
     zero_run.rethrow_if_failed();
     std::vector<scale_result> scale_results;
     for (const float multiplier : epsilon_scales) {
-        const float epsilon = multiplier * spec.relative_epsilon * source_norm;
+        const float epsilon = layer_norm_rotor ? multiplier * spec.relative_epsilon : multiplier * spec.relative_epsilon * source_norm;
         scale_result result { multiplier, epsilon };
         result.plus.target_captures.resize(max_offset + 1);
         result.minus.target_captures.resize(max_offset + 1);
-        const std::vector<ggml_fp16_t> plus_perturbation = fp16_perturbation(direction, epsilon);
-        const std::vector<ggml_fp16_t> minus_perturbation = fp16_perturbation(direction, -epsilon);
-        auto plus_run = run_branch(runtime, before_source, source_token, suffix, spec, &plus_perturbation, result.plus);
+        const std::vector<ggml_fp16_t> plus_perturbation = layer_norm_rotor ? rotor_perturbation(native_source, direction, epsilon) : fp16_perturbation(direction, epsilon);
+        const std::vector<ggml_fp16_t> minus_perturbation = layer_norm_rotor ? rotor_perturbation(native_source, direction, -epsilon) : fp16_perturbation(direction, -epsilon);
+        auto plus_run = run_branch(runtime, before_source, source_token, suffix, spec, &plus_perturbation, nullptr, result.plus);
         runtime.run();
         plus_run.rethrow_if_failed();
-        auto minus_run = run_branch(runtime, before_source, source_token, suffix, spec, &minus_perturbation, result.minus);
+        auto minus_run = run_branch(runtime, before_source, source_token, suffix, spec, &minus_perturbation, nullptr, result.minus);
         runtime.run();
         minus_run.rethrow_if_failed();
         scale_results.push_back(std::move(result));
     }
     const size_t base_scale_index = (size_t) std::distance(epsilon_scales.begin(), std::find(epsilon_scales.begin(), epsilon_scales.end(), 1.0f));
-    scale_result repeat_result { 1.0f, spec.relative_epsilon * source_norm };
+    scale_result repeat_result { 1.0f, layer_norm_rotor ? spec.relative_epsilon : spec.relative_epsilon * source_norm };
     repeat_result.plus.target_captures.resize(max_offset + 1);
     repeat_result.minus.target_captures.resize(max_offset + 1);
-    const std::vector<ggml_fp16_t> repeat_plus = fp16_perturbation(direction, repeat_result.epsilon);
-    const std::vector<ggml_fp16_t> repeat_minus = fp16_perturbation(direction, -repeat_result.epsilon);
-    auto repeat_plus_run = run_branch(runtime, before_source, source_token, suffix, spec, &repeat_plus, repeat_result.plus);
+    const std::vector<ggml_fp16_t> repeat_plus = layer_norm_rotor ? rotor_perturbation(native_source, direction, repeat_result.epsilon) : fp16_perturbation(direction, repeat_result.epsilon);
+    const std::vector<ggml_fp16_t> repeat_minus = layer_norm_rotor ? rotor_perturbation(native_source, direction, -repeat_result.epsilon) : fp16_perturbation(direction, -repeat_result.epsilon);
+    auto repeat_plus_run = run_branch(runtime, before_source, source_token, suffix, spec, &repeat_plus, nullptr, repeat_result.plus);
     runtime.run();
     repeat_plus_run.rethrow_if_failed();
-    auto repeat_minus_run = run_branch(runtime, before_source, source_token, suffix, spec, &repeat_minus, repeat_result.minus);
+    auto repeat_minus_run = run_branch(runtime, before_source, source_token, suffix, spec, &repeat_minus, nullptr, repeat_result.minus);
     runtime.run();
     repeat_minus_run.rethrow_if_failed();
 
     const float zero_state_error = state_max_abs_difference(native.final_state, zero.final_state);
     std::ofstream output(output_path);
     if (!output) throw std::runtime_error("failed to open output: " + output_path);
-    output << std::setprecision(9) << "{\n  \"experiment\": \"rwkv_jacobian_replay_verify\",\n  \"lens_spec\": ";
+    output << std::setprecision(9) << "{\n  \"schema_version\": 2,\n  \"experiment\": \"rwkv_jacobian_replay_verify\",\n  \"lens_spec\": ";
     rwkv_jacobian_lens::write_json(output, spec);
     output << ",\n  \"model\": ";
     rwkv_experiment::write_json_string(output, model_path);
+    output << ",\n  \"prompt\": ";
+    rwkv_experiment::write_json_string(output, prompt);
     output << ",\n  \"source_position\": " << source_position
            << ",\n  \"source_token\": {\"id\": " << source_token << ", \"text\": ";
     rwkv_experiment::write_json_string(output, common_token_to_piece(ctx, source_token, true));
@@ -392,7 +531,57 @@ int main(int argc, char ** argv) {
                << ", \"repeat_1x_cosine\": " << repeat_cosine
                << ", \"passed\": " << (passed ? "true" : "false") << '}';
     }
-    output << "\n    ],\n    \"passed\": " << (linearity_gate_passed ? "true" : "false") << "\n  }\n}\n";
+    output << "\n    ],\n    \"passed\": " << (linearity_gate_passed ? "true" : "false") << "\n  }";
+    output << ",\n  \"inputs\": [";
+    if (top_logit_count > 0) {
+        if (spec.target_tap != "rwkv.layer." + std::to_string(model->hparams.n_layer() - 1) + ".resid.out") {
+            throw std::runtime_error("top-logits requires the final residual target tap");
+        }
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        int32_t source_layer = -1;
+        (void) std::sscanf(spec.source_tap.c_str(), "rwkv.layer.%d.", &source_layer);
+        for (size_t offset_index = 0; offset_index < spec.offsets.size(); ++offset_index) {
+            const int32_t offset = spec.offsets[offset_index];
+            const std::vector<float> & plus_target = capture(scale_results[base_scale_index].plus.target_captures[offset], spec.target_tap).data_f32;
+            const std::vector<float> & minus_target = capture(scale_results[base_scale_index].minus.target_captures[offset], spec.target_tap).data_f32;
+            std::vector<float> plus_logits(n_vocab), minus_logits(n_vocab), response(n_vocab);
+            if (!llama_interp_rwkv_final_readout(ctx, plus_target.data(), 1, plus_logits.data()) ||
+                !llama_interp_rwkv_final_readout(ctx, minus_target.data(), 1, minus_logits.data())) {
+                throw std::runtime_error("final residual logit evaluation failed");
+            }
+            for (int32_t token = 0; token < n_vocab; ++token) {
+                response[token] = (plus_logits[token] - minus_logits[token]) / (2.0f * scale_results[base_scale_index].epsilon);
+            }
+            const std::vector<int32_t> top_positive = top_indices(response, top_logit_count, true);
+            const std::vector<int32_t> top_negative = top_indices(response, top_logit_count, false);
+            const llama_token target_token = offset == 0 ? source_token : suffix[offset - 1];
+            if (offset_index) output << ',';
+            output << "\n    {\"position\": " << source_position + offset << ", \"input_token\": {\"id\": " << target_token << ", \"text\": ";
+            rwkv_experiment::write_json_string(output, common_token_to_piece(ctx, target_token, true));
+            output << "}, \"layers\": [{\"layer\": " << source_layer << ", \"lenses\": [{\"lens\": ";
+            rwkv_experiment::write_json_string(output, std::string("exploratory.base_logit_derivative.") + (layer_norm_rotor ? "rotor.positive" : "direction.positive"));
+            output << ", \"result\": {\"top_logits\": [";
+            for (size_t i = 0; i < top_positive.size(); ++i) {
+                const int32_t token = top_positive[i];
+                if (i) output << ',';
+                output << "\n              {\"token_id\": " << token << ", \"token\": ";
+                rwkv_experiment::write_json_string(output, common_token_to_piece(ctx, token, true));
+                output << ", \"logit\": " << response[token] << '}';
+            }
+            output << "\n            ]}}, {\"lens\": ";
+            rwkv_experiment::write_json_string(output, std::string("exploratory.base_logit_derivative.") + (layer_norm_rotor ? "rotor.negative" : "direction.negative"));
+            output << ", \"result\": {\"top_logits\": [";
+            for (size_t i = 0; i < top_negative.size(); ++i) {
+                const int32_t token = top_negative[i];
+                if (i) output << ',';
+                output << "\n              {\"token_id\": " << token << ", \"token\": ";
+                rwkv_experiment::write_json_string(output, common_token_to_piece(ctx, token, true));
+                output << ", \"logit\": " << response[token] << '}';
+            }
+            output << "\n            ]}}]}]}";
+        }
+    }
+    output << "\n  ]\n}\n";
     if (!output) throw std::runtime_error("failed to write output: " + output_path);
     output.close();
 
@@ -403,7 +592,7 @@ int main(int argc, char ** argv) {
         llama_backend_free();
         return 2;
     }
-    if (spec.source_tap == spec.target_tap &&
+    if (!layer_norm_rotor && spec.source_tap == spec.target_tap &&
         std::find(spec.offsets.begin(), spec.offsets.end(), 0) != spec.offsets.end() &&
         max_identity_error > tolerance) {
         std::fprintf(stderr, "verification failed: same-tap offset-zero identity control failed\n");

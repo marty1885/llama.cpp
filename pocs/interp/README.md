@@ -32,6 +32,35 @@ may be reused after graph execution.
 build/bin/llama-rwkv-interp-verify -m MODEL.gguf -ngl 99
 ```
 
+## Scientific Context
+
+`logs/TMIX_INVESTIGATION.md` is the durable scientific ledger for the current TMix
+work. Read it together with the repository-level `SCIENTIFIC_METHOD_PROMPT.md`
+before interpreting captures or adding an experiment. Experiment protocols live
+in `experiments/`; completed observations and result reports live in `logs/`.
+
+The current investigation treats the following as distinct objects:
+
+```python
+time_out       # an update in residual coordinates
+resid_time     # resid_in + time_out
+ln_direction   # normalized centered direction of resid_time
+rotor          # minimal rotation from incoming to resulting LN direction
+```
+
+Directly applying the final output head to `time_out` is not a validated lens and
+has produced incoherent results. Addition followed by LayerNorm and its rotor
+description are the same computation. The current hypothesis is that TMix may move
+the normalized residual into an unused or less-used destination that marks added
+information for the following MLP to resolve. The competing explanation is that
+the rotation is only incidental normalization geometry. Merely measuring a
+rotation cannot distinguish them.
+
+Exported recurrent state is valid for deterministic handoff and replay, but it is
+not an isolated memory-item representation. Controlled memory writes must use live
+RWKV quantities and the native production recurrence rather than state swaps or
+post-hoc state deltas.
+
 ## Jacobian Replay Contract
 
 `llama-rwkv-jacobian-replay-verify` is the first validation primitive for the

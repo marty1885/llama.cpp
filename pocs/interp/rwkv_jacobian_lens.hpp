@@ -21,6 +21,7 @@ struct lens_spec {
     std::vector<int32_t> offsets;
     uint64_t direction_seed = 1;
     float relative_epsilon = 0.01f;
+    std::string direction = "seeded_unit_l2_rademacher";
 };
 
 inline void validate(const lens_spec & spec) {
@@ -30,7 +31,7 @@ inline void validate(const lens_spec & spec) {
     if (spec.offsets.empty()) {
         throw std::runtime_error("LensSpec requires at least one future offset");
     }
-    if (spec.relative_epsilon <= 0.0f) {
+    if (spec.relative_epsilon <= 0.0f || spec.direction.empty()) {
         throw std::runtime_error("LensSpec relative_epsilon must be positive");
     }
     for (const int32_t offset : spec.offsets) {
@@ -66,7 +67,9 @@ inline void write_json(std::ostream & output, const lens_spec & spec) {
     output << ",\n    \"position_semantics\": \"input-token index; offset zero is the source token\""
            << ",\n    \"suffix_semantics\": \"exact teacher-forced input tokens in both branches\""
            << ",\n    \"derivative\": \"central finite difference\""
-           << ",\n    \"direction\": \"seeded unit-L2 Rademacher\""
+           << ",\n    \"direction\": ";
+    rwkv_experiment::write_json_string(output, spec.direction);
+    output
            << ",\n    \"relative_epsilon\": " << spec.relative_epsilon
            << ",\n    \"direction_seed\": " << spec.direction_seed
            << ",\n    \"offsets\": [";

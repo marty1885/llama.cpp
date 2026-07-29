@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "experiment": "tmix_relative_geometry_null",
+  "seed": 817263,
+  "corpus_sha256": "1cc5a25086b87a19b47368705d6bd4342ab60480928c6a90b329d84f13879f6b",
+  "manifest_sha256": "b6a1bbef05a3d2a9c2301f80e2c63f847e4e251de8e0ff577b9619f3148238cd",
+  "source_provenance": "Project Gutenberg ebook 73544, The 42nd (East Lancashire) Division 1914-1918, Frederick P. Gibbon, release 2024-05-05, https://www.gutenberg.org/cache/epub/73544/pg73544.txt, source_sha256=623ce1590ed04b304a751ba2f5f0f4ffccfaea0080830f136fd01392831d5392, extraction=64 evenly-spaced non-overlapping 256-word spans starting at word 3000",
+  "rotor_subspace_prompts_sha256": "b41febd2f7ab415c4da1f3a7257dcd3e0efc7524a80a233a15bf042b9283e90d",
+  "destination_subspace_expanded_prompts_sha256": "e39c9b21a449ba54f8a4d82d3ff84d7191228dd97f2ad06b8f582609b843a1ff",
+  "destination_subspace_pile10k_prompts_sha256": "8a93c7205f12e124fc2dac064e0ee30e8afdffd009bd48734557b1bc6e4ef17c"
+}

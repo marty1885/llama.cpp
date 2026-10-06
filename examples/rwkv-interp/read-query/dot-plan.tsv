@@ -1,0 +1,24 @@
+s0	-	story	Alice wears a yellow hat and lives in Paris. Bob wears a blue hat and lives in Rome.	yellow,blue
+s0_q0	s0	query_story	\nThe hat color of the person living in Paris is:	yellow,blue
+s0_q1	s0	query_story	\nThe hat color of the person living in Rome is:	yellow,blue
+s1	-	story	Bob wears a blue hat and lives in Rome. Alice wears a yellow hat and lives in Paris.	yellow,blue
+s1_q0	s1	query_story	\nThe hat color of the person living in Paris is:	yellow,blue
+s1_q1	s1	query_story	\nThe hat color of the person living in Rome is:	yellow,blue
+s2	-	story	Alice wears a yellow hat and lives in Rome. Bob wears a blue hat and lives in Paris.	yellow,blue
+s2_q0	s2	query_story	\nThe hat color of the person living in Rome is:	yellow,blue
+s2_q1	s2	query_story	\nThe hat color of the person living in Paris is:	yellow,blue
+s3	-	story	Bob wears a blue hat and lives in Paris. Alice wears a yellow hat and lives in Rome.	yellow,blue
+s3_q0	s3	query_story	\nThe hat color of the person living in Rome is:	yellow,blue
+s3_q1	s3	query_story	\nThe hat color of the person living in Paris is:	yellow,blue
+s4	-	story	Alice wears a blue hat and lives in Paris. Bob wears a yellow hat and lives in Rome.	yellow,blue
+s4_q0	s4	query_story	\nThe hat color of the person living in Paris is:	yellow,blue
+s4_q1	s4	query_story	\nThe hat color of the person living in Rome is:	yellow,blue
+s5	-	story	Bob wears a yellow hat and lives in Rome. Alice wears a blue hat and lives in Paris.	yellow,blue
+s5_q0	s5	query_story	\nThe hat color of the person living in Paris is:	yellow,blue
+s5_q1	s5	query_story	\nThe hat color of the person living in Rome is:	yellow,blue
+s6	-	story	Alice wears a blue hat and lives in Rome. Bob wears a yellow hat and lives in Paris.	yellow,blue
+s6_q0	s6	query_story	\nThe hat color of the person living in Rome is:	yellow,blue
+s6_q1	s6	query_story	\nThe hat color of the person living in Paris is:	yellow,blue
+s7	-	story	Bob wears a yellow hat and lives in Paris. Alice wears a blue hat and lives in Rome.	yellow,blue
+s7_q0	s7	query_story	\nThe hat color of the person living in Rome is:	yellow,blue
+s7_q1	s7	query_story	\nThe hat color of the person living in Paris is:	yellow,blue

@@ -1,0 +1,24 @@
+{"id": "s0", "text": "Alice wears a yellow hat and lives in Paris. Bob wears a blue hat and lives in Rome.", "names": ["Alice", "Bob"], "colors": ["yellow", "blue"], "cities": ["Paris", "Rome"], "order": 0}
+{"id": "s0_q0", "parent": "s0", "target": 0, "gold": "yellow", "text": "\nThe hat color of the person living in Paris is:"}
+{"id": "s0_q1", "parent": "s0", "target": 1, "gold": "blue", "text": "\nThe hat color of the person living in Rome is:"}
+{"id": "s1", "text": "Bob wears a blue hat and lives in Rome. Alice wears a yellow hat and lives in Paris.", "names": ["Alice", "Bob"], "colors": ["yellow", "blue"], "cities": ["Paris", "Rome"], "order": 1}
+{"id": "s1_q0", "parent": "s1", "target": 0, "gold": "yellow", "text": "\nThe hat color of the person living in Paris is:"}
+{"id": "s1_q1", "parent": "s1", "target": 1, "gold": "blue", "text": "\nThe hat color of the person living in Rome is:"}
+{"id": "s2", "text": "Alice wears a yellow hat and lives in Rome. Bob wears a blue hat and lives in Paris.", "names": ["Alice", "Bob"], "colors": ["yellow", "blue"], "cities": ["Rome", "Paris"], "order": 0}
+{"id": "s2_q0", "parent": "s2", "target": 0, "gold": "yellow", "text": "\nThe hat color of the person living in Rome is:"}
+{"id": "s2_q1", "parent": "s2", "target": 1, "gold": "blue", "text": "\nThe hat color of the person living in Paris is:"}
+{"id": "s3", "text": "Bob wears a blue hat and lives in Paris. Alice wears a yellow hat and lives in Rome.", "names": ["Alice", "Bob"], "colors": ["yellow", "blue"], "cities": ["Rome", "Paris"], "order": 1}
+{"id": "s3_q0", "parent": "s3", "target": 0, "gold": "yellow", "text": "\nThe hat color of the person living in Rome is:"}
+{"id": "s3_q1", "parent": "s3", "target": 1, "gold": "blue", "text": "\nThe hat color of the person living in Paris is:"}
+{"id": "s4", "text": "Alice wears a blue hat and lives in Paris. Bob wears a yellow hat and lives in Rome.", "names": ["Alice", "Bob"], "colors": ["blue", "yellow"], "cities": ["Paris", "Rome"], "order": 0}
+{"id": "s4_q0", "parent": "s4", "target": 0, "gold": "blue", "text": "\nThe hat color of the person living in Paris is:"}
+{"id": "s4_q1", "parent": "s4", "target": 1, "gold": "yellow", "text": "\nThe hat color of the person living in Rome is:"}
+{"id": "s5", "text": "Bob wears a yellow hat and lives in Rome. Alice wears a blue hat and lives in Paris.", "names": ["Alice", "Bob"], "colors": ["blue", "yellow"], "cities": ["Paris", "Rome"], "order": 1}
+{"id": "s5_q0", "parent": "s5", "target": 0, "gold": "blue", "text": "\nThe hat color of the person living in Paris is:"}
+{"id": "s5_q1", "parent": "s5", "target": 1, "gold": "yellow", "text": "\nThe hat color of the person living in Rome is:"}
+{"id": "s6", "text": "Alice wears a blue hat and lives in Rome. Bob wears a yellow hat and lives in Paris.", "names": ["Alice", "Bob"], "colors": ["blue", "yellow"], "cities": ["Rome", "Paris"], "order": 0}
+{"id": "s6_q0", "parent": "s6", "target": 0, "gold": "blue", "text": "\nThe hat color of the person living in Rome is:"}
+{"id": "s6_q1", "parent": "s6", "target": 1, "gold": "yellow", "text": "\nThe hat color of the person living in Paris is:"}
+{"id": "s7", "text": "Bob wears a yellow hat and lives in Paris. Alice wears a blue hat and lives in Rome.", "names": ["Alice", "Bob"], "colors": ["blue", "yellow"], "cities": ["Rome", "Paris"], "order": 1}
+{"id": "s7_q0", "parent": "s7", "target": 0, "gold": "blue", "text": "\nThe hat color of the person living in Rome is:"}
+{"id": "s7_q1", "parent": "s7", "target": 1, "gold": "yellow", "text": "\nThe hat color of the person living in Paris is:"}
